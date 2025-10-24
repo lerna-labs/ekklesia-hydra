@@ -30,7 +30,7 @@ app.use((err: any, _req: any, res: any, _next: any) => {
     res.status(500).json({status: 'ERROR', message: 'Internal server error'});
 });
 
-const port = process.env.EXPRESS_PORT || 3000;
+const port = 3000;
 const TRP_URL = process.env.TRP_URL as string;
 const HYDRA_NETWORK = parseInt(process.env.HYDRA_NETWORK || '0', 10);
 const CLOSE_TOKEN = process.env.CLOSE_TOKEN || "shutitdown";
