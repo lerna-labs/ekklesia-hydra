@@ -35,6 +35,8 @@ const TRP_URL = process.env.TRP_URL as string;
 const HYDRA_NETWORK = parseInt(process.env.HYDRA_NETWORK || '0', 10);
 const CLOSE_TOKEN = process.env.CLOSE_TOKEN || "shutitdown";
 
+console.log(`Ekklesia Hydra has launched! ${port} ${HYDRA_NETWORK} ${CLOSE_TOKEN}`);
+
 // Recursive function to sanitize BigInts... need to swap them to strings when passing JSON
 function sanitizeBigInts(obj: any): any {
     if (typeof obj === 'bigint') {
