@@ -22,7 +22,7 @@
     "typecheck": "tsc -p tsconfig.build.json --noEmit"
   },
   "dependencies": {
-    "@lerna-labs/hydra-sdk": "^1.0.0-beta.10",
+    "@lerna-labs/hydra-sdk": "^1.0.0-beta.12",
     "@meshsdk/core": "^1.9.0-beta.83",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
