@@ -1,22 +1,162 @@
-party Sender;
+party Voting_Authority;
 
-party Receiver;
+env {
+    minting_script: Bytes,
+    token_policy: Bytes,
+}
 
-tx transfer(
-    quantity: Int
+type Vote {
+    Version: Int,
+    VoterId: Bytes,
+    MerkleRoot: Bytes,
+    Signature: Bytes,
+    Key: Bytes,
+    COSESign1Hex: Bytes,
+    COSEKeyHex: Bytes,
+    Votes: Bytes,
+}
+
+tx register_voter(
+    user_id: Bytes,
 ) {
-    input source {
-        from: Sender,
-        min_amount: Ada(quantity) + fees,
+    input* gas {
+        from: Voting_Authority,
+        min_amount: fees + Ada(1),
     }
-    
-    output {
-        to: Receiver,
-        amount: Ada(quantity),
+
+    mint {
+        amount: AnyAsset(token_policy, user_id, 1),
     }
 
     output {
-        to: Sender,
-        amount: source - Ada(quantity) - fees,
+        to: Voting_Authority,
+        amount: AnyAsset(token_policy, user_id, 1),
+        datum: Vote {
+            Version: 0,
+            VoterId: user_id,
+            MerkleRoot: 0x00,
+            Signature: 0x00,
+            Key: 0x00,
+            COSESign1Hex: 0x00,
+            COSEKeyHex: 0x00,
+            Votes: 0x00,
+        },
+    }
+
+    output {
+        to: Voting_Authority,
+        amount: gas,
+    }
+
+    cardano::native_witness {
+        script: minting_script,
+    }
+
+    metadata {
+        0: user_id,
+    }
+}
+
+tx vote_and_register(
+    user_id: Bytes,
+    merkle_root: Bytes,
+    signature: Bytes,
+    key: Bytes,
+    cose_sign1: Bytes,
+    cose_key: Bytes,
+    vote_hex: Bytes,
+) {
+    input* gas {
+        from: Voting_Authority,
+        min_amount: fees + Ada(1),
+    }
+
+    mint {
+        amount: AnyAsset(token_policy, user_id, 1),
+    }
+
+    output {
+        to: Voting_Authority,
+        amount: AnyAsset(token_policy, user_id, 1),
+        datum: Vote {
+           Version: 1,
+           VoterId: user_id,
+           MerkleRoot: merkle_root,
+           Signature: signature,
+           Key: key,
+           COSESign1Hex: cose_sign1,
+           COSEKeyHex: cose_key,
+           Votes: vote_hex,
+        },
+    }
+
+    output {
+        to: Voting_Authority,
+        amount: gas,
+    }
+
+    cardano::native_witness {
+        script: minting_script,
+    }
+
+    metadata {
+        0: user_id,
+        2: merkle_root,
+    }
+}
+
+tx cast_vote (
+    user_id: Bytes,
+    merkle_root: Bytes,
+    signature: Bytes,
+    key: Bytes,
+    cose_sign1: Bytes,
+    cose_key: Bytes,
+    vote_hex: Bytes,
+) {
+    input current {
+        from: Voting_Authority,
+        min_amount: AnyAsset(token_policy, user_id, 1),
+        datum_is: Vote,
+    }
+
+    output {
+        to: Voting_Authority,
+        amount: AnyAsset(token_policy, user_id, 1),
+        datum: Vote {
+            Version: current.Version + 1,
+            VoterId: current.VoterId,
+            MerkleRoot: merkle_root,
+            Signature: signature,
+            Key: key,
+            COSESign1Hex: cose_sign1,
+            COSEKeyHex: cose_key,
+            Votes: vote_hex,
+        },
+    }
+
+    metadata {
+        2: merkle_root,
+    }
+}
+
+tx deregister(
+    user_id: Bytes,
+) {
+    input* gas {
+        from: Voting_Authority,
+        min_amount: AnyAsset(token_policy, user_id, 1),
+    }
+
+    burn {
+        amount: AnyAsset(token_policy, user_id, 1),
+    }
+
+    cardano::native_witness {
+        script: minting_script,
+    }
+
+    metadata {
+        1: user_id,
     }
 }

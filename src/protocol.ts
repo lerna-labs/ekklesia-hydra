@@ -17,14 +17,65 @@ export const DEFAULT_HEADERS = {
 export const DEFAULT_ENV_ARGS = {
 };
 
-export type TransferParams = {
-    quantity: ArgValue | bigint | number; // Int
-    receiver: ArgValue | string; // Address
-    sender: ArgValue | string; // Address
+export type RegisterVoterParams = {
+    mintingScript: ArgValue | Uint8Array; // Bytes
+    tokenPolicy: ArgValue | Uint8Array; // Bytes
+    userId: ArgValue | Uint8Array; // Bytes
+    votingAuthority: ArgValue | string; // Address
 }
 
-export const TRANSFER_IR = {
-    bytecode: "0d03000106736f757263650d0206736f757263650d010673656e646572050e010c0100000d01087175616e74697479020d0300000000020d0108726563656976657205000c0100000d01087175616e74697479020d010673656e64657205000e020e0210010d0206736f757263650d010673656e646572050e010c0100000d01087175616e74697479020d030000000c0100000d01087175616e74697479020d0300000000000000",
+export const REGISTER_VOTER_IR = {
+    bytecode: "0d030001036761730d02036761730d0110766f74696e675f617574686f72697479050e010d030c010000050200010000020d0110766f74696e675f617574686f726974790503000805000d0107757365725f6964040401000401000401000401000401000401000c010d010c746f6b656e5f706f6c696379040d0107757365725f69640405020d0110766f74696e675f617574686f72697479050010010d02036761730d0110766f74696e675f617574686f72697479050e010d030c010000050200010000010c010d010c746f6b656e5f706f6c696379040d0107757365725f69640405020000010e6e61746976655f7769746e65737301067363726970740d010e6d696e74696e675f7363726970740400000105000d0107757365725f696404",
+    encoding: "hex",
+    version: "v1alpha8",
+};
+
+export type VoteAndRegisterParams = {
+    coseKey: ArgValue | Uint8Array; // Bytes
+    coseSign1: ArgValue | Uint8Array; // Bytes
+    key: ArgValue | Uint8Array; // Bytes
+    merkleRoot: ArgValue | Uint8Array; // Bytes
+    mintingScript: ArgValue | Uint8Array; // Bytes
+    signature: ArgValue | Uint8Array; // Bytes
+    tokenPolicy: ArgValue | Uint8Array; // Bytes
+    userId: ArgValue | Uint8Array; // Bytes
+    voteHex: ArgValue | Uint8Array; // Bytes
+    votingAuthority: ArgValue | string; // Address
+}
+
+export const VOTE_AND_REGISTER_IR = {
+    bytecode: "0d030001036761730d02036761730d0110766f74696e675f617574686f72697479050e010d030c010000050200010000020d0110766f74696e675f617574686f726974790503000805020d0107757365725f6964040d010b6d65726b6c655f726f6f74040d01097369676e6174757265040d01036b6579040d010a636f73655f7369676e31040d0108636f73655f6b6579040d0108766f74655f686578040c010d010c746f6b656e5f706f6c696379040d0107757365725f69640405020d0110766f74696e675f617574686f72697479050010010d02036761730d0110766f74696e675f617574686f72697479050e010d030c010000050200010000010c010d010c746f6b656e5f706f6c696379040d0107757365725f69640405020000010e6e61746976655f7769746e65737301067363726970740d010e6d696e74696e675f7363726970740400000205000d0107757365725f69640405040d010b6d65726b6c655f726f6f7404",
+    encoding: "hex",
+    version: "v1alpha8",
+};
+
+export type CastVoteParams = {
+    coseKey: ArgValue | Uint8Array; // Bytes
+    coseSign1: ArgValue | Uint8Array; // Bytes
+    key: ArgValue | Uint8Array; // Bytes
+    merkleRoot: ArgValue | Uint8Array; // Bytes
+    signature: ArgValue | Uint8Array; // Bytes
+    tokenPolicy: ArgValue | Uint8Array; // Bytes
+    userId: ArgValue | Uint8Array; // Bytes
+    voteHex: ArgValue | Uint8Array; // Bytes
+    votingAuthority: ArgValue | string; // Address
+}
+
+export const CAST_VOTE_IR = {
+    bytecode: "0d0300010763757272656e740d020763757272656e740d0110766f74696e675f617574686f72697479050c010d010c746f6b656e5f706f6c696379040d0107757365725f696404050200000000010d0110766f74696e675f617574686f72697479050300080e010e0510020d020763757272656e740d0110766f74696e675f617574686f72697479050c010d010c746f6b656e5f706f6c696379040d0107757365725f69640405020000000005020e0510020d020763757272656e740d0110766f74696e675f617574686f72697479050c010d010c746f6b656e5f706f6c696379040d0107757365725f6964040502000000010d010b6d65726b6c655f726f6f74040d01097369676e6174757265040d01036b6579040d010a636f73655f7369676e31040d0108636f73655f6b6579040d0108766f74655f686578040c010d010c746f6b656e5f706f6c696379040d0107757365725f69640405020000000000000105040d010b6d65726b6c655f726f6f7404",
+    encoding: "hex",
+    version: "v1alpha8",
+};
+
+export type DeregisterParams = {
+    mintingScript: ArgValue | Uint8Array; // Bytes
+    tokenPolicy: ArgValue | Uint8Array; // Bytes
+    userId: ArgValue | Uint8Array; // Bytes
+    votingAuthority: ArgValue | string; // Address
+}
+
+export const DEREGISTER_IR = {
+    bytecode: "0d030001036761730d02036761730d0110766f74696e675f617574686f72697479050c010d010c746f6b656e5f706f6c696379040d0107757365725f696404050200010000000000010c010d010c746f6b656e5f706f6c696379040d0107757365725f696404050200010e6e61746976655f7769746e65737301067363726970740d010e6d696e74696e675f7363726970740400000105020d0107757365725f696404",
     encoding: "hex",
     version: "v1alpha8",
 };
@@ -36,9 +87,30 @@ export class Client {
         this.#client = new TRPClient(options);
     }
 
-    async transferTx(args: TransferParams): Promise<ResolveResponse> {
+    async registerVoterTx(args: RegisterVoterParams): Promise<ResolveResponse> {
         return await this.#client.resolve({
-            tir: TRANSFER_IR,
+            tir: REGISTER_VOTER_IR,
+            args,
+        });
+    }
+
+    async voteAndRegisterTx(args: VoteAndRegisterParams): Promise<ResolveResponse> {
+        return await this.#client.resolve({
+            tir: VOTE_AND_REGISTER_IR,
+            args,
+        });
+    }
+
+    async castVoteTx(args: CastVoteParams): Promise<ResolveResponse> {
+        return await this.#client.resolve({
+            tir: CAST_VOTE_IR,
+            args,
+        });
+    }
+
+    async deregisterTx(args: DeregisterParams): Promise<ResolveResponse> {
+        return await this.#client.resolve({
+            tir: DEREGISTER_IR,
             args,
         });
     }

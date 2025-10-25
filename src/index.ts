@@ -4,13 +4,14 @@ import express from 'express';
 import {authHeaderMiddleware} from './middleware.js';
 import {
     Wrangler,
-    queryUtxoByAddress,
-    createMultisigAddress,
     getAdmin,
-    getUtxoSet
+    getUtxoSet,
+    createNativeScript, submitTx,
 } from '@lerna-labs/hydra-sdk';
 import {MeshWallet} from "@meshsdk/core";
 import {Client} from "./protocol.js";
+import {bech32} from 'bech32';
+import {createHash} from 'crypto';
 
 const app = express();
 app.use(express.json());
@@ -35,8 +36,6 @@ const TRP_URL = process.env.TRP_URL as string;
 const HYDRA_NETWORK = parseInt(process.env.HYDRA_NETWORK || '0', 10);
 const CLOSE_TOKEN = process.env.CLOSE_TOKEN || "shutitdown";
 
-console.log(`Ekklesia Hydra has launched! ${port} ${HYDRA_NETWORK} ${CLOSE_TOKEN}`);
-
 // Recursive function to sanitize BigInts... need to swap them to strings when passing JSON
 function sanitizeBigInts(obj: any): any {
     if (typeof obj === 'bigint') {
@@ -54,6 +53,26 @@ function sanitizeBigInts(obj: any): any {
     }
 }
 
+export function voterIdToHex(voterId: string): string {
+    if (!voterId) {
+        throw new Error('Invalid voter ID');
+    }
+
+    try {
+        // Decode the Bech32 payload
+        const decoded = bech32.decode(voterId);
+        const bytes = bech32.fromWords(decoded.words);
+
+        // Hash to 32 bytes (blake2b-256 ensures fixed 32-byte output)
+        const hash = createHash('blake2b512').update(Buffer.from(bytes)).digest('hex').slice(0, 64);
+
+        return hash.toLowerCase();
+    } catch (error) {
+        console.error(`Failed to convert voter ID to hex:`, error);
+        throw new Error('Unable to decode Bech32 identifier');
+    }
+}
+
 type initializePayload = {
     admin_wallet?: MeshWallet;
     address?: string;
@@ -61,7 +80,7 @@ type initializePayload = {
     client?: Client;
 }
 
-async function initialize(user_address?: string): Promise<initializePayload> {
+async function initialize(): Promise<initializePayload> {
     let admin_wallet: MeshWallet;
     try {
         admin_wallet = await getAdmin();
@@ -70,20 +89,11 @@ async function initialize(user_address?: string): Promise<initializePayload> {
         return {};
     }
 
-    const admin_address = admin_wallet.addresses.enterpriseAddressBech32 as string;
     const client = new Client({
         endpoint: TRP_URL as string,
     });
 
-    if (user_address === undefined) {
-        return {admin_wallet, client};
-    } else {
-        const {
-            address,
-            scriptCbor,
-        } = createMultisigAddress(admin_address, user_address, HYDRA_NETWORK);
-        return {admin_wallet, address, scriptCbor, client};
-    }
+    return {admin_wallet, client};
 }
 
 app.get('/', (_, res) => {
@@ -178,98 +188,61 @@ app.post("/ledger", async (req, res) => {
             admin_wallet: admin_wallet.addresses.enterpriseAddressBech32
         }
     });
-
 });
 
-app.get("/user/:address", async (req, res) => {
-    const user_address = req.params.address;
-    const {admin_wallet, address} = await initialize(user_address);
-
-    if (!address) {
-        res.json({
-            status: "ERROR",
-            message: "Could not initialize user address",
-        });
-        return;
-    }
-
-    res.json({
-        status: "SUCCESS",
-        data: {
-            address,
-        }
-    });
-});
-
-app.get('/utxos/:address', async (req, res) => {
-    const user_address = req.params.address;
-
-    if (!user_address) {
-        res.json({
-            status: 'ERROR',
-            message: 'Could not initialize user address',
-        });
-        return;
-    }
+app.post("/register", async (req, res) => {
+    const voter_id = req.body.voterId;
+    const head_id = voterIdToHex(voter_id);
 
     try {
-        const utxos = await queryUtxoByAddress(user_address);
-        res.json({
-            status: 'SUCCESS',
-            data: {
-                address: user_address,
-                utxos,
-            },
-        });
-    } catch (error: any) {
-        res.json({
-            status: 'ERROR',
-            message: 'Failed to query UTxO',
-        });
-    }
-});
+        console.log(`Registering a new voter ${voter_id} with head ${head_id}`);
 
-app.get('/balance/:address', async (req, res) => {
-    const user_address = req.params.address;
-
-    if (!user_address) {
-        res.json({
-            status: 'ERROR',
-            message: 'Could not initialize user address',
-        });
-        return;
-    }
-
-    try {
-        const utxos = await queryUtxoByAddress(user_address);
-        const balance: Record<string, bigint> = {};
-        utxos.forEach((utxo: any) => {
-            utxo.amount.forEach((value: any) => {
-                const policy_id = value.unit;
-                for (const [asset_id, quantity] of Object.entries(value.quantity)) {
-                    const unit = `${policy_id}.${asset_id}`;
-                    if (balance[unit] === undefined) {
-                        balance[unit] = 0n;
-                    }
-
-                    balance[unit] += BigInt(quantity as string);
-                }
+        const {admin_wallet, client} = await initialize();
+        if (!admin_wallet) {
+            res.status(410).json({
+                message: "Could not initialize admin wallet",
             });
+            return;
+        }
+
+        const admin_payment_address = admin_wallet.addresses.enterpriseAddressBech32 as string;
+
+        if (!client) {
+            res.status(410).json({
+                message: "Could not initialize client",
+            });
+            return;
+        }
+
+        const {
+            address: ScriptAddress,
+            scriptCbor: TOKEN_SCRIPT,
+            scriptHash: TOKEN_POLICY
+        } = createNativeScript(admin_payment_address);
+
+        console.log(`Generated native script for minting?\r
+${ScriptAddress}\r
+${TOKEN_SCRIPT}\r
+${TOKEN_POLICY}`);
+
+        const trp_response = await client.registerVoterTx({
+            votingAuthority: admin_payment_address,
+            userId: Buffer.from(head_id, "hex"),
+            mintingScript: Buffer.from(TOKEN_SCRIPT as string, "hex"),
+            tokenPolicy: Buffer.from(TOKEN_POLICY as string, "hex"),
         });
-        res.json({
-            status: 'SUCCESS',
-            data: {
-                balance: sanitizeBigInts(balance),
-            },
-        });
-    } catch (error: any) {
-        console.error(`Balance check error`, error);
-        res.json({
-            status: 'ERROR',
-            message: 'Could not query utxo by address',
+
+        const signedTx = await admin_wallet.signTx(trp_response.tx);
+        const submit_response = await submitTx(TRP_URL, signedTx, `0:${head_id}`);
+        const response_json = await submit_response.json();
+
+        res.status(200).json(response_json);
+    } catch (err: any) {
+        res.status(400).json({
+            message: err.message || "Failed to register voter",
         });
     }
-});
+})
 
 app.listen(port, () => {
     console.log(`✅ Hydra SDK API server is running on http://localhost:${port}`);
