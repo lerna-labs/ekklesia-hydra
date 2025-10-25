@@ -107,6 +107,7 @@ tx vote_and_register(
 
 tx cast_vote (
     user_id: Bytes,
+    version: Int,
     merkle_root: Bytes,
     signature: Bytes,
     key: Bytes,
@@ -117,15 +118,14 @@ tx cast_vote (
     input current {
         from: Voting_Authority,
         min_amount: AnyAsset(token_policy, user_id, 1),
-        datum_is: Vote,
     }
 
     output {
         to: Voting_Authority,
         amount: AnyAsset(token_policy, user_id, 1),
         datum: Vote {
-            Version: current.Version + 1,
-            VoterId: current.VoterId,
+            Version: version,
+            VoterId: user_id,
             MerkleRoot: merkle_root,
             Signature: signature,
             Key: key,

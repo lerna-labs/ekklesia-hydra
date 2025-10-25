@@ -269,6 +269,7 @@ app.post("/vote", async (req, res) => {
             votingAuthority: admin_payment_address,
             tokenPolicy: Buffer.from(TOKEN_POLICY as string, "hex"),
             userId: Buffer.from(head_id, "hex"),
+            version: 69,
             coseKey: Buffer.from(req.body.signature.COSE_Key_hex),
             coseSign1: Buffer.from(req.body.signature.COSE_Sign1_hex),
             key: Buffer.from(req.body.signature.key),
