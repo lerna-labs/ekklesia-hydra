@@ -195,8 +195,6 @@ app.post("/register", async (req, res) => {
     const head_id = voterIdToHex(voter_id);
 
     try {
-        console.log(`Registering a new voter ${voter_id} with head ${head_id}`);
-
         const {admin_wallet, client} = await initialize();
         if (!admin_wallet) {
             res.status(410).json({
@@ -220,16 +218,63 @@ app.post("/register", async (req, res) => {
             scriptHash: TOKEN_POLICY
         } = createNativeScript(admin_payment_address);
 
-        console.log(`Generated native script for minting?\r
-${ScriptAddress}\r
-${TOKEN_SCRIPT}\r
-${TOKEN_POLICY}`);
-
         const trp_response = await client.registerVoterTx({
             votingAuthority: admin_payment_address,
-            userId: Buffer.from(head_id, "hex"),
             mintingScript: Buffer.from(TOKEN_SCRIPT as string, "hex"),
             tokenPolicy: Buffer.from(TOKEN_POLICY as string, "hex"),
+            userId: Buffer.from(head_id, "hex"),
+        });
+
+        const signedTx = await admin_wallet.signTx(trp_response.tx);
+        const submit_response = await submitTx(TRP_URL, signedTx, `0:${head_id}`);
+        const response_json = await submit_response.json();
+
+        res.status(200).json(response_json);
+    } catch (err: any) {
+        res.status(400).json({
+            message: err.message || "Failed to register voter",
+        });
+    }
+})
+
+app.post("/vote", async (req, res) => {
+    const voter_id = req.body.voterId;
+    const head_id = voterIdToHex(voter_id);
+
+    try {
+        const {admin_wallet, client} = await initialize();
+        if (!admin_wallet) {
+            res.status(410).json({
+                message: "Could not initialize admin wallet",
+            });
+            return;
+        }
+
+        const admin_payment_address = admin_wallet.addresses.enterpriseAddressBech32 as string;
+
+        if (!client) {
+            res.status(410).json({
+                message: "Could not initialize client",
+            });
+            return;
+        }
+
+        const {
+            address,
+            scriptCbor,
+            scriptHash: TOKEN_POLICY
+        } = createNativeScript(admin_payment_address);
+
+        const trp_response = await client.castVoteTx({
+            votingAuthority: admin_payment_address,
+            tokenPolicy: Buffer.from(TOKEN_POLICY as string, "hex"),
+            userId: Buffer.from(head_id, "hex"),
+            coseKey: Buffer.from(req.body.signature.COSE_Key_hex),
+            coseSign1: Buffer.from(req.body.signature.COSE_Sign1_hex),
+            key: Buffer.from(req.body.signature.key),
+            signature: Buffer.from(req.body.signature.signature),
+            merkleRoot: Buffer.from(req.body.merkleRoot),
+            voteHex: Buffer.from(Buffer.from(JSON.stringify(req.body.votes), "utf8").toString("hex")),
         });
 
         const signedTx = await admin_wallet.signTx(trp_response.tx);
