@@ -5,6 +5,15 @@ env {
     token_policy: Bytes,
 }
 
+type Ballot {
+    Version: Int,
+    BallotId: Bytes,
+    MerkleRoot: Bytes,
+    TotalVotes: Int,
+    ValidVotes: Int,
+    Finalized: Int,
+}
+
 type Vote {
     Version: Int,
     VoterId: Bytes,
@@ -66,33 +75,33 @@ tx vote_and_register(
     cose_key: Bytes,
     vote_hex: Bytes,
 ) {
-    input* gas {
+    input gas {
         from: Voting_Authority,
-        min_amount: fees + Ada(1),
+        min_amount: fees + min_utxo(voter_token),
     }
 
     mint {
         amount: AnyAsset(token_policy, user_id, 1),
     }
 
-    output {
+    output voter_token {
         to: Voting_Authority,
-        amount: AnyAsset(token_policy, user_id, 1),
+        amount: min_utxo(voter_token) + AnyAsset(token_policy, user_id, 1),
         datum: Vote {
-           Version: 1,
-           VoterId: user_id,
-           MerkleRoot: merkle_root,
-           Signature: signature,
-           Key: key,
-           COSESign1Hex: cose_sign1,
-           COSEKeyHex: cose_key,
-           Votes: vote_hex,
+            Version: 1,
+            VoterId: user_id,
+            MerkleRoot: merkle_root,
+            Signature: signature,
+            Key: key,
+            COSESign1Hex: cose_sign1,
+            COSEKeyHex: cose_key,
+            Votes: vote_hex,
         },
     }
 
     output {
         to: Voting_Authority,
-        amount: gas,
+        amount: gas - fees - min_utxo(voter_token),
     }
 
     cardano::native_witness {
@@ -115,9 +124,9 @@ tx cast_vote (
     cose_key: Bytes,
     vote_hex: Bytes,
 ) {
-    input* gas {
+    input * gas {
         from: Voting_Authority,
-        min_amount: Ada(5) + fees + AnyAsset(token_policy, user_id, 1) + min_utxo(voter_token),
+        min_amount: fees + min_utxo(voter_token) + AnyAsset(token_policy, user_id, 1),
     }
 
     output voter_token {
@@ -137,7 +146,7 @@ tx cast_vote (
 
     output {
         to: Voting_Authority,
-        amount: gas - fees - min_utxo(voter_token),
+        amount: gas - fees - min_utxo(voter_token) - AnyAsset(token_policy, user_id, 1),
     }
 
     metadata {
@@ -148,7 +157,12 @@ tx cast_vote (
 tx count_vote (
     user_id: Bytes,
 ) {
-    input* gas {
+    input gas {
+        from: Voting_Authority,
+        min_amount: fees,
+    }
+
+    input voter_token {
         from: Voting_Authority,
         min_amount: AnyAsset(token_policy, user_id, 1),
     }
@@ -157,11 +171,51 @@ tx count_vote (
         amount: AnyAsset(token_policy, user_id, 1),
     }
 
+    output change {
+        to: Voting_Authority,
+        amount: gas + voter_token - fees - AnyAsset(token_policy, user_id, 1),
+    }
+
     cardano::native_witness {
         script: minting_script,
     }
 
     metadata {
         1: user_id,
+    }
+}
+
+tx finalize_vote (
+    ballot_id: Bytes,
+    merkle_root: Bytes,
+    total_votes: Int,
+    valid_votes: Int,
+) {
+    input * gas {
+        from: Voting_Authority,
+        min_amount: fees + min_utxo(ballot_token) + AnyAsset(token_policy, ballot_id, 1),
+    }
+
+    output ballot_token {
+        to: Voting_Authority,
+        amount: min_utxo(ballot_token) + AnyAsset(token_policy, ballot_id, 1),
+        datum: Ballot {
+            Version: 1,
+            BallotId: ballot_id,
+            MerkleRoot: merkle_root,
+            TotalVotes: total_votes,
+            ValidVotes: valid_votes,
+            Finalized: 1,
+        },
+    }
+
+    output {
+        to: Voting_Authority,
+        amount: gas - fees - min_utxo(ballot_token) - AnyAsset(token_policy, ballot_id, 1),
+    }
+
+    metadata {
+        3: ballot_id,
+        4: merkle_root,
     }
 }

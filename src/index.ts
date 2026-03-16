@@ -33,6 +33,7 @@ app.use((err: any, _req: any, res: any, _next: any) => {
 
 const port = 3000;
 const TRP_URL = process.env.TRP_URL as string;
+const HYDRA_API_URL = process.env.HYDRA_API_URL as string;
 const HYDRA_NETWORK = parseInt(process.env.HYDRA_NETWORK || '0', 10);
 const CLOSE_TOKEN = process.env.CLOSE_TOKEN || "shutitdown";
 
@@ -71,6 +72,52 @@ export function voterIdToHex(voterId: string): string {
         console.error(`Failed to convert voter ID to hex:`, error);
         throw new Error('Unable to decode Bech32 identifier');
     }
+}
+
+type VoteDatum = {
+    version: number;
+    voterId: string;
+    merkleRoot: string;
+    signature: string;
+    key: string;
+    coseSign1Hex: string;
+    coseKeyHex: string;
+    votes: string;
+}
+
+async function findVoterUtxo(tokenPolicy: string, userId: string): Promise<any | null> {
+    const res = await fetch(`${HYDRA_API_URL}/snapshot/utxo`);
+    const utxoSet = await res.json();
+
+    const assetKey = `${tokenPolicy}.${userId}`;
+
+    for (const [utxoRef, utxo] of Object.entries<any>(utxoSet)) {
+        const value = utxo.value;
+        if (!value) continue;
+
+        // Check if any key in value matches our policy.asset pattern
+        for (const key of Object.keys(value)) {
+            if (key === assetKey) {
+                return { ref: utxoRef, ...utxo };
+            }
+        }
+    }
+
+    return null;
+}
+
+function parseVoteDatum(datum: any): VoteDatum {
+    const fields = datum.fields;
+    return {
+        version: fields[0].int,
+        voterId: fields[1].bytes,
+        merkleRoot: fields[2].bytes,
+        signature: fields[3].bytes,
+        key: fields[4].bytes,
+        coseSign1Hex: fields[5].bytes,
+        coseKeyHex: fields[6].bytes,
+        votes: fields[7].bytes,
+    };
 }
 
 type initializePayload = {
@@ -218,6 +265,14 @@ app.post("/register", async (req, res) => {
             scriptHash: TOKEN_POLICY
         } = createNativeScript(admin_payment_address);
 
+        const existingUtxo = await findVoterUtxo(TOKEN_POLICY as string, head_id);
+        if (existingUtxo) {
+            res.status(409).json({
+                message: "Voter is already registered",
+            });
+            return;
+        }
+
         const trp_response = await client.registerVoterTx({
             votingAuthority: admin_payment_address,
             mintingScript: Buffer.from(TOKEN_SCRIPT as string, "hex"),
@@ -265,11 +320,25 @@ app.post("/vote", async (req, res) => {
             scriptHash: TOKEN_POLICY
         } = createNativeScript(admin_payment_address);
 
+        const voterUtxo = await findVoterUtxo(TOKEN_POLICY as string, head_id);
+        if (!voterUtxo) {
+            res.status(404).json({
+                message: "Voter is not registered",
+            });
+            return;
+        }
+
+        let nextVersion = 1;
+        if (voterUtxo.datum) {
+            const parsed = parseVoteDatum(voterUtxo.datum);
+            nextVersion = parsed.version + 1;
+        }
+
         const trp_response = await client.castVoteTx({
             votingAuthority: admin_payment_address,
             tokenPolicy: Buffer.from(TOKEN_POLICY as string, "hex"),
             userId: Buffer.from(head_id, "hex"),
-            version: 69,
+            version: nextVersion,
             coseKey: Buffer.from(req.body.signature.COSE_Key_hex),
             coseSign1: Buffer.from(req.body.signature.COSE_Sign1_hex),
             key: Buffer.from(req.body.signature.key),
@@ -286,6 +355,207 @@ app.post("/vote", async (req, res) => {
     } catch (err: any) {
         res.status(400).json({
             message: err.message || "Failed to register voter",
+        });
+    }
+})
+
+app.post("/vote-and-register", async (req, res) => {
+    const voter_id = req.body.voterId;
+    const head_id = voterIdToHex(voter_id);
+
+    try {
+        const {admin_wallet, client} = await initialize();
+        if (!admin_wallet) {
+            res.status(410).json({
+                message: "Could not initialize admin wallet",
+            });
+            return;
+        }
+
+        const admin_payment_address = admin_wallet.addresses.enterpriseAddressBech32 as string;
+
+        if (!client) {
+            res.status(410).json({
+                message: "Could not initialize client",
+            });
+            return;
+        }
+
+        const {
+            scriptCbor: TOKEN_SCRIPT,
+            scriptHash: TOKEN_POLICY
+        } = createNativeScript(admin_payment_address);
+
+        const existingUtxo = await findVoterUtxo(TOKEN_POLICY as string, head_id);
+        if (existingUtxo) {
+            res.status(409).json({
+                message: "Voter is already registered",
+            });
+            return;
+        }
+
+        const trp_response = await client.voteAndRegisterTx({
+            votingAuthority: admin_payment_address,
+            mintingScript: Buffer.from(TOKEN_SCRIPT as string, "hex"),
+            tokenPolicy: Buffer.from(TOKEN_POLICY as string, "hex"),
+            userId: Buffer.from(head_id, "hex"),
+            coseKey: Buffer.from(req.body.signature.COSE_Key_hex),
+            coseSign1: Buffer.from(req.body.signature.COSE_Sign1_hex),
+            key: Buffer.from(req.body.signature.key),
+            signature: Buffer.from(req.body.signature.signature),
+            merkleRoot: Buffer.from(req.body.merkleRoot),
+            voteHex: Buffer.from(Buffer.from(JSON.stringify(req.body.votes), "utf8").toString("hex")),
+        });
+
+        const signedTx = await admin_wallet.signTx(trp_response.tx);
+        const submit_response = await submitTx(TRP_URL, signedTx, `0:${head_id}`);
+        const response_json = await submit_response.json();
+
+        res.status(200).json(response_json);
+    } catch (err: any) {
+        res.status(400).json({
+            message: err.message || "Failed to vote and register",
+        });
+    }
+})
+
+app.post("/count", async (req, res) => {
+    const voter_id = req.body.voterId;
+    const head_id = voterIdToHex(voter_id);
+
+    try {
+        const {admin_wallet, client} = await initialize();
+        if (!admin_wallet) {
+            res.status(410).json({
+                message: "Could not initialize admin wallet",
+            });
+            return;
+        }
+
+        const admin_payment_address = admin_wallet.addresses.enterpriseAddressBech32 as string;
+
+        if (!client) {
+            res.status(410).json({
+                message: "Could not initialize client",
+            });
+            return;
+        }
+
+        const {
+            scriptCbor: TOKEN_SCRIPT,
+            scriptHash: TOKEN_POLICY
+        } = createNativeScript(admin_payment_address);
+
+        const voterUtxo = await findVoterUtxo(TOKEN_POLICY as string, head_id);
+        if (!voterUtxo) {
+            res.status(404).json({
+                message: "Voter is not registered",
+            });
+            return;
+        }
+
+        const trp_response = await client.countVoteTx({
+            votingAuthority: admin_payment_address,
+            mintingScript: Buffer.from(TOKEN_SCRIPT as string, "hex"),
+            tokenPolicy: Buffer.from(TOKEN_POLICY as string, "hex"),
+            userId: Buffer.from(head_id, "hex"),
+        });
+
+        const signedTx = await admin_wallet.signTx(trp_response.tx);
+        const submit_response = await submitTx(TRP_URL, signedTx, `0:${head_id}`);
+        const response_json = await submit_response.json();
+
+        res.status(200).json(response_json);
+    } catch (err: any) {
+        res.status(400).json({
+            message: err.message || "Failed to count vote",
+        });
+    }
+})
+
+app.post("/finalize", async (req, res) => {
+    try {
+        const {admin_wallet, client} = await initialize();
+        if (!admin_wallet) {
+            res.status(410).json({
+                message: "Could not initialize admin wallet",
+            });
+            return;
+        }
+
+        const admin_payment_address = admin_wallet.addresses.enterpriseAddressBech32 as string;
+
+        if (!client) {
+            res.status(410).json({
+                message: "Could not initialize client",
+            });
+            return;
+        }
+
+        const {
+            scriptHash: TOKEN_POLICY
+        } = createNativeScript(admin_payment_address);
+
+        const trp_response = await client.finalizeVoteTx({
+            votingAuthority: admin_payment_address,
+            tokenPolicy: Buffer.from(TOKEN_POLICY as string, "hex"),
+            ballotId: Buffer.from(req.body.ballotId, "hex"),
+            merkleRoot: Buffer.from(req.body.merkleRoot, "hex"),
+            totalVotes: req.body.totalVotes,
+            validVotes: req.body.validVotes,
+        });
+
+        const signedTx = await admin_wallet.signTx(trp_response.tx);
+        const submit_response = await submitTx(TRP_URL, signedTx, `0:${req.body.ballotId}`);
+        const response_json = await submit_response.json();
+
+        res.status(200).json(response_json);
+    } catch (err: any) {
+        res.status(400).json({
+            message: err.message || "Failed to finalize vote",
+        });
+    }
+})
+
+app.get("/voter/:voterId", async (req, res) => {
+    const voter_id = req.params.voterId;
+    const head_id = voterIdToHex(voter_id);
+
+    try {
+        const {admin_wallet} = await initialize();
+        if (!admin_wallet) {
+            res.status(410).json({
+                message: "Could not initialize admin wallet",
+            });
+            return;
+        }
+
+        const admin_payment_address = admin_wallet.addresses.enterpriseAddressBech32 as string;
+
+        const {
+            scriptHash: TOKEN_POLICY
+        } = createNativeScript(admin_payment_address);
+
+        const voterUtxo = await findVoterUtxo(TOKEN_POLICY as string, head_id);
+        if (!voterUtxo) {
+            res.status(404).json({
+                message: "Voter is not registered",
+            });
+            return;
+        }
+
+        if (!voterUtxo.datum) {
+            res.status(200).json({
+                message: "Voter is registered but has no vote datum",
+            });
+            return;
+        }
+
+        const datum = parseVoteDatum(voterUtxo.datum);
+        res.status(200).json(datum);
+    } catch (err: any) {
+        res.status(400).json({
+            message: err.message || "Failed to lookup voter",
         });
     }
 })
