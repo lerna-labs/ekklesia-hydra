@@ -17,7 +17,7 @@
   ],
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "build": "tsc -p tsconfig.build.json",
+    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --outfile=dist/index.js --packages=external",
     "start": "node dist/index.js",
     "typecheck": "tsc -p tsconfig.build.json --noEmit"
   },
@@ -30,6 +30,7 @@
   },
   "devDependencies": {
     "@types/express": "^4.17.21",
+    "esbuild": "^0.27.4",
     "tsx": "^4.19.1",
     "typescript": "^5.6.3"
   }
