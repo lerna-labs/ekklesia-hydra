@@ -4,6 +4,13 @@ file = "./main.tx3"
 name = "charlie"
 balance = 100000000000
 
+# Step 0: Prepare the head (mint ballot token + create 100A gas UTxO)
+[[transactions]]
+description = "Prepare head with ballot token and gas UTxO"
+template = "prepare_head"
+signers = ["charlie"]
+args = { voting_authority = "@charlie", minting_script = "0x820181820400", token_policy = "0x954fe5769e9eb8dad54c99f8d62015c813c24f229a4d98dbf05c28b9", ballot_id = "0xba110700000000000000000000000001" }
+
 # Step 1: Register a voter
 [[transactions]]
 description = "Register voter alice_drep"

@@ -8,7 +8,8 @@ import {
     getUtxoSet,
     createNativeScript, submitTx,
 } from '@lerna-labs/hydra-sdk';
-import {MeshWallet} from "@meshsdk/core";
+import {MeshWallet, BlockfrostProvider} from "@meshsdk/core";
+import {HydraProvider} from "@meshsdk/hydra";
 import {Client} from "./protocol.js";
 import {bech32} from 'bech32';
 import {createHash} from 'crypto';
@@ -36,6 +37,109 @@ const TRP_URL = process.env.TRP_URL as string;
 const HYDRA_API_URL = process.env.HYDRA_API_URL as string;
 const HYDRA_NETWORK = parseInt(process.env.HYDRA_NETWORK || '0', 10);
 const CLOSE_TOKEN = process.env.CLOSE_TOKEN || "shutitdown";
+const DEFAULT_GAS_AMOUNT = 100_000_000;
+
+function getBlockfrost(): BlockfrostProvider {
+    const key = process.env.BLOCKFROST_API_KEY;
+    if (!key) throw new Error("BLOCKFROST_API_KEY not set");
+    return new BlockfrostProvider(key);
+}
+
+/**
+ * Convert a Blockfrost-fetched UTxO into the Hydra node's expected JSON format
+ * for use with buildCommit / deposit.
+ */
+function toHydraUTxO(utxo: any): Record<string, any> {
+    const value: Record<string, any> = {lovelace: Number(utxo.output.amount.find((a: any) => a.unit === "lovelace")?.quantity ?? 0)};
+
+    for (const asset of utxo.output.amount) {
+        if (asset.unit === "lovelace") continue;
+        const policyId = asset.unit.slice(0, 56);
+        const assetName = asset.unit.slice(56);
+        if (!value[policyId]) value[policyId] = {};
+        value[policyId][assetName] = Number(asset.quantity);
+    }
+
+    return {
+        address: utxo.output.address,
+        datum: null,
+        inlineDatum: utxo.output.plutusData ?? null,
+        inlineDatumRaw: null,
+        inlineDatumhash: utxo.output.dataHash ?? null,
+        referenceScript: utxo.output.scriptRef ?? null,
+        value,
+    };
+}
+
+/**
+ * Open a Hydra head with an empty commit (no initial UTxOs).
+ * Uses buildCommit({}) which tells the Hydra node we have nothing to commit.
+ */
+async function openHeadEmpty(timeoutMs = 180000): Promise<void> {
+    const wrangler = new Wrangler(process.env.HYDRA_API_URL, process.env.HYDRA_WS_URL);
+    const blockfrost = getBlockfrost();
+    const admin = await getAdmin();
+
+    return new Promise(async (resolve, reject) => {
+        let settled = false;
+
+        const handle = async (message: any) => {
+            try {
+                if (message.tag === "HeadIsOpen") {
+                    if (settled) return;
+                    settled = true;
+                    resolve();
+                } else if (message.tag === "HeadIsInitializing") {
+                    // Empty commit — no UTxOs to commit
+                    const commitTx = await wrangler.provider.buildCommit({});
+                    if (commitTx?.cborHex) {
+                        const signed = await admin.signTx(commitTx.cborHex);
+                        await blockfrost.submitTx(signed);
+                    }
+                } else if (message.tag === "Greetings") {
+                    switch (message.headStatus) {
+                        case "Idle":
+                            await wrangler.provider.init();
+                            break;
+                        case "Initializing": {
+                            const commitTx = await wrangler.provider.buildCommit({});
+                            if (commitTx?.cborHex) {
+                                const signed = await admin.signTx(commitTx.cborHex);
+                                await blockfrost.submitTx(signed);
+                            }
+                            break;
+                        }
+                        case "Open":
+                            if (!settled) { settled = true; resolve(); }
+                            break;
+                    }
+                }
+            } catch (err) {
+                if (!settled) { settled = true; reject(err); }
+            }
+        };
+
+        wrangler.provider.onMessage(handle);
+
+        try {
+            await wrangler.provider.connect();
+        } catch (err) {
+            if (!settled) {
+                settled = true;
+                return reject(new Error("Failed to connect to Hydra provider: " + String(err)));
+            }
+        }
+
+        const timer = setTimeout(() => {
+            if (!settled) { settled = true; reject(new Error("Timeout waiting for head to open (empty commit)")); }
+        }, timeoutMs);
+
+        const origResolve = resolve;
+        const origReject = reject;
+        resolve = (v: void | PromiseLike<void>) => { clearTimeout(timer); origResolve(v); };
+        reject = (e: any) => { clearTimeout(timer); origReject(e); };
+    });
+}
 
 // Recursive function to sanitize BigInts... need to swap them to strings when passing JSON
 function sanitizeBigInts(obj: any): any {
@@ -162,23 +266,49 @@ app.get('/health', async (_, res) => {
 });
 
 app.post('/start', async (req, res) => {
-    const wrangler = new Wrangler(process.env.HYDRA_API_URL, process.env.HYDRA_WS_URL);
-    const txHash = req.body.txHash;
-    const txIndex = req.body.txIdx;
+    // Support both legacy single UTxO, array format, and empty body (empty commit)
+    let utxos: {txHash: string, txIndex: number}[] = [];
 
-    if (!txHash || txIndex === undefined || txIndex === null || txIndex < 0) {
-        console.error(`Bad commit identifiers:`, txHash, txIndex);
-        return res.status(400).json({
-            status: 'ERROR',
-            message: 'Bad Commit UTxO Identifiers',
-        });
+    if (Array.isArray(req.body.utxos) && req.body.utxos.length > 0) {
+        utxos = req.body.utxos.map((u: any) => ({
+            txHash: u.txHash,
+            txIndex: u.txIdx ?? u.txIndex,
+        }));
+    } else if (req.body.txHash) {
+        utxos = [{txHash: req.body.txHash, txIndex: req.body.txIdx}];
+    }
+    // If no utxos provided, we'll open with an empty commit
+
+    for (const u of utxos) {
+        if (!u.txHash || u.txIndex === undefined || u.txIndex === null || u.txIndex < 0) {
+            console.error(`Bad commit identifiers:`, u);
+            return res.status(400).json({
+                status: 'ERROR',
+                message: 'Bad Commit UTxO Identifiers',
+            });
+        }
     }
 
     try {
-        await wrangler.waitForHeadOpen({txHash, txIndex}, 180000);
+        if (utxos.length === 0) {
+            // Empty commit — open head without committing any UTxOs
+            await openHeadEmpty(180000);
+            return res.json({
+                status: 'SUCCESS',
+                message: 'Head is open (empty commit)',
+                committed: [],
+            });
+        }
+
+        // TODO: Once hydra-sdk Wrangler supports commitBlueprintUTxOs,
+        // pass the full array in a single commit. For now, commit the
+        // first UTxO (the SDK only supports one per commit call).
+        const wrangler = new Wrangler(process.env.HYDRA_API_URL, process.env.HYDRA_WS_URL);
+        await wrangler.waitForHeadOpen(utxos[0], 180000);
         return res.json({
             status: 'SUCCESS',
             message: 'Head is open',
+            committed: utxos,
         });
     } catch (err: any) {
         console.error('Failed to start head:', err);
@@ -236,6 +366,59 @@ app.post("/ledger", async (req, res) => {
         }
     });
 });
+
+app.post("/prepare", async (req, res) => {
+    const ballot_id = req.body.ballotId;
+    const gasAmount = req.body.gasAmount ?? DEFAULT_GAS_AMOUNT;
+
+    if (!ballot_id) {
+        return res.status(400).json({
+            message: "Missing ballotId",
+        });
+    }
+
+    try {
+        const {admin_wallet, client} = await initialize();
+        if (!admin_wallet) {
+            res.status(410).json({
+                message: "Could not initialize admin wallet",
+            });
+            return;
+        }
+
+        const admin_payment_address = admin_wallet.addresses.enterpriseAddressBech32 as string;
+
+        if (!client) {
+            res.status(410).json({
+                message: "Could not initialize client",
+            });
+            return;
+        }
+
+        const {
+            scriptCbor: TOKEN_SCRIPT,
+            scriptHash: TOKEN_POLICY
+        } = createNativeScript(admin_payment_address);
+
+        const trp_response = await client.prepareHeadTx({
+            votingAuthority: admin_payment_address,
+            mintingScript: Buffer.from(TOKEN_SCRIPT as string, "hex"),
+            tokenPolicy: Buffer.from(TOKEN_POLICY as string, "hex"),
+            ballotId: Buffer.from(ballot_id, "hex"),
+            gasAmount,
+        });
+
+        const signedTx = await admin_wallet.signTx(trp_response.tx);
+        const submit_response = await submitTx(TRP_URL, signedTx, `3:${ballot_id}`);
+        const response_json = await submit_response.json();
+
+        res.status(200).json(response_json);
+    } catch (err: any) {
+        res.status(400).json({
+            message: err.message || "Failed to prepare head",
+        });
+    }
+})
 
 app.post("/register", async (req, res) => {
     const voter_id = req.body.voterId;
@@ -559,6 +742,149 @@ app.get("/voter/:voterId", async (req, res) => {
         });
     }
 })
+
+// ── Incremental Deposit ──────────────────────────────────────────────
+app.post("/deposit", async (req, res) => {
+    const utxoRefs: {txHash: string, txIdx: number}[] = req.body.utxos;
+
+    if (!Array.isArray(utxoRefs) || utxoRefs.length === 0) {
+        return res.status(400).json({status: "ERROR", message: "Provide a non-empty \"utxos\" array of {txHash, txIdx}"});
+    }
+
+    try {
+        const admin = await getAdmin();
+        const blockfrost = getBlockfrost();
+        const provider = new HydraProvider({httpUrl: HYDRA_API_URL, history: false});
+        const deposited: string[] = [];
+
+        for (const ref of utxoRefs) {
+            // Fetch the UTxO from L1
+            const l1Utxos = await blockfrost.fetchUTxOs(ref.txHash);
+            const target = l1Utxos.find((u: any) => u.input.outputIndex === ref.txIdx);
+            if (!target) {
+                return res.status(404).json({
+                    status: "ERROR",
+                    message: `UTxO not found on L1: ${ref.txHash}#${ref.txIdx}`,
+                });
+            }
+
+            // Convert to Hydra format and build the commit/deposit tx
+            const hydraUtxo = toHydraUTxO(target);
+            const key = `${ref.txHash}#${ref.txIdx}`;
+            const commitResult = await provider.buildCommit({[key]: hydraUtxo});
+
+            if (commitResult?.cborHex) {
+                const signed = await admin.signTx(commitResult.cborHex);
+                await blockfrost.submitTx(signed);
+                deposited.push(key);
+            }
+        }
+
+        return res.json({status: "SUCCESS", deposited});
+    } catch (err: any) {
+        console.error("Deposit failed:", err);
+        return res.status(400).json({status: "ERROR", message: err.message || "Deposit failed"});
+    }
+});
+
+// ── Incremental Decommit ─────────────────────────────────────────────
+app.post("/decommit", async (req, res) => {
+    const provider = new HydraProvider({httpUrl: HYDRA_API_URL, history: false});
+
+    try {
+        if (req.body.cborHex) {
+            // Raw CBOR path — caller already built the L2 tx
+            const tx = {
+                type: "Tx ConwayEra" as const,
+                description: "",
+                cborHex: req.body.cborHex as string,
+            };
+            const result = await provider.decommit(tx);
+            return res.json({status: "SUCCESS", txHash: result});
+        }
+
+        // Server-side build path
+        const utxoRefs: {txHash: string, txIdx: number}[] | undefined = req.body.utxos;
+        const toAddress: string | undefined = req.body.to;
+
+        if (!utxoRefs || !toAddress) {
+            return res.status(400).json({
+                status: "ERROR",
+                message: 'Provide either "cborHex" or both "utxos" and "to"',
+            });
+        }
+
+        // Fetch the snapshot to find UTxOs in the head
+        const snapshotRes = await fetch(`${HYDRA_API_URL}/snapshot/utxo`);
+        const snapshot = await snapshotRes.json();
+
+        // Build a simple L2 transaction sending the specified UTxOs to `to`
+        // For L2, fees are 0. We use MeshTxBuilder with HydraProvider as fetcher.
+        const {MeshTxBuilder} = await import("@meshsdk/core");
+        const admin = await getAdmin();
+        const txBuilder = new MeshTxBuilder({fetcher: provider as any});
+
+        let totalLovelace = 0;
+        for (const ref of utxoRefs) {
+            const key = `${ref.txHash}#${ref.txIdx}`;
+            const utxo = snapshot[key];
+            if (!utxo) {
+                return res.status(404).json({
+                    status: "ERROR",
+                    message: `UTxO not found in head: ${key}`,
+                });
+            }
+            txBuilder.txIn(ref.txHash, ref.txIdx);
+            totalLovelace += Number(utxo.value?.lovelace ?? 0);
+        }
+
+        txBuilder.txOut(toAddress, [{unit: "lovelace", quantity: String(totalLovelace)}]);
+        txBuilder.changeAddress(toAddress);
+
+        const unsignedTx = await txBuilder.complete();
+        const signedTx = await admin.signTx(unsignedTx);
+
+        const tx = {
+            type: "Tx ConwayEra" as const,
+            description: "",
+            cborHex: signedTx,
+        };
+        const result = await provider.decommit(tx);
+        return res.json({status: "SUCCESS", txHash: result});
+    } catch (err: any) {
+        console.error("Decommit failed:", err);
+        return res.status(400).json({status: "ERROR", message: err.message || "Decommit failed"});
+    }
+});
+
+// ── Pending Deposits ─────────────────────────────────────────────────
+app.get("/pending-deposits", async (_req, res) => {
+    try {
+        const provider = new HydraProvider({httpUrl: HYDRA_API_URL, history: false});
+        const pending = await provider.getPendingCommits();
+        return res.json({status: "SUCCESS", pending});
+    } catch (err: any) {
+        console.error("Failed to get pending deposits:", err);
+        return res.status(400).json({status: "ERROR", message: err.message || "Failed to get pending deposits"});
+    }
+});
+
+// ── Recover Deposit ──────────────────────────────────────────────────
+app.post("/recover", async (req, res) => {
+    const txHash = req.body.txHash;
+    if (!txHash) {
+        return res.status(400).json({status: "ERROR", message: "Provide \"txHash\""});
+    }
+
+    try {
+        const provider = new HydraProvider({httpUrl: HYDRA_API_URL, history: false});
+        const result = await provider.recover(txHash);
+        return res.json({status: "SUCCESS", txHash: result});
+    } catch (err: any) {
+        console.error("Recover failed:", err);
+        return res.status(400).json({status: "ERROR", message: err.message || "Recover failed"});
+    }
+});
 
 app.listen(port, () => {
     console.log(`✅ Hydra SDK API server is running on http://localhost:${port}`);

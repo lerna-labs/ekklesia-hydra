@@ -25,6 +25,51 @@ type Vote {
     Votes: Bytes,
 }
 
+tx prepare_head(
+    ballot_id: Bytes,
+    gas_amount: Int,
+) {
+    input gas {
+        from: Voting_Authority,
+        min_amount: fees + gas_amount + min_utxo(ballot_token),
+    }
+
+    mint {
+        amount: AnyAsset(token_policy, ballot_id, 1),
+    }
+
+    output ballot_token {
+        to: Voting_Authority,
+        amount: min_utxo(ballot_token) + AnyAsset(token_policy, ballot_id, 1),
+        datum: Ballot {
+            Version: 1,
+            BallotId: ballot_id,
+            MerkleRoot: 0x00,
+            TotalVotes: 0,
+            ValidVotes: 0,
+            Finalized: 0,
+        },
+    }
+
+    output head_gas {
+        to: Voting_Authority,
+        amount: gas_amount,
+    }
+
+    output {
+        to: Voting_Authority,
+        amount: gas - fees - min_utxo(ballot_token) - gas_amount,
+    }
+
+    cardano::native_witness {
+        script: minting_script,
+    }
+
+    metadata {
+        3: ballot_id,
+    }
+}
+
 tx register_voter(
     user_id: Bytes,
 ) {
