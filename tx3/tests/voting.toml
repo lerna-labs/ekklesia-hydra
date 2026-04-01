@@ -1,0 +1,47 @@
+file = "./main.tx3"
+
+[[wallets]]
+name = "charlie"
+balance = 100000000000
+
+# Step 0: Prepare the head (mint ballot token + create 100A gas UTxO)
+[[transactions]]
+description = "Prepare head with ballot token and gas UTxO"
+template = "prepare_head"
+signers = ["charlie"]
+args = { voting_authority = "@charlie", minting_script = "0x820181820400", token_policy = "0x954fe5769e9eb8dad54c99f8d62015c813c24f229a4d98dbf05c28b9", ballot_id = "0xba110700000000000000000000000001" }
+
+# Step 1: Register a voter
+[[transactions]]
+description = "Register voter alice_drep"
+template = "register_voter"
+signers = ["charlie"]
+args = { voting_authority = "@charlie", minting_script = "0x820181820400", token_policy = "0x954fe5769e9eb8dad54c99f8d62015c813c24f229a4d98dbf05c28b9", user_id = "0xa11ced4e901234567890abcdef012345" }
+
+# Step 2: Cast a vote for that voter
+[[transactions]]
+description = "Cast vote for alice_drep"
+template = "cast_vote"
+signers = ["charlie"]
+args = { voting_authority = "@charlie", minting_script = "0x820181820400", token_policy = "0x954fe5769e9eb8dad54c99f8d62015c813c24f229a4d98dbf05c28b9", user_id = "0xa11ced4e901234567890abcdef012345", version = 1, merkle_root = "0xdeadbeef00112233445566778899aabb", signature = "0x5369676e617475726548657265", key = "0x4b657948657265", cose_sign1 = "0x434f5345", cose_key = "0x434f53454b6579", vote_hex = "0x01020304" }
+
+# Step 3: Register and vote in a single tx for a second voter
+[[transactions]]
+description = "Register and vote for bob_spo"
+template = "vote_and_register"
+signers = ["charlie"]
+args = { voting_authority = "@charlie", minting_script = "0x820181820400", token_policy = "0x954fe5769e9eb8dad54c99f8d62015c813c24f229a4d98dbf05c28b9", user_id = "0xb0b5901234567890abcdef0123456789", merkle_root = "0xcafebabe00112233445566778899aabb", signature = "0x426f625369676e6174757265", key = "0x426f624b6579", cose_sign1 = "0x426f62434f5345", cose_key = "0x426f62434f53454b6579", vote_hex = "0x05060708" }
+
+# Step 4: Count (burn) alice_drep's vote
+[[transactions]]
+description = "Count vote for alice_drep"
+template = "count_vote"
+signers = ["charlie"]
+args = { voting_authority = "@charlie", minting_script = "0x820181820400", token_policy = "0x954fe5769e9eb8dad54c99f8d62015c813c24f229a4d98dbf05c28b9", user_id = "0xa11ced4e901234567890abcdef012345" }
+
+# Step 5: Count (burn) bob_spo's vote
+[[transactions]]
+description = "Count vote for bob_spo"
+template = "count_vote"
+signers = ["charlie"]
+args = { voting_authority = "@charlie", minting_script = "0x820181820400", token_policy = "0x954fe5769e9eb8dad54c99f8d62015c813c24f229a4d98dbf05c28b9", user_id = "0xb0b5901234567890abcdef0123456789" }

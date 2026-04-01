@@ -1,5 +1,5 @@
 [[utxos]]
-address = "@bob"
+address = "@alice"
 value = 100000000000
 
 [[utxos]]
@@ -7,5 +7,5 @@ address = "@charlie"
 value = 100000000000
 
 [[utxos]]
-address = "@alice"
+address = "@bob"
 value = 100000000000
