@@ -1,0 +1,217 @@
+{
+  "info": {
+    "name": "Ekklesia Hydra Middleware",
+    "description": "API collection for the Ekklesia voting middleware running on Hydra L2.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:3000" },
+    { "key": "apiKey", "value": "your-api-key-here" },
+    { "key": "closeToken", "value": "shutitdown" },
+    { "key": "txHash", "value": "" },
+    { "key": "policyId", "value": "" },
+    { "key": "fingerprint", "value": "" },
+    { "key": "instanceAssetName", "value": "" },
+    { "key": "ballotIpfsCid", "value": "" },
+    { "key": "voterId", "value": "drep1..." }
+  ],
+  "auth": {
+    "type": "apikey",
+    "apikey": [
+      { "key": "key", "value": "x-api-key" },
+      { "key": "value", "value": "{{apiKey}}" },
+      { "key": "in", "value": "header" }
+    ]
+  },
+  "item": [
+    {
+      "name": "Health & Query",
+      "item": [
+        {
+          "name": "GET / — Root",
+          "request": { "method": "GET", "url": "{{baseUrl}}/" }
+        },
+        {
+          "name": "GET /health — Head Status",
+          "request": { "method": "GET", "url": "{{baseUrl}}/health" }
+        },
+        {
+          "name": "POST /ledger — UTxO Set",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/ledger",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{}" }
+          }
+        },
+        {
+          "name": "GET /ballot — Cached Ballot Definition",
+          "request": { "method": "GET", "url": "{{baseUrl}}/ballot" }
+        },
+        {
+          "name": "GET /votes — All Votes",
+          "request": { "method": "GET", "url": "{{baseUrl}}/votes" }
+        },
+        {
+          "name": "GET /voter/:voterId — Voter Lookup",
+          "request": { "method": "GET", "url": "{{baseUrl}}/voter/{{voterId}}" }
+        }
+      ]
+    },
+    {
+      "name": "Ballot Setup (L1)",
+      "item": [
+        {
+          "name": "POST /prepare — Mint Ballot Tokens",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/prepare",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"namespace\": \"vote.ekklesia.test.example\",\n  \"ballot\": {\n    \"specVersion\": \"1.0.0\",\n    \"title\": \"Test Ballot\",\n    \"description\": \"A test ballot for development\",\n    \"questions\": [\n      {\n        \"questionId\": \"q1\",\n        \"question\": \"Do you approve?\",\n        \"method\": \"binary\",\n        \"options\": [\n          { \"label\": \"Yes\", \"value\": 1 },\n          { \"label\": \"No\", \"value\": 0 },\n          { \"label\": \"Abstain\", \"value\": 2 }\n        ]\n      }\n    ],\n    \"roleWeighting\": { \"DRep\": \"CredentialBased\" },\n    \"endEpoch\": 999,\n    \"ekklesia\": {\n      \"namespace\": \"\",\n      \"votingAuthority\": \"\",\n      \"context\": \"hydra-head\",\n      \"acceptedCredentials\": [\"0x22\"],\n      \"merkleRoot\": \"\",\n      \"ballotIpfsCid\": \"\",\n      \"votingWindow\": {\n        \"open\": \"2026-04-01T00:00:00Z\",\n        \"close\": \"2026-04-15T00:00:00Z\"\n      }\n    }\n  },\n  \"gasAmount\": 50,\n  \"cip179\": false\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "var json = pm.response.json();",
+                  "if (json.data) {",
+                  "  pm.collectionVariables.set('txHash', json.data.txHash);",
+                  "  pm.collectionVariables.set('policyId', json.data.policyId);",
+                  "  pm.collectionVariables.set('fingerprint', json.data.fingerprint);",
+                  "  pm.collectionVariables.set('instanceAssetName', json.data.instanceAssetName);",
+                  "  pm.collectionVariables.set('ballotIpfsCid', json.data.ballotIpfsCid);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Head Lifecycle",
+      "item": [
+        {
+          "name": "POST /start — Open Head",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/start",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"utxos\": [\n    { \"txHash\": \"{{txHash}}\", \"outputIndex\": 1 },\n    { \"txHash\": \"{{txHash}}\", \"outputIndex\": 2 }\n  ],\n  \"ballotIpfsCid\": \"{{ballotIpfsCid}}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "POST /close — Close Head",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/close",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{ \"closeToken\": \"{{closeToken}}\" }" }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Voting (In-Head)",
+      "item": [
+        {
+          "name": "POST /register — Register Voter",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/register",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{ \"voterId\": \"{{voterId}}\" }" }
+          }
+        },
+        {
+          "name": "POST /vote-and-register — Register + Vote",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/vote-and-register",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"voterId\": \"{{voterId}}\",\n  \"ballotId\": \"{{txHash}}\",\n  \"votes\": [\n    { \"questionId\": \"q1\", \"selection\": [1] }\n  ],\n  \"signature\": {\n    \"coseSign1Hex\": \"TODO\",\n    \"coseKeyHex\": \"TODO\",\n    \"key\": \"TODO\",\n    \"signature\": \"TODO\"\n  }\n}"
+            }
+          }
+        },
+        {
+          "name": "POST /vote — Cast Vote",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/vote",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"voterId\": \"{{voterId}}\",\n  \"nonce\": 2,\n  \"ballotId\": \"{{txHash}}\",\n  \"votes\": [\n    { \"questionId\": \"q1\", \"selection\": [0] }\n  ],\n  \"signature\": {\n    \"coseSign1Hex\": \"TODO\",\n    \"coseKeyHex\": \"TODO\",\n    \"key\": \"TODO\",\n    \"signature\": \"TODO\"\n  }\n}"
+            }
+          }
+        },
+        {
+          "name": "POST /vote — Script DRep (Multi-Sig)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/vote",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"voterId\": \"drep_script1...\",\n  \"nonce\": 1,\n  \"ballotId\": \"{{txHash}}\",\n  \"votes\": [\n    { \"questionId\": \"q1\", \"selection\": [1] }\n  ],\n  \"signature\": {\n    \"nativeScript\": {\n      \"type\": \"atLeast\",\n      \"required\": 2,\n      \"scripts\": [\n        { \"type\": \"sig\", \"keyHash\": \"aabb...\" },\n        { \"type\": \"sig\", \"keyHash\": \"ccdd...\" },\n        { \"type\": \"sig\", \"keyHash\": \"eeff...\" }\n      ]\n    },\n    \"witnesses\": [\n      { \"coseSign1Hex\": \"TODO\", \"coseKeyHex\": \"TODO\", \"key\": \"TODO\", \"signature\": \"TODO\" },\n      { \"coseSign1Hex\": \"TODO\", \"coseKeyHex\": \"TODO\", \"key\": \"TODO\", \"signature\": \"TODO\" }\n    ]\n  }\n}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Settlement",
+      "item": [
+        {
+          "name": "POST /finalize — Tally + Update Datum",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/finalize",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"ballotId\": \"{{txHash}}\",\n  \"ballotName\": \"{{instanceAssetName}}\"\n}" }
+          }
+        },
+        {
+          "name": "POST /count — Burn All Voter Tokens",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/count",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{}" }
+          }
+        },
+        {
+          "name": "POST /settle — Full Settlement",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/settle",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"ballotId\": \"{{txHash}}\",\n  \"ballotName\": \"{{instanceAssetName}}\",\n  \"closeToken\": \"{{closeToken}}\"\n}" }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Audit",
+      "item": [
+        {
+          "name": "GET /audit — Full Verification Bundle",
+          "request": { "method": "GET", "url": "{{baseUrl}}/audit" }
+        },
+        {
+          "name": "GET /audit/vote/:voterId — Single Voter Audit",
+          "request": { "method": "GET", "url": "{{baseUrl}}/audit/vote/{{voterId}}" }
+        }
+      ]
+    }
+  ]
+}

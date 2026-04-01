@@ -5,16 +5,35 @@ env {
     token_policy: Bytes,
 }
 
+// ---------------------------------------------------------------------------
+// Voter token datum — slim; full evidence lives on IPFS
+// ---------------------------------------------------------------------------
+
 type Vote {
-    Version: Int,
     VoterId: Bytes,
+    Version: Int,
     MerkleRoot: Bytes,
-    Signature: Bytes,
-    Key: Bytes,
-    COSESign1Hex: Bytes,
-    COSEKeyHex: Bytes,
-    Votes: Bytes,
+    VoteHash: Bytes,
+    IpfsCid: Bytes,
 }
+
+// ---------------------------------------------------------------------------
+// Ballot instance (601) datum — slim; full results live on IPFS
+// Status: 0=created, 1=active, 2=tallying, 3=finalized, 4=contested
+// ---------------------------------------------------------------------------
+
+type BallotResult {
+    BallotId: Bytes,
+    Status: Int,
+    ResultsHash: Bytes,
+    EvidenceCid: Bytes,
+    TotalVoters: Int,
+    MerkleRoot: Bytes,
+}
+
+// ---------------------------------------------------------------------------
+// Register a new voter — mint token with empty datum
+// ---------------------------------------------------------------------------
 
 tx register_voter(
     user_id: Bytes,
@@ -32,14 +51,11 @@ tx register_voter(
         to: Voting_Authority,
         amount: min_utxo(voter_token) + AnyAsset(token_policy, user_id, 1),
         datum: Vote {
-            Version: 0,
             VoterId: user_id,
+            Version: 0,
             MerkleRoot: 0x00,
-            Signature: 0x00,
-            Key: 0x00,
-            COSESign1Hex: 0x00,
-            COSEKeyHex: 0x00,
-            Votes: 0x00,
+            VoteHash: 0x00,
+            IpfsCid: 0x00,
         },
     }
 
@@ -51,20 +67,17 @@ tx register_voter(
     cardano::native_witness {
         script: minting_script,
     }
-
-    metadata {
-        0: user_id,
-    }
 }
+
+// ---------------------------------------------------------------------------
+// Register + vote in one transaction
+// ---------------------------------------------------------------------------
 
 tx vote_and_register(
     user_id: Bytes,
     merkle_root: Bytes,
-    signature: Bytes,
-    key: Bytes,
-    cose_sign1: Bytes,
-    cose_key: Bytes,
-    vote_hex: Bytes,
+    vote_hash: Bytes,
+    ipfs_cid: Bytes,
 ) {
     input* gas {
         from: Voting_Authority,
@@ -79,14 +92,11 @@ tx vote_and_register(
         to: Voting_Authority,
         amount: AnyAsset(token_policy, user_id, 1),
         datum: Vote {
-           Version: 1,
-           VoterId: user_id,
-           MerkleRoot: merkle_root,
-           Signature: signature,
-           Key: key,
-           COSESign1Hex: cose_sign1,
-           COSEKeyHex: cose_key,
-           Votes: vote_hex,
+            VoterId: user_id,
+            Version: 1,
+            MerkleRoot: merkle_root,
+            VoteHash: vote_hash,
+            IpfsCid: ipfs_cid,
         },
     }
 
@@ -98,22 +108,18 @@ tx vote_and_register(
     cardano::native_witness {
         script: minting_script,
     }
-
-    metadata {
-        0: user_id,
-        2: merkle_root,
-    }
 }
 
-tx cast_vote (
+// ---------------------------------------------------------------------------
+// Cast or update a vote on an existing voter token
+// ---------------------------------------------------------------------------
+
+tx cast_vote(
     user_id: Bytes,
     version: Int,
     merkle_root: Bytes,
-    signature: Bytes,
-    key: Bytes,
-    cose_sign1: Bytes,
-    cose_key: Bytes,
-    vote_hex: Bytes,
+    vote_hash: Bytes,
+    ipfs_cid: Bytes,
 ) {
     input* gas {
         from: Voting_Authority,
@@ -124,14 +130,11 @@ tx cast_vote (
         to: Voting_Authority,
         amount: min_utxo(voter_token) + AnyAsset(token_policy, user_id, 1),
         datum: Vote {
-            Version: version,
             VoterId: user_id,
+            Version: version,
             MerkleRoot: merkle_root,
-            Signature: signature,
-            Key: key,
-            COSESign1Hex: cose_sign1,
-            COSEKeyHex: cose_key,
-            Votes: vote_hex,
+            VoteHash: vote_hash,
+            IpfsCid: ipfs_cid,
         },
     }
 
@@ -139,13 +142,13 @@ tx cast_vote (
         to: Voting_Authority,
         amount: gas - fees - min_utxo(voter_token),
     }
-
-    metadata {
-        2: merkle_root,
-    }
 }
 
-tx count_vote (
+// ---------------------------------------------------------------------------
+// Count/burn a voter token at end of voting
+// ---------------------------------------------------------------------------
+
+tx count_vote(
     user_id: Bytes,
 ) {
     input* gas {
@@ -160,8 +163,40 @@ tx count_vote (
     cardano::native_witness {
         script: minting_script,
     }
+}
 
-    metadata {
-        1: user_id,
+// ---------------------------------------------------------------------------
+// Finalize ballot — spend (601) instance UTxO, recreate with results datum
+// ---------------------------------------------------------------------------
+
+tx finalize_ballot(
+    ballot_name: Bytes,
+    ballot_id: Bytes,
+    results_hash: Bytes,
+    evidence_cid: Bytes,
+    total_voters: Int,
+    merkle_root: Bytes,
+) {
+    input* gas {
+        from: Voting_Authority,
+        min_amount: AnyAsset(token_policy, ballot_name, 1) + fees + min_utxo(ballot_result),
+    }
+
+    output ballot_result {
+        to: Voting_Authority,
+        amount: min_utxo(ballot_result) + AnyAsset(token_policy, ballot_name, 1),
+        datum: BallotResult {
+            BallotId: ballot_id,
+            Status: 3,
+            ResultsHash: results_hash,
+            EvidenceCid: evidence_cid,
+            TotalVoters: total_voters,
+            MerkleRoot: merkle_root,
+        },
+    }
+
+    output {
+        to: Voting_Authority,
+        amount: gas - fees - min_utxo(ballot_result),
     }
 }
