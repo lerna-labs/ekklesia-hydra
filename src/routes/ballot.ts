@@ -98,8 +98,10 @@ router.post('/prepare', async (req, res) => {
     }
 
     try {
-        // --- 1. Initialize wallet and timelocked native script ---
-        const admin_wallet: MeshWallet = await getAdmin();
+        // --- 1. Initialize wallet with L1 fetcher and timelocked native script ---
+        const blockfrostKey = process.env.BLOCKFROST_API_KEY as string;
+        const blockfrost = new BlockfrostProvider(blockfrostKey);
+        const admin_wallet: MeshWallet = await getAdmin(blockfrostKey);
         const admin_address = admin_wallet.addresses.enterpriseAddressBech32 as string;
 
         // Convert voting window open time to a slot for the timelock
@@ -183,8 +185,6 @@ router.post('/prepare', async (req, res) => {
         };
 
         // --- 5. Build the L1 minting transaction ---
-        const blockfrost = new BlockfrostProvider(process.env.BLOCKFROST_API_KEY as string);
-
         const txBuilder = new MeshTxBuilder({
             fetcher: blockfrost,
             evaluator: blockfrost,
