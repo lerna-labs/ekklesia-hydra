@@ -2,50 +2,125 @@
  * End-to-end integration test for the Ekklesia Hydra voting middleware.
  *
  * Requires a live environment:
- *   - Middleware running (default: http://localhost:3000)
+ *   - Middleware running on a remote VM (or locally)
  *   - Hydra node + IPFS node available
- *   - Blockfrost API key configured
+ *   - Blockfrost API key configured on the middleware
  *   - Valid admin wallet with funds
+ *   - `cardano-signer` CLI installed (for key generation + CIP-8 signing)
  *
  * Set environment variables before running:
- *   E2E_API_URL    — middleware base URL (default: http://localhost:3000)
+ *   E2E_API_URL    — middleware base URL (e.g., http://10.0.0.5:3000)
  *   E2E_API_KEY    — x-api-key header value
- *   E2E_VOTER_ID   — bech32 voter ID to test with (e.g., drep1...)
  *   E2E_CLOSE_TOKEN — close token (default: shutitdown)
  *
  * Run: npm run test:e2e
  */
 
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { execSync } from 'node:child_process';
+import { blake2b256, bytesToHex } from '@lerna-labs/hydra-proof';
+import type { SignedVotePayload } from '../src/types.js';
 
-const API_URL = process.env.E2E_API_URL ?? 'http://localhost:3000';
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+const API_URL = process.env.E2E_API_URL ?? '';
 const API_KEY = process.env.E2E_API_KEY ?? '';
-const VOTER_ID = process.env.E2E_VOTER_ID ?? '';
 const CLOSE_TOKEN = process.env.E2E_CLOSE_TOKEN ?? 'shutitdown';
 
-const headers = {
+// ---------------------------------------------------------------------------
+// Helpers — cardano-signer CLI wrappers
+// ---------------------------------------------------------------------------
+
+interface DRepKeys {
+    secretKey: string;   // extended secret key hex
+    publicKey: string;   // ed25519 public key hex
+    drepId: string;      // CIP-129 bech32 drep1...
+}
+
+interface CoseWitness {
+    coseSign1Hex: string;
+    coseKeyHex: string;
+    key: string;
+    signature: string;
+}
+
+/** Generate a fresh DRep key pair using cardano-signer. */
+function generateDRepKeys(): DRepKeys {
+    const raw = execSync('cardano-signer keygen --path drep --json-extended', {
+        encoding: 'utf-8',
+    });
+    const json = JSON.parse(raw);
+    return {
+        secretKey: json.secretKey as string,
+        publicKey: json.publicKey as string,
+        drepId: json.drepIdBech as string,
+    };
+}
+
+/**
+ * Sign a merkleRoot hex string with CIP-8 COSE_Sign1 using cardano-signer.
+ * Returns the four fields expected by the middleware's CoseWitness interface.
+ */
+function signMerkleRoot(merkleRoot: string, secretKey: string, drepAddress: string): CoseWitness {
+    const raw = execSync(
+        `cardano-signer sign --cip8 ` +
+        `--data "${merkleRoot}" ` +
+        `--secret-key "${secretKey}" ` +
+        `--address "${drepAddress}" ` +
+        `--json-extended`,
+        { encoding: 'utf-8' },
+    );
+    const json = JSON.parse(raw);
+    return {
+        coseSign1Hex: json.output.COSE_Sign1_hex,
+        coseKeyHex: json.output.COSE_Key_hex,
+        key: json.publicKey,
+        signature: json.signature,
+    };
+}
+
+/** Compute merkleRoot the same way the middleware does. */
+function computeMerkleRoot(payload: SignedVotePayload): string {
+    return bytesToHex(blake2b256(JSON.stringify(payload)));
+}
+
+// ---------------------------------------------------------------------------
+// HTTP helper
+// ---------------------------------------------------------------------------
+
+const headers = () => ({
     'Content-Type': 'application/json',
     'x-api-key': API_KEY,
-};
+});
 
 async function api(method: string, path: string, body?: unknown) {
     const res = await fetch(`${API_URL}${path}`, {
         method,
-        headers,
+        headers: headers(),
         body: body ? JSON.stringify(body) : undefined,
     });
     const json = await res.json();
     return { status: res.status, json };
 }
 
+// ---------------------------------------------------------------------------
 // Shared state across ordered tests
+// ---------------------------------------------------------------------------
+
+let prepareTxHash: string;
 let policyId: string;
 let fingerprint: string;
 let instanceAssetName: string;
 let ballotIpfsCid: string;
 let ballotContentHash: string;
-let prepareTxHash: string;
+let drepKeys: DRepKeys;
 let voteReceipt: { txHash: string; voteHash: string; ipfsCid: string; tokenName: string };
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 describe('Ekklesia Hydra E2E — Full Ballot Lifecycle', () => {
 
@@ -54,12 +129,16 @@ describe('Ekklesia Hydra E2E — Full Ballot Lifecycle', () => {
     // -----------------------------------------------------------------------
 
     beforeAll(() => {
+        if (!API_URL) throw new Error('E2E_API_URL is required');
         if (!API_KEY) throw new Error('E2E_API_KEY is required');
-        if (!VOTER_ID) throw new Error('E2E_VOTER_ID is required (bech32 voter ID)');
+
+        // Generate DRep keys once for the entire test run
+        drepKeys = generateDRepKeys();
+        console.log(`  Generated DRep: ${drepKeys.drepId}`);
     });
 
     it('should be reachable', async () => {
-        const { status, } = await api('GET', '/');
+        const { status } = await api('GET', '/');
         expect(status).toBe(200);
     });
 
@@ -132,18 +211,17 @@ describe('Ekklesia Hydra E2E — Full Ballot Lifecycle', () => {
             expect(json.data.ballotIpfsCid).toBeDefined();
             expect(json.data.ballotContentHash).toBeDefined();
 
-            // Save for subsequent tests
+            prepareTxHash = json.data.txHash;
             policyId = json.data.policyId;
             fingerprint = json.data.fingerprint;
             instanceAssetName = json.data.instanceAssetName;
             ballotIpfsCid = json.data.ballotIpfsCid;
             ballotContentHash = json.data.ballotContentHash;
-            prepareTxHash = json.data.txHash;
 
             console.log(`  Ballot minted: ${prepareTxHash}`);
             console.log(`  Policy ID: ${policyId}`);
             console.log(`  IPFS CID: ${ballotIpfsCid}`);
-        }, 120_000); // L1 tx can be slow
+        }, 120_000);
     });
 
     // -----------------------------------------------------------------------
@@ -152,8 +230,6 @@ describe('Ekklesia Hydra E2E — Full Ballot Lifecycle', () => {
 
     describe('POST /start — commit (601) + gas into Hydra head', () => {
         it('should open the head and cache the ballot', async () => {
-            // The (601) token is at output index 1, gas at index 2
-            // (index 0 is the (600) which stays on L1)
             const { status, json } = await api('POST', '/start', {
                 utxos: [
                     { txHash: prepareTxHash, outputIndex: 1 },
@@ -167,7 +243,7 @@ describe('Ekklesia Hydra E2E — Full Ballot Lifecycle', () => {
             expect(json.data.ballotCached).toBe(true);
 
             console.log('  Head opened, ballot cached');
-        }, 240_000); // Head open can take up to 3 min
+        }, 240_000);
     });
 
     // -----------------------------------------------------------------------
@@ -186,45 +262,47 @@ describe('Ekklesia Hydra E2E — Full Ballot Lifecycle', () => {
     });
 
     // -----------------------------------------------------------------------
-    // Phase 4: Register + Vote
+    // Phase 4: Register + Vote (with real COSE signatures)
     // -----------------------------------------------------------------------
 
     describe('POST /vote-and-register — register voter and cast first vote', () => {
-        it('should register and vote in one transaction', async () => {
-            const { status, json } = await api('POST', '/vote-and-register', {
-                voterId: VOTER_ID,
+        it('should register and vote with a real COSE signature', async () => {
+            const votes = [
+                { questionId: 'q1', selection: [1] },        // Yes
+                { questionId: 'q2', selection: [0, 2] },     // Options A + C
+            ];
+
+            // Build the same signed payload the server will compute
+            const signedPayload: SignedVotePayload = {
                 ballotId: prepareTxHash,
-                votes: [
-                    { questionId: 'q1', selection: [1] },        // Yes
-                    { questionId: 'q2', selection: [0, 2] },     // Options A + C
-                ],
-                signature: {
-                    // NOTE: These must be real COSE signatures for the test to pass
-                    // signature verification. In a real test, generate these from
-                    // the voter's wallet.
-                    COSE_Sign1_hex: process.env.E2E_COSE_SIGN1 ?? 'placeholder',
-                    COSE_Key_hex: process.env.E2E_COSE_KEY ?? 'placeholder',
-                    key: process.env.E2E_SIG_KEY ?? 'placeholder',
-                    signature: process.env.E2E_SIG ?? 'placeholder',
-                },
+                nonce: 1,
+                votes,
+            };
+
+            // Compute merkleRoot and sign it
+            const merkleRoot = computeMerkleRoot(signedPayload);
+            const signature = signMerkleRoot(merkleRoot, drepKeys.secretKey, drepKeys.drepId);
+
+            console.log(`  merkleRoot: ${merkleRoot}`);
+            console.log(`  Signing with DRep: ${drepKeys.drepId}`);
+
+            const { status, json } = await api('POST', '/vote-and-register', {
+                voterId: drepKeys.drepId,
+                ballotId: prepareTxHash,
+                votes,
+                signature,
             });
 
-            // If signature verification is enabled and we have placeholders, this will 401
-            // That's expected — the test documents the full flow
-            if (status === 200) {
-                expect(json.status).toBe('SUCCESS');
-                expect(json.data.registered).toBe(true);
-                expect(json.data.txHash).toBeDefined();
-                expect(json.data.voteHash).toBeDefined();
-                expect(json.data.ipfsCid).toBeDefined();
+            expect(status).toBe(200);
+            expect(json.status).toBe('SUCCESS');
+            expect(json.data.txHash).toBeDefined();
+            expect(json.data.voteHash).toBeDefined();
+            expect(json.data.ipfsCid).toBeDefined();
 
-                voteReceipt = json.data;
-                console.log(`  Registered + voted: ${json.data.txHash}`);
-            } else if (status === 401) {
-                console.log('  Skipped: signature verification failed (expected with placeholders)');
-            } else {
-                console.log(`  Unexpected status ${status}:`, json);
-            }
+            voteReceipt = json.data;
+            console.log(`  Registered + voted: ${json.data.txHash}`);
+            console.log(`  Vote hash: ${json.data.voteHash}`);
+            console.log(`  IPFS CID: ${json.data.ipfsCid}`);
         }, 60_000);
     });
 
@@ -233,21 +311,23 @@ describe('Ekklesia Hydra E2E — Full Ballot Lifecycle', () => {
     // -----------------------------------------------------------------------
 
     describe('GET /votes — list all votes', () => {
-        it('should return votes list', async () => {
+        it('should return at least one vote', async () => {
             const { status, json } = await api('GET', '/votes');
 
             expect(status).toBe(200);
             expect(json.status).toBe('SUCCESS');
-            expect(json.data.totalVoters).toBeGreaterThanOrEqual(0);
+            expect(json.data.totalVoters).toBeGreaterThanOrEqual(1);
         });
     });
 
-    describe('GET /voter/:voterId — lookup specific voter', () => {
-        it('should find or 404 the test voter', async () => {
-            const { status, } = await api('GET', `/voter/${VOTER_ID}`);
+    describe('GET /voter/:voterId — lookup the test voter', () => {
+        it('should find the registered voter', async () => {
+            const { status, json } = await api('GET', `/voter/${drepKeys.drepId}`);
 
-            // 200 if vote-and-register succeeded, 404 if sig verification blocked it
-            expect([200, 404]).toContain(status);
+            expect(status).toBe(200);
+            expect(json.status).toBe('SUCCESS');
+            expect(json.data.voterId).toBe(drepKeys.drepId);
+            expect(json.data.voteHash).toBe(voteReceipt.voteHash);
         });
     });
 
@@ -256,28 +336,24 @@ describe('Ekklesia Hydra E2E — Full Ballot Lifecycle', () => {
     // -----------------------------------------------------------------------
 
     describe('GET /audit — full verification bundle', () => {
-        it('should return audit data', async () => {
+        it('should return audit data with at least one voter', async () => {
             const { status, json } = await api('GET', '/audit');
 
             expect(status).toBe(200);
             expect(json.status).toBe('SUCCESS');
             expect(json.data.ballotCached).toBe(true);
-            expect(json.data.totalVoters).toBeGreaterThanOrEqual(0);
+            expect(json.data.totalVoters).toBeGreaterThanOrEqual(1);
         });
     });
 
     describe('GET /audit/vote/:voterId — single voter audit', () => {
-        it('should return voter evidence or 404', async () => {
-            const { status, json } = await api('GET', `/audit/vote/${VOTER_ID}`);
+        it('should return voter evidence with verification data', async () => {
+            const { status, json } = await api('GET', `/audit/vote/${drepKeys.drepId}`);
 
-            // 200 if voted, 404 if not
-            expect([200, 404]).toContain(status);
-
-            if (status === 200) {
-                expect(json.data.cacheEntry).toBeDefined();
-                expect(json.data.verification).toBeDefined();
-                expect(json.data.history).toBeDefined();
-            }
+            expect(status).toBe(200);
+            expect(json.data.cacheEntry).toBeDefined();
+            expect(json.data.verification).toBeDefined();
+            expect(json.data.history).toBeDefined();
         });
     });
 
@@ -292,15 +368,16 @@ describe('Ekklesia Hydra E2E — Full Ballot Lifecycle', () => {
                 ballotName: instanceAssetName,
             });
 
-            if (status === 200) {
-                expect(json.status).toBe('SUCCESS');
-                expect(json.data.resultsHash).toBeDefined();
-                expect(json.data.evidenceDirectoryCid).toBeDefined();
-                expect(json.data.evidenceMerkleRoot).toBeDefined();
-                console.log(`  Finalized: ${json.data.evidenceDirectoryCid}`);
-            } else {
-                console.log(`  Finalize status ${status}:`, json.message);
-            }
+            expect(status).toBe(200);
+            expect(json.status).toBe('SUCCESS');
+            expect(json.data.resultsHash).toBeDefined();
+            expect(json.data.evidenceDirectoryCid).toBeDefined();
+            expect(json.data.evidenceMerkleRoot).toBeDefined();
+            expect(json.data.totalVoters).toBeGreaterThanOrEqual(1);
+
+            console.log(`  Finalized: ${json.data.evidenceDirectoryCid}`);
+            console.log(`  Results hash: ${json.data.resultsHash}`);
+            console.log(`  Total voters: ${json.data.totalVoters}`);
         }, 120_000);
     });
 

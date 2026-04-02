@@ -450,14 +450,13 @@ router.post('/vote-and-register', async (req, res) => {
             }
         }
 
-        // --- 1. Build evidence bundle ---
+        // --- 1. Build signed payload (timestamp excluded — nonce provides replay protection) ---
         const timestamp = new Date().toISOString();
 
         const signedPayload: SignedVotePayload = {
             ballotId,
             nonce,
             votes,
-            timestamp,
         };
 
         // --- 2. Compute hashes ---
@@ -622,14 +621,13 @@ router.post('/vote', async (req, res) => {
             }
         }
 
-        // --- 1. Build signed payload + compute hashes ---
+        // --- 1. Build signed payload (timestamp excluded — nonce provides replay protection) ---
         const timestamp = new Date().toISOString();
 
         const signedPayload: SignedVotePayload = {
             ballotId,
             nonce,
             votes,
-            timestamp,
         };
 
         const merkleRoot = bytesToHex(blake2b256(JSON.stringify(signedPayload)));

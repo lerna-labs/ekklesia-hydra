@@ -292,7 +292,6 @@ export interface SignedVotePayload {
     ballotId: string;
     nonce: number;
     votes: VoteSelection[];
-    timestamp: string;
 }
 
 // ---------------------------------------------------------------------------

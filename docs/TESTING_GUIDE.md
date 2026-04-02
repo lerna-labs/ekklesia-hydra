@@ -1,173 +1,105 @@
-# Ekklesia Hydra E2E Testing Guide
+# Ekklesia Hydra Testing Guide
 
-Step-by-step guide for running a complete voting lifecycle on Cardano testnet
-using the Ekklesia Hydra middleware.
+Testing guide for the Ekklesia Hydra voting middleware against a live
+Hydra SDK stack.
 
 ---
 
 ## 1. Prerequisites
 
-- **Docker** — for running the middleware container
-- **Node.js 22+** — for local development / running tests
-- **Hydra node** — running and connected to Cardano testnet
-- **IPFS node** — Kubo HTTP API (default: `http://localhost:5001`)
-- **Blockfrost API key** — for testnet (`preview` or `preprod`)
-- **TRP server** — Tx3 runtime protocol endpoint
+- **Remote VM** with the full Hydra SDK stack running (Hydra node, IPFS,
+  TRP, Blockfrost, admin wallet with funds)
+- **Node.js 22+** on the machine running tests
+- **cardano-signer** CLI installed ([github.com/gitmachtl/cardano-signer](https://github.com/gitmachtl/cardano-signer))
+  — used by the E2E test for key generation and CIP-8 signing
 
 ---
 
-## 2. Testnet Wallet Setup
+## 2. Configuration
 
-### 2.1 Generate an admin wallet
+The E2E tests are configured via environment variables:
 
-Use `cardano-cli` to generate a new key pair:
-
-```bash
-cardano-cli address key-gen \
-  --verification-key-file admin.vkey \
-  --signing-key-file admin.skey
-
-cardano-cli address build \
-  --payment-verification-key-file admin.vkey \
-  --out-file admin.addr \
-  --testnet-magic 2  # preview testnet
-```
-
-### 2.2 Export the CBOR signing key
-
-The middleware expects `HYDRA_ADMIN_CARDANO_PK` as CBOR hex:
-
-```bash
-cat admin.skey | jq -r '.cborHex'
-# Use this value for HYDRA_ADMIN_CARDANO_PK
-```
-
-### 2.3 Derive the enterprise address
-
-The enterprise address (no staking component) is what the middleware uses
-for all operations:
-
-```bash
-cat admin.addr
-# e.g., addr_test1qz...
-```
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `E2E_API_URL` | Yes | Middleware base URL (e.g., `http://10.0.0.5:3000`) |
+| `E2E_API_KEY` | Yes | Value for the `x-api-key` header |
+| `E2E_CLOSE_TOKEN` | No | Token to close the head (default: `shutitdown`) |
 
 ---
 
-## 3. Get Testnet Funds
+## 3. Running the Automated E2E Tests
 
-### 3.1 Request tADA from the faucet
-
-Visit the Cardano testnet faucet:
-- **Preview**: https://docs.cardano.org/cardano-testnets/tools/faucet/
-
-Enter your enterprise address from step 2.3. You'll receive ~10,000 tADA.
-
-### 3.2 Verify funds arrived
+The E2E test covers the full ballot lifecycle: mint → open head → register
++ vote (with real COSE signatures) → query → audit → finalize → burn →
+close head.
 
 ```bash
-# Using Blockfrost API
-curl -H "project_id: YOUR_BLOCKFROST_KEY" \
-  https://cardano-preview.blockfrost.io/api/v0/addresses/$(cat admin.addr)
+E2E_API_URL=http://<vm-ip>:3000 \
+E2E_API_KEY=<your-api-key> \
+npm run test:e2e
 ```
 
-Wait for the transaction to be confirmed (~20 seconds on preview).
+The test generates a fresh DRep key pair on each run using `cardano-signer`,
+computes the correct `blake2b256` merkle root, signs it with CIP-8
+COSE_Sign1, and submits a real vote. All assertions are strict (expect
+200 responses, not fallback 401s).
 
----
+### Running the signing unit test
 
-## 4. Environment Configuration
-
-### 4.1 Create `.local.env`
-
-```env
-# Admin wallet
-HYDRA_ADMIN_CARDANO_PK=5820<your-skey-cbor-hex>
-
-# Network
-HYDRA_NETWORK=0
-
-# Infrastructure
-HYDRA_API_URL=http://localhost:4001
-HYDRA_WS_URL=ws://localhost:4001
-TRP_URL=http://localhost:50051
-BLOCKFROST_API_KEY=previewXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
-IPFS_API_URL=http://localhost:5001
-IPFS_STAGING_DIR=/ipfs-staging
-
-# Auth
-X_API_KEY=test-api-key-123
-CLOSE_TOKEN=shutitdown
-```
-
-### 4.2 Start the middleware
-
-**Docker:**
-```bash
-docker build -t ekklesia-hydra .
-docker run -p 3000:3000 --env-file .local.env ekklesia-hydra
-```
-
-**Local development:**
-```bash
-npm run dev
-```
-
-### 4.3 Verify the middleware is running
+A faster offline test validates COSE signature construction against the
+SDK's `verifySignature()` without needing any network infrastructure:
 
 ```bash
-curl http://localhost:3000/
-# → "Hydra SDK API is running"
+npx vitest run tests/signing.test.ts
 ```
 
 ---
 
-## 5. Mint Ballot Tokens (L1)
+## 4. Manual Testing with curl
 
-### 5.1 Prepare the ballot
+### 4.1 Generate DRep keys
 
 ```bash
-curl -X POST http://localhost:3000/prepare \
+cardano-signer keygen --path drep --json-extended
+```
+
+Save the output — you'll need `drepIdBech` (voter ID) and `secretKey`
+(for signing).
+
+### 4.2 Check middleware health
+
+```bash
+curl http://<vm-ip>:3000/health \
+  -H "x-api-key: <your-api-key>"
+```
+
+### 4.3 Mint ballot tokens (L1)
+
+```bash
+curl -X POST http://<vm-ip>:3000/prepare \
   -H "Content-Type: application/json" \
-  -H "x-api-key: test-api-key-123" \
+  -H "x-api-key: <your-api-key>" \
   -d '{
-    "namespace": "vote.ekklesia.test.e2e-2026-03",
+    "namespace": "vote.ekklesia.test.manual",
     "ballot": {
-      "specVersion": "0.3.0",
-      "title": "E2E Test Ballot",
-      "description": "End-to-end test ballot for Hydra voting",
-      "questions": [
-        {
-          "questionId": "q1",
-          "question": "Do you approve this proposal?",
-          "method": "binary",
-          "options": [
-            { "label": "Yes", "value": 1 },
-            { "label": "No", "value": 0 },
-            { "label": "Abstain", "value": 2 }
-          ]
-        },
-        {
-          "questionId": "q2",
-          "question": "Select your preferred options",
-          "method": "multi-choice",
-          "options": [
-            { "label": "Option A", "value": 0 },
-            { "label": "Option B", "value": 1 },
-            { "label": "Option C", "value": 2 }
-          ],
-          "maxSelections": 2,
-          "minSelections": 1
-        }
-      ],
+      "specVersion": "1.0.0",
+      "title": "Manual Test Ballot",
+      "description": "Manual test",
+      "questions": [{
+        "questionId": "q1",
+        "question": "Approve?",
+        "method": "binary",
+        "options": [
+          { "label": "Yes", "value": 1 },
+          { "label": "No", "value": 0 },
+          { "label": "Abstain", "value": 2 }
+        ]
+      }],
       "roleWeighting": { "DRep": "CredentialBased" },
       "endEpoch": 999,
       "ekklesia": {
-        "namespace": "",
-        "votingAuthority": "",
-        "context": "hydra-head",
-        "acceptedCredentials": ["0x22"],
-        "merkleRoot": "",
-        "ballotIpfsCid": "",
+        "namespace": "", "votingAuthority": "", "context": "hydra-head",
+        "acceptedCredentials": ["0x22"], "merkleRoot": "", "ballotIpfsCid": "",
         "votingWindow": {
           "open": "2026-04-01T00:00:00Z",
           "close": "2026-04-30T00:00:00Z"
@@ -178,324 +110,137 @@ curl -X POST http://localhost:3000/prepare \
   }'
 ```
 
-### 5.2 Save the response
+Save `txHash` (used as `ballotId`), `instanceAssetName` (used as
+`ballotName`), and `ballotIpfsCid`.
 
-The response contains values you'll need throughout the test:
-
-```json
-{
-  "status": "SUCCESS",
-  "data": {
-    "txHash": "<save this — used as ballotId>",
-    "policyId": "<save this>",
-    "fingerprint": "<save this>",
-    "instanceAssetName": "<save this — used as ballotName>",
-    "ballotIpfsCid": "<save this — used in /start>",
-    "commitUtxos": [
-      { "txHash": "...", "outputIndex": 1 },
-      { "txHash": "...", "outputIndex": 2 }
-    ]
-  }
-}
-```
-
-### 5.3 Wait for L1 confirmation
-
-The minting transaction needs to be confirmed on-chain before committing
-to the Hydra head. Wait ~20 seconds, then verify:
+### 4.4 Open head
 
 ```bash
-curl -H "project_id: YOUR_BLOCKFROST_KEY" \
-  "https://cardano-preview.blockfrost.io/api/v0/txs/<txHash>"
-```
-
----
-
-## 6. Open the Hydra Head
-
-```bash
-curl -X POST http://localhost:3000/start \
+curl -X POST http://<vm-ip>:3000/start \
   -H "Content-Type: application/json" \
-  -H "x-api-key: test-api-key-123" \
+  -H "x-api-key: <your-api-key>" \
   -d '{
     "utxos": [
-      { "txHash": "<txHash from /prepare>", "outputIndex": 1 },
-      { "txHash": "<txHash from /prepare>", "outputIndex": 2 }
+      { "txHash": "<txHash>", "outputIndex": 1 },
+      { "txHash": "<txHash>", "outputIndex": 2 }
     ],
-    "ballotIpfsCid": "<ballotIpfsCid from /prepare>"
+    "ballotIpfsCid": "<ballotIpfsCid>"
   }'
 ```
 
-This waits up to 180 seconds for the head to open. On success:
+### 4.5 Compute merkle root and sign
 
-```json
-{ "status": "SUCCESS", "data": { "ballotCached": true } }
-```
-
-### 6.1 Verify head is open
+The voter signs `blake2b256(JSON.stringify({ballotId, nonce, votes}))`.
+Compute the merkle root:
 
 ```bash
-curl http://localhost:3000/health \
-  -H "x-api-key: test-api-key-123"
-# → { "status": "SUCCESS", "data": { "headStatus": { ... } } }
+# Compute the merkle root (example using Node.js one-liner)
+node --input-type=module -e "
+import { blake2b256, bytesToHex } from '@lerna-labs/hydra-proof';
+const payload = {
+  ballotId: '<txHash>',
+  nonce: 1,
+  votes: [{ questionId: 'q1', selection: [1] }]
+};
+console.log(bytesToHex(blake2b256(JSON.stringify(payload))));
+"
 ```
 
----
-
-## 7. Register Voters and Cast Votes
-
-### 7.1 Single vote (register + vote)
+Then sign:
 
 ```bash
-curl -X POST http://localhost:3000/vote-and-register \
+cardano-signer sign --cip8 \
+  --data "<merkleRoot hex from above>" \
+  --secret-key "<secretKey hex from keygen>" \
+  --address "<drepIdBech from keygen>" \
+  --json-extended
+```
+
+### 4.6 Submit vote
+
+```bash
+curl -X POST http://<vm-ip>:3000/vote-and-register \
   -H "Content-Type: application/json" \
-  -H "x-api-key: test-api-key-123" \
+  -H "x-api-key: <your-api-key>" \
   -d '{
-    "voterId": "drep1<your-drep-bech32>",
-    "ballotId": "<txHash from /prepare>",
-    "votes": [
-      { "questionId": "q1", "selection": [1] },
-      { "questionId": "q2", "selection": [0, 2] }
-    ],
+    "voterId": "<drepIdBech>",
+    "ballotId": "<txHash>",
+    "votes": [{ "questionId": "q1", "selection": [1] }],
     "signature": {
-      "coseSign1Hex": "<COSE_Sign1 hex from wallet>",
-      "coseKeyHex": "<COSE_Key hex from wallet>",
-      "key": "<raw key hex>",
-      "signature": "<raw signature hex>"
+      "coseSign1Hex": "<COSE_Sign1_hex from sign output>",
+      "coseKeyHex": "<COSE_Key_hex from sign output>",
+      "key": "<publicKey from sign output>",
+      "signature": "<signature from sign output>"
     }
   }'
 ```
 
-### 7.2 Constructing COSE signatures
-
-The voter must sign a specific payload. The signed message is:
-
-```
-merkleRoot = blake2b_256(JSON.stringify({
-  ballotId: "<ballotId>",
-  nonce: 1,
-  votes: [{ questionId: "q1", selection: [1] }, ...],
-  timestamp: "<ISO timestamp>"
-}))
-```
-
-Use a CIP-30 compatible wallet (e.g., Eternl, Nami, Lace) to produce the
-COSE_Sign1 and COSE_Key from the voter's DRep credential.
-
-### 7.3 Stress testing (multiple voters)
-
-For stress testing, loop the `/vote-and-register` endpoint with different
-voter IDs. Each voter needs a unique bech32 credential:
+### 4.7 Query and audit
 
 ```bash
-# Example: register 100 voters
-for i in $(seq 1 100); do
-  curl -X POST http://localhost:3000/vote-and-register \
-    -H "Content-Type: application/json" \
-    -H "x-api-key: test-api-key-123" \
-    -d "{
-      \"voterId\": \"drep1voter${i}...\",
-      \"ballotId\": \"<txHash>\",
-      \"votes\": [{ \"questionId\": \"q1\", \"selection\": [1] }],
-      \"signature\": { ... }
-    }"
-done
-```
-
-**Recommended test sizes:**
-- Smoke test: 1-5 voters
-- Integration test: 10-25 voters
-- Stress test: 100-500 voters
-- Load test: 500+ voters (monitor Hydra node memory/throughput)
-
----
-
-## 8. Query During Voting
-
-```bash
-# All votes (slim list)
-curl http://localhost:3000/votes -H "x-api-key: test-api-key-123"
+# All votes
+curl http://<vm-ip>:3000/votes -H "x-api-key: <your-api-key>"
 
 # Specific voter
-curl http://localhost:3000/voter/drep1... -H "x-api-key: test-api-key-123"
-
-# Ballot definition
-curl http://localhost:3000/ballot -H "x-api-key: test-api-key-123"
+curl http://<vm-ip>:3000/voter/<drepIdBech> -H "x-api-key: <your-api-key>"
 
 # Full audit bundle
-curl http://localhost:3000/audit -H "x-api-key: test-api-key-123"
+curl http://<vm-ip>:3000/audit -H "x-api-key: <your-api-key>"
 
-# Single voter audit (with IPFS evidence)
-curl http://localhost:3000/audit/vote/drep1... -H "x-api-key: test-api-key-123"
+# Single voter audit
+curl http://<vm-ip>:3000/audit/vote/<drepIdBech> -H "x-api-key: <your-api-key>"
 ```
 
----
-
-## 9. Settle the Vote
-
-### Option A: Full settlement (recommended)
-
-Runs finalize → burn all voter tokens → close head in one call:
+### 4.8 Settle
 
 ```bash
-curl -X POST http://localhost:3000/settle \
+curl -X POST http://<vm-ip>:3000/settle \
   -H "Content-Type: application/json" \
-  -H "x-api-key: test-api-key-123" \
+  -H "x-api-key: <your-api-key>" \
   -d '{
-    "ballotId": "<txHash from /prepare>",
-    "ballotName": "<instanceAssetName from /prepare>",
+    "ballotId": "<txHash>",
+    "ballotName": "<instanceAssetName>",
     "closeToken": "shutitdown"
   }'
 ```
 
-### Option B: Manual step-by-step
-
-```bash
-# Step 1: Finalize (tally + IPFS pin + update (601) datum)
-curl -X POST http://localhost:3000/finalize \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: test-api-key-123" \
-  -d '{
-    "ballotId": "<txHash>",
-    "ballotName": "<instanceAssetName>"
-  }'
-
-# Step 2: Burn all voter tokens
-curl -X POST http://localhost:3000/count \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: test-api-key-123" \
-  -d '{}'
-
-# Step 3: Close head
-curl -X POST http://localhost:3000/close \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: test-api-key-123" \
-  -d '{ "closeToken": "shutitdown" }'
-```
-
-### 9.1 Save settlement results
-
-From the `/settle` or `/finalize` response, save:
-- `resultsHash` — blake2b_256 of results JSON
-- `evidenceDirectoryCid` — IPFS directory CID containing all evidence
-- `evidenceMerkleRoot` — merkle root of all vote hashes
-- `totalVoters` — voter count
-
 ---
 
-## 10. Verify Results on Testnet
+## 5. Signature Reference
 
-After settlement, the (601) token returns to L1 via Hydra fanout with an
-updated datum. Follow the [Auditor Verification Guide](AUDITOR_GUIDE.md)
-to independently verify.
+### What gets signed
 
-### 10.1 Find the (601) token on L1
+The voter signs a blake2b-256 hash of the `SignedVotePayload`:
 
-```bash
-# Query admin address UTxOs via Blockfrost
-curl -H "project_id: YOUR_BLOCKFROST_KEY" \
-  "https://cardano-preview.blockfrost.io/api/v0/addresses/<admin-addr>/utxos"
-
-# Look for the UTxO containing asset with prefix 00259a20 (601 label)
-```
-
-### 10.2 Read the (601) datum
-
-The inline datum should show:
-
-```json
-{
-  "BallotId": "<ballotId>",
-  "Status": 3,
-  "ResultsHash": "<matches resultsHash from /settle>",
-  "EvidenceCid": "<matches evidenceDirectoryCid>",
-  "TotalVoters": 42,
-  "MerkleRoot": "<matches evidenceMerkleRoot>"
+```typescript
+SignedVotePayload = {
+    ballotId: string,   // tx hash from /prepare
+    nonce: number,      // 1 for first vote, increments on updates
+    votes: VoteSelection[]
 }
+merkleRoot = blake2b256(JSON.stringify(signedPayload))  // 64-char hex
 ```
 
-### 10.3 Fetch evidence from IPFS
+The merkle root hex string is signed as CIP-8 COSE_Sign1 text payload
+(not hashed, not hex-decoded — the ASCII hex string itself is the payload).
 
-```bash
-# Fetch the results file
-curl "https://ipfs.io/ipfs/<evidenceDirectoryCid>/results.json"
+### COSE_Sign1 structure
 
-# Fetch a specific voter's evidence
-curl "https://ipfs.io/ipfs/<evidenceDirectoryCid>/votes/<tokenName>.json"
-
-# Fetch a voter's merkle inclusion proof
-curl "https://ipfs.io/ipfs/<evidenceDirectoryCid>/proofs/<voterId>.json"
-```
-
-### 10.4 Verify cryptographic integrity
-
-1. `blake2b_256(results.json)` should match the on-chain `ResultsHash`
-2. Each voter's `blake2b_256(evidence JSON)` should match their `voteHash`
-3. Each voter's merkle inclusion proof should resolve to the on-chain `MerkleRoot`
-4. Each voter's COSE signature should verify against their credential
-
-See the full verification checklist in [AUDITOR_GUIDE.md](AUDITOR_GUIDE.md).
+The middleware's SDK verifies three things:
+1. **Ed25519 signature** is valid over the COSE Sig_structure
+2. **Payload matches** — extracted COSE payload (as ASCII) equals the
+   merkle root hex string
+3. **Address matches** — blake2b-224 of the COSE_Key public key matches
+   the DRep credential hash (first byte of bech32 data skipped)
 
 ---
 
-## 11. Stress Test Parameters
+## 6. Troubleshooting
 
-| Metric | Where to measure |
-|--------|-----------------|
-| Vote submission throughput | Time between `/vote-and-register` calls |
-| IPFS pin latency | Time for IPFS pin during each vote |
-| Finalization time | Duration of `/finalize` (scales with voter count) |
-| Burn throughput | Sequential burns in `/count` |
-| Head close + fanout | Duration of `/close` |
-| Evidence directory size | IPFS directory size after `/finalize` |
-
-**Known scaling characteristics:**
-- Voter token burns are sequential (each depends on UTxO state from previous)
-- Merkle tree construction at finalization scales O(n log n)
-- IPFS pinning at finalization pins all evidence files in one directory
-- Hydra head transaction throughput depends on node configuration
-
----
-
-## 12. Cleanup
-
-### 12.1 Return tADA to the faucet
-
-After testing, return unused tADA to the faucet return address (listed on
-the faucet page) to keep testnet funds circulating.
-
-### 12.2 Tear down containers
-
-```bash
-docker stop <container-id>
-# Also stop Hydra node, IPFS node, TRP server as needed
-```
-
-### 12.3 Clean up staging directory
-
-```bash
-rm -rf /ipfs-staging/*
-```
-
----
-
-## 13. Running the Automated E2E Tests
-
-The repository includes a vitest-based integration test that covers the
-full lifecycle:
-
-```bash
-# Requires all services running (Hydra, IPFS, TRP, Blockfrost)
-npm run test:e2e
-```
-
-The test file is at `tests/e2e.test.ts`. It covers:
-1. Ballot minting (`POST /prepare`)
-2. Head open (`POST /start`)
-3. Vote + register (`POST /vote-and-register`)
-4. Query endpoints (`GET /ballot`, `/votes`, `/voter/:id`, `/audit`)
-5. Settlement (`POST /finalize`)
-
-**Note:** The automated test uses placeholder COSE signatures by default.
-Set the `E2E_COSE_SIGN1`, `E2E_COSE_KEY`, `E2E_SIG_KEY`, and `E2E_SIG`
-environment variables with real signatures to test signature verification.
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `SIGNATURE_INVALID` / 401 | Merkle root mismatch between client and server | Ensure `JSON.stringify` field order matches: `{ballotId, nonce, votes}` |
+| `CONFLICT` / 409 on vote-and-register | Voter already registered | Use `POST /vote` with incremented nonce instead |
+| 503 on vote endpoints | IPFS node unreachable | Check IPFS_API_URL connectivity from the VM |
+| Head not opening (timeout) | UTxO not confirmed on L1 | Wait for L1 confirmation (~20s) before calling /start |
+| `cardano-signer` not found | CLI not in PATH | Install from [github.com/gitmachtl/cardano-signer](https://github.com/gitmachtl/cardano-signer) |
