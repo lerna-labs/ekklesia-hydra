@@ -202,14 +202,15 @@ router.post('/prepare', async (req, res) => {
             .mint('1', POLICY_ID, instanceAssetName)
             .mintingScript(SCRIPT_CBOR)
             // Output: (600) token with inline datum → stays on L1
+            // Min UTxO for token + inline datum is ~3-4 ADA on Conway; use 5 ADA for safety
             .txOut(admin_address, [
-                { unit: 'lovelace', quantity: '2000000' },
+                { unit: 'lovelace', quantity: '5000000' },
                 { unit: POLICY_ID + definitionAssetName, quantity: '1' },
             ])
             .txOutInlineDatumValue(JSON.stringify(definitionDatum))
             // Output: (601) token with inline datum → will be committed to Hydra
             .txOut(admin_address, [
-                { unit: 'lovelace', quantity: '2000000' },
+                { unit: 'lovelace', quantity: '5000000' },
                 { unit: POLICY_ID + instanceAssetName, quantity: '1' },
             ])
             .txOutInlineDatumValue(JSON.stringify(instanceDatum))
