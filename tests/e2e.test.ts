@@ -101,7 +101,16 @@ async function api(method: string, path: string, body?: unknown) {
         headers: headers(),
         body: body ? JSON.stringify(body) : undefined,
     });
-    const json = await res.json();
+    const text = await res.text();
+    let json: any;
+    try {
+        json = JSON.parse(text);
+    } catch {
+        json = { raw: text };
+    }
+    if (res.status >= 400) {
+        console.log(`  [${method} ${path}] ${res.status}:`, JSON.stringify(json).slice(0, 300));
+    }
     return { status: res.status, json };
 }
 
@@ -138,14 +147,17 @@ describe('Ekklesia Hydra E2E — Full Ballot Lifecycle', () => {
     });
 
     it('should be reachable', async () => {
-        const { status } = await api('GET', '/');
+        const { status, json } = await api('GET', '/');
         expect(status).toBe(200);
+        expect(json.status).toBe('SUCCESS');
     });
 
     it('should report health', async () => {
-        const { json } = await api('GET', '/health');
-        expect(json.status).toBeDefined();
-    });
+        const { status, json } = await api('GET', '/health');
+        // 200 = head reachable, 503 = Hydra node unreachable (both are valid pre-head states)
+        expect([200, 503]).toContain(status);
+        console.log(`  Health: ${status}`, JSON.stringify(json.data ?? json.message ?? '').slice(0, 200));
+    }, 15_000);
 
     // -----------------------------------------------------------------------
     // Phase 1: Ballot Preparation (L1)

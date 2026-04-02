@@ -6,7 +6,7 @@ import { getCachedBallot } from './lifecycle.js';
 const router = Router();
 
 router.get('/', (_, res) => {
-    res.send('Hydra SDK API is running');
+    return success(res, { message: 'Hydra SDK API is running' });
 });
 
 router.post('/ledger', async (req, res) => {
