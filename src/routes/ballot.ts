@@ -229,7 +229,7 @@ router.post('/prepare', async (req, res) => {
 
         const unsignedTx = await txBuilder
             .changeAddress(admin_address)
-            .selectUtxosFrom(await admin_wallet.getUtxos())
+            .selectUtxosFrom(await blockfrost.fetchAddressUTxOs(admin_address))
             .complete();
 
         // --- 6. Sign and submit ---
