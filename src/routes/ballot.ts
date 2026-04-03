@@ -264,4 +264,63 @@ router.post('/prepare', async (req, res) => {
     }
 });
 
+/**
+ * POST /sweep
+ *
+ * Sweep all native tokens from the admin wallet to a dump address,
+ * leaving only clean ADA UTxOs (needed for Hydra collateral).
+ *
+ * Body:
+ *   dumpAddress: string — bech32 address to receive the swept tokens
+ */
+router.post('/sweep', async (req, res) => {
+    const { dumpAddress } = req.body as { dumpAddress?: string };
+
+    if (!dumpAddress) {
+        return error(res, 'MISSING_FIELDS', 'Missing required field: dumpAddress', 400);
+    }
+
+    try {
+        const blockfrostKey = process.env.BLOCKFROST_API_KEY as string;
+        const blockfrost = new BlockfrostProvider(blockfrostKey);
+        const admin_wallet: MeshWallet = await getAdmin(blockfrostKey);
+        const admin_address = admin_wallet.addresses.enterpriseAddressBech32 as string;
+
+        const utxos = await blockfrost.fetchAddressUTxOs(admin_address);
+
+        // Collect all non-ADA assets
+        const tokens: Array<{ unit: string; quantity: string }> = [];
+        for (const u of utxos) {
+            for (const a of u.output.amount) {
+                if (a.unit !== 'lovelace') {
+                    tokens.push({ unit: a.unit, quantity: a.quantity });
+                }
+            }
+        }
+
+        if (tokens.length === 0) {
+            return success(res, { swept: 0, message: 'Wallet is clean' });
+        }
+
+        const txBuilder = new MeshTxBuilder({ fetcher: blockfrost, evaluator: blockfrost });
+        txBuilder.txOut(dumpAddress, [
+            { unit: 'lovelace', quantity: '5000000' },
+            ...tokens,
+        ]);
+
+        const unsignedTx = await txBuilder
+            .changeAddress(admin_address)
+            .selectUtxosFrom(utxos)
+            .complete();
+
+        const signedTx = await admin_wallet.signTx(unsignedTx);
+        const txHash = await blockfrost.submitTx(signedTx);
+
+        return success(res, { swept: tokens.length, txHash });
+    } catch (err: any) {
+        console.error('Failed to sweep wallet:', err);
+        return error(res, 'INTERNAL_ERROR', err.message || 'Failed to sweep wallet', 500);
+    }
+});
+
 export default router;

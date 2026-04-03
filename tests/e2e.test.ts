@@ -29,6 +29,7 @@ const API_URL = process.env.E2E_API_URL ?? '';
 const API_KEY = process.env.E2E_API_KEY ?? '';
 const CLOSE_TOKEN = process.env.E2E_CLOSE_TOKEN ?? 'shutitdown';
 const BLOCKFROST_KEY = process.env.E2E_BLOCKFROST_KEY ?? '';
+const DUMP_ADDRESS = process.env.E2E_DUMP_ADDRESS ?? '';
 
 // ---------------------------------------------------------------------------
 // Helpers — cardano-signer CLI wrappers
@@ -160,6 +161,52 @@ describe('Ekklesia Hydra E2E — Full Ballot Lifecycle', () => {
         expect([200, 503]).toContain(status);
         console.log(`  Health: ${status}`, JSON.stringify(json.data ?? json.message ?? '').slice(0, 200));
     }, 15_000);
+
+    // -----------------------------------------------------------------------
+    // Phase 0b: Sweep stale tokens from admin wallet
+    // -----------------------------------------------------------------------
+
+    describe('Wallet cleanup — sweep stale tokens', () => {
+        it('should sweep stale tokens to ensure clean collateral', async () => {
+            if (!DUMP_ADDRESS) {
+                console.log('  Skipped: E2E_DUMP_ADDRESS not set');
+                return;
+            }
+
+            const { status, json } = await api('POST', '/sweep', {
+                dumpAddress: DUMP_ADDRESS,
+            });
+
+            if (status === 200 && json.data?.swept === 0) {
+                console.log('  Wallet is clean — no stale tokens');
+            } else if (status === 200) {
+                console.log(`  Swept ${json.data.swept} tokens → ${json.data.txHash}`);
+
+                // Wait for sweep tx to settle
+                if (!BLOCKFROST_KEY) throw new Error('E2E_BLOCKFROST_KEY required to confirm sweep tx');
+                const networkPrefix = BLOCKFROST_KEY.startsWith('preprod')
+                    ? 'cardano-preprod'
+                    : BLOCKFROST_KEY.startsWith('mainnet')
+                        ? 'cardano-mainnet'
+                        : 'cardano-preview';
+                console.log('  Waiting for sweep tx confirmation...');
+                for (let attempt = 0; attempt < 10; attempt++) {
+                    const txRes = await fetch(
+                        `https://${networkPrefix}.blockfrost.io/api/v0/txs/${json.data.txHash}`,
+                        { headers: { project_id: BLOCKFROST_KEY } },
+                    );
+                    if (txRes.ok) {
+                        console.log(`  Sweep confirmed after ~${attempt * 40}s`);
+                        break;
+                    }
+                    if (attempt === 9) throw new Error('Sweep tx not confirmed after 400s');
+                    await new Promise(r => setTimeout(r, 40_000));
+                }
+            } else {
+                console.log(`  Sweep failed: ${json.message}`);
+            }
+        }, 480_000);
+    });
 
     // -----------------------------------------------------------------------
     // Phase 1: Ballot Preparation (L1)
