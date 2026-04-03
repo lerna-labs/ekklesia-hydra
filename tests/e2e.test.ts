@@ -501,14 +501,58 @@ describe('Ekklesia Hydra E2E — Full Ballot Lifecycle', () => {
     });
 
     // -----------------------------------------------------------------------
-    // Phase 9: Post-settlement verification
+    // Phase 9: Wait for contestation period + fanout
     // -----------------------------------------------------------------------
 
-    describe('GET /health — verify head is closed', () => {
-        it('should report non-Open status', async () => {
+    describe('Wait for fanout — contestation period + finalize', () => {
+        it('should wait for head to reach Final state', async () => {
+            // The contestation period is typically 600s (10 min).
+            // Poll health every 30s until the head is FanoutPossible or Final.
+            console.log('  Waiting for contestation period to expire...');
+
+            for (let attempt = 0; attempt < 30; attempt++) {
+                const { json } = await api('GET', '/health');
+                const headStatus = json.data?.headStatus ?? json.status;
+                console.log(`  [${attempt * 30}s] Head status: ${headStatus}`);
+
+                if (headStatus === 'Final') {
+                    console.log('  Head fully finalized!');
+                    return;
+                }
+
+                if (headStatus === 'FanoutPossible') {
+                    // Trigger fanout via /close (Wrangler handles FanoutPossible → Fanout)
+                    console.log('  Contestation period expired, triggering fanout...');
+                    const { status: closeStatus } = await api('POST', '/close', {
+                        closeToken: CLOSE_TOKEN,
+                    });
+                    if (closeStatus === 200) {
+                        console.log('  Fanout triggered, waiting for finalization...');
+                        // Give it a bit to finalize
+                        await new Promise(r => setTimeout(r, 30_000));
+                        const { json: finalJson } = await api('GET', '/health');
+                        console.log(`  Final status: ${finalJson.data?.headStatus}`);
+                        return;
+                    }
+                }
+
+                await new Promise(r => setTimeout(r, 30_000));
+            }
+
+            throw new Error('Head did not reach Final state within 15 minutes');
+        }, 960_000); // 16 min timeout
+    });
+
+    // -----------------------------------------------------------------------
+    // Phase 10: Post-settlement verification
+    // -----------------------------------------------------------------------
+
+    describe('GET /health — verify head is finalized', () => {
+        it('should report Final status', async () => {
             const { json } = await api('GET', '/health');
-            expect(json.status).not.toBe('Open');
-            console.log(`  Final head status: ${json.status}`);
+            const headStatus = json.data?.headStatus ?? 'unknown';
+            console.log(`  Final head status: ${headStatus}`);
+            expect(headStatus).toBe('Final');
         });
     });
 });

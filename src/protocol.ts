@@ -10,7 +10,8 @@ import {
 } from "tx3-sdk/trp";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-const resolve = (client: TRPClient, params: any) => client.resolve(params);
+const resolve = (client: TRPClient, params: any) =>
+    client.resolve({ ...params, bytecode: params.tir });
 
 
 export const DEFAULT_TRP_ENDPOINT = "http://localhost:8164";
@@ -105,35 +106,35 @@ export class Client {
 
     async registerVoterTx(args: RegisterVoterParams): Promise<ResolveResponse> {
         return await resolve(this.#client, {
-            bytecode: REGISTER_VOTER_IR,
+            tir: REGISTER_VOTER_IR,
             args,
         });
     }
 
     async voteAndRegisterTx(args: VoteAndRegisterParams): Promise<ResolveResponse> {
         return await resolve(this.#client, {
-            bytecode: VOTE_AND_REGISTER_IR,
+            tir: VOTE_AND_REGISTER_IR,
             args,
         });
     }
 
     async castVoteTx(args: CastVoteParams): Promise<ResolveResponse> {
         return await resolve(this.#client, {
-            bytecode: CAST_VOTE_IR,
+            tir: CAST_VOTE_IR,
             args,
         });
     }
 
     async countVoteTx(args: CountVoteParams): Promise<ResolveResponse> {
         return await resolve(this.#client, {
-            bytecode: COUNT_VOTE_IR,
+            tir: COUNT_VOTE_IR,
             args,
         });
     }
 
     async finalizeBallotTx(args: FinalizeBallotParams): Promise<ResolveResponse> {
         return await resolve(this.#client, {
-            bytecode: FINALIZE_BALLOT_IR,
+            tir: FINALIZE_BALLOT_IR,
             args,
         });
     }
