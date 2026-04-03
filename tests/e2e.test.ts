@@ -233,7 +233,11 @@ describe('Ekklesia Hydra E2E — Full Ballot Lifecycle', () => {
             console.log(`  Ballot minted: ${prepareTxHash}`);
             console.log(`  Policy ID: ${policyId}`);
             console.log(`  IPFS CID: ${ballotIpfsCid}`);
-        }, 120_000);
+
+            // Wait for L1 confirmation (preprod can have rollbacks)
+            console.log('  Waiting 180s for L1 confirmation...');
+            await new Promise(r => setTimeout(r, 180_000));
+        }, 300_000);
     });
 
     // -----------------------------------------------------------------------
