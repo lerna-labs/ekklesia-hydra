@@ -515,8 +515,8 @@ describe('Ekklesia Hydra E2E — Full Ballot Lifecycle', () => {
                 const headStatus = json.data?.headStatus ?? json.status;
                 console.log(`  [${attempt * 30}s] Head status: ${headStatus}`);
 
-                if (headStatus === 'Final') {
-                    console.log('  Head fully finalized!');
+                if (headStatus === 'Final' || headStatus === 'Idle') {
+                    console.log(`  Head finalized (${headStatus})!`);
                     return;
                 }
 
@@ -547,12 +547,12 @@ describe('Ekklesia Hydra E2E — Full Ballot Lifecycle', () => {
     // Phase 10: Post-settlement verification
     // -----------------------------------------------------------------------
 
-    describe('GET /health — verify head is finalized', () => {
-        it('should report Final status', async () => {
+    describe('GET /health — verify head is back to Idle', () => {
+        it('should report Idle status after fanout', async () => {
             const { json } = await api('GET', '/health');
             const headStatus = json.data?.headStatus ?? 'unknown';
             console.log(`  Final head status: ${headStatus}`);
-            expect(headStatus).toBe('Final');
+            expect(headStatus).toBe('Idle');
         });
     });
 });
