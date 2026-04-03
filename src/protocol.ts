@@ -96,10 +96,15 @@ export class Client {
     readonly #client: TRPClient;
 
     constructor(options: ClientOptions) {
+        console.log("Constructing TRP Client", options);
         this.#client = new TRPClient(options);
     }
 
     async registerVoterTx(args: RegisterVoterParams): Promise<ResolveResponse> {
+        console.log("Registering Voter", {
+            tir: REGISTER_VOTER_IR,
+            args,
+        });
         return await this.#client.resolve({
             tir: REGISTER_VOTER_IR,
             args,
@@ -107,6 +112,10 @@ export class Client {
     }
 
     async voteAndRegisterTx(args: VoteAndRegisterParams): Promise<ResolveResponse> {
+        console.log("Vote and Register", {
+            tir: VOTE_AND_REGISTER_IR,
+            args,
+        })
         return await this.#client.resolve({
             tir: VOTE_AND_REGISTER_IR,
             args,
@@ -114,6 +123,10 @@ export class Client {
     }
 
     async castVoteTx(args: CastVoteParams): Promise<ResolveResponse> {
+        console.log("Casting Vote", {
+            tir: CAST_VOTE_IR,
+            args,
+        })
         return await this.#client.resolve({
             tir: CAST_VOTE_IR,
             args,
@@ -121,6 +134,10 @@ export class Client {
     }
 
     async countVoteTx(args: CountVoteParams): Promise<ResolveResponse> {
+        console.log("Counting Vote", {
+            tir: COUNT_VOTE_IR,
+            args,
+        })
         return await this.#client.resolve({
             tir: COUNT_VOTE_IR,
             args,
@@ -128,6 +145,10 @@ export class Client {
     }
 
     async finalizeBallotTx(args: FinalizeBallotParams): Promise<ResolveResponse> {
+        console.log("Finalizing Ballot", {
+            tir: FINALIZE_BALLOT_IR,
+            args,
+        })
         return await this.#client.resolve({
             tir: FINALIZE_BALLOT_IR,
             args,
