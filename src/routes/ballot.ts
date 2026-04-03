@@ -219,7 +219,8 @@ router.post('/prepare', async (req, res) => {
                 { unit: 'lovelace', quantity: gasLovelace },
             ]);
 
-        // Set transaction validity to match the timelocked script
+        // Transaction validity must not exceed the timelocked script's invalidHereafter.
+        // The voting window open time MUST be in the future to allow minting.
         txBuilder.invalidHereafter(votingOpenSlot);
 
         // Optionally attach CIP-179 surveyDetails as label 17 metadata

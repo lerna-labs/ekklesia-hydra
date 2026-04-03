@@ -122,6 +122,7 @@ let prepareTxHash: string;
 let policyId: string;
 let fingerprint: string;
 let instanceAssetName: string;
+let votingOpenTime: number; // epoch ms — when votes can begin
 let ballotIpfsCid: string;
 let ballotContentHash: string;
 let drepKeys: DRepKeys;
@@ -203,8 +204,8 @@ describe('Ekklesia Hydra E2E — Full Ballot Lifecycle', () => {
                     merkleRoot: '',
                     ballotIpfsCid: '',
                     votingWindow: {
-                        open: new Date().toISOString(),
-                        close: new Date(Date.now() + 86400000).toISOString(),
+                        open: new Date((votingOpenTime = Date.now() + 600_000)).toISOString(),  // 10 minutes from now
+                        close: new Date(Date.now() + 86_400_000).toISOString(),
                     },
                 },
             };
@@ -234,10 +235,10 @@ describe('Ekklesia Hydra E2E — Full Ballot Lifecycle', () => {
             console.log(`  Policy ID: ${policyId}`);
             console.log(`  IPFS CID: ${ballotIpfsCid}`);
 
-            // Wait for L1 confirmation (preprod can have rollbacks)
-            console.log('  Waiting 180s for L1 confirmation...');
-            await new Promise(r => setTimeout(r, 180_000));
-        }, 300_000);
+            // Wait for L1 confirmation before committing to Hydra head
+            console.log('  Waiting 30s for L1 confirmation...');
+            await new Promise(r => setTimeout(r, 30_000));
+        }, 180_000);
     });
 
     // -----------------------------------------------------------------------
@@ -280,6 +281,17 @@ describe('Ekklesia Hydra E2E — Full Ballot Lifecycle', () => {
     // -----------------------------------------------------------------------
     // Phase 4: Register + Vote (with real COSE signatures)
     // -----------------------------------------------------------------------
+
+    describe('Wait for voting window to open', () => {
+        it('should wait until the voting start time', async () => {
+            const remaining = votingOpenTime - Date.now();
+            if (remaining > 0) {
+                console.log(`  Waiting ${Math.ceil(remaining / 1000)}s for voting window to open...`);
+                await new Promise(r => setTimeout(r, remaining));
+            }
+            console.log('  Voting window is open');
+        }, 660_000); // 11 minutes max
+    });
 
     describe('POST /vote-and-register — register voter and cast first vote', () => {
         it('should register and vote with a real COSE signature', async () => {
