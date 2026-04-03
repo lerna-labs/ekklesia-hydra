@@ -1,5 +1,6 @@
 import { Router } from 'express';
-import { Wrangler } from '@lerna-labs/hydra-sdk';
+import { BlockfrostProvider, MeshTxBuilder } from '@meshsdk/core';
+import { getAdmin, Wrangler } from '@lerna-labs/hydra-sdk';
 import { CLOSE_TOKEN, ipfs, success, error } from '../helpers.js';
 import type { BallotDefinition } from '../types.js';
 
@@ -55,7 +56,28 @@ router.post('/start', async (req, res) => {
     }
 
     try {
-        await wrangler.waitForHeadOpen({ utxos }, 180000);
+        // Build a blueprint transaction that spends all the UTxOs to commit.
+        // The Hydra node uses this to determine which UTxOs enter the head.
+        const blockfrostKey = process.env.BLOCKFROST_API_KEY as string;
+        const blockfrost = new BlockfrostProvider(blockfrostKey);
+        const admin_wallet = await getAdmin(blockfrostKey);
+        const admin_address = admin_wallet.addresses.enterpriseAddressBech32 as string;
+
+        const txBuilder = new MeshTxBuilder({ fetcher: blockfrost });
+        for (const u of utxos) {
+            txBuilder.txIn(u.txHash, u.outputIndex);
+        }
+        const blueprintCbor = await txBuilder
+            .changeAddress(admin_address)
+            .complete();
+
+        const blueprintTx = {
+            type: 'Tx ConwayEra' as const,
+            cborHex: blueprintCbor,
+            description: 'Commit Blueprint',
+        };
+
+        await wrangler.waitForHeadOpen({ utxos, blueprintTx }, 180000);
 
         // Cache the ballot definition from IPFS if CID was provided
         if (ballotIpfsCid) {

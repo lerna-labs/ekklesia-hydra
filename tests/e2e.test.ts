@@ -28,6 +28,7 @@ import type { SignedVotePayload } from '../src/types.js';
 const API_URL = process.env.E2E_API_URL ?? '';
 const API_KEY = process.env.E2E_API_KEY ?? '';
 const CLOSE_TOKEN = process.env.E2E_CLOSE_TOKEN ?? 'shutitdown';
+const BLOCKFROST_KEY = process.env.E2E_BLOCKFROST_KEY ?? '';
 
 // ---------------------------------------------------------------------------
 // Helpers — cardano-signer CLI wrappers
@@ -235,10 +236,28 @@ describe('Ekklesia Hydra E2E — Full Ballot Lifecycle', () => {
             console.log(`  Policy ID: ${policyId}`);
             console.log(`  IPFS CID: ${ballotIpfsCid}`);
 
-            // Wait for L1 confirmation before committing to Hydra head
-            console.log('  Waiting 30s for L1 confirmation...');
-            await new Promise(r => setTimeout(r, 30_000));
-        }, 180_000);
+            // Poll Blockfrost until the transaction is confirmed on L1
+            console.log('  Waiting for L1 confirmation...');
+            if (!BLOCKFROST_KEY) throw new Error('E2E_BLOCKFROST_KEY is required to confirm L1 transactions');
+            const networkPrefix = BLOCKFROST_KEY.startsWith('mainnet')
+                ? 'cardano-mainnet'
+                : BLOCKFROST_KEY.startsWith('preprod')
+                    ? 'cardano-preprod'
+                    : 'cardano-preview';
+
+            for (let attempt = 0; attempt < 15; attempt++) {
+                const txRes = await fetch(
+                    `https://${networkPrefix}.blockfrost.io/api/v0/txs/${prepareTxHash}`,
+                    { headers: { project_id: BLOCKFROST_KEY } },
+                );
+                if (txRes.ok) {
+                    console.log(`  Confirmed on L1 after ~${attempt * 40}s`);
+                    break;
+                }
+                if (attempt === 14) throw new Error('Transaction not confirmed after 10 minutes');
+                await new Promise(r => setTimeout(r, 40_000));
+            }
+        }, 660_000);
     });
 
     // -----------------------------------------------------------------------
