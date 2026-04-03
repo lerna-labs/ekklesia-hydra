@@ -217,6 +217,10 @@ router.post('/prepare', async (req, res) => {
             // Output: Gas UTxO for in-head operations
             .txOut(admin_address, [
                 { unit: 'lovelace', quantity: gasLovelace },
+            ])
+            // Output: ADA-only collateral UTxO for Hydra node init/commit transactions
+            .txOut(admin_address, [
+                { unit: 'lovelace', quantity: '5000000' },
             ]);
 
         // Transaction validity must not exceed the timelocked script's invalidHereafter.
