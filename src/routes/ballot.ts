@@ -288,9 +288,8 @@ router.post('/sweep', async (req, res) => {
         const utxos = await blockfrost.fetchAddressUTxOs(admin_address);
 
         if (utxos.length <= 1) {
-            // Already consolidated (0 or 1 UTxO), check for tokens
-            const tokens = utxos.flatMap(u => u.output.amount.filter(a => a.unit !== 'lovelace'));
-            if (tokens.length === 0) {
+            const hasTokens = utxos.some(u => u.output.amount.some(a => a.unit !== 'lovelace'));
+            if (!hasTokens) {
                 return success(res, { swept: 0, consolidated: false, message: 'Wallet is already clean' });
             }
         }
@@ -318,10 +317,13 @@ router.post('/sweep', async (req, res) => {
             ]);
         }
 
-        // All remaining ADA consolidates into the change output (single UTxO)
+        // Explicitly add ALL UTxOs as inputs to force consolidation
+        for (const u of utxos) {
+            txBuilder.txIn(u.input.txHash, u.input.outputIndex);
+        }
+
         const unsignedTx = await txBuilder
             .changeAddress(admin_address)
-            .selectUtxosFrom(utxos)
             .complete();
 
         const signedTx = await admin_wallet.signTx(unsignedTx);
