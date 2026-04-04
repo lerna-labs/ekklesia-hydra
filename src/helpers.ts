@@ -41,6 +41,21 @@ export const voteCache: DiskCache<VoteCacheEntry> = createDiskCache<VoteCacheEnt
     (entry) => entry.voterId,
 );
 
+/**
+ * Parse a TRP submitTx response. Throws on JSON-RPC errors so the caller
+ * doesn't silently treat a rejected transaction as success.
+ */
+export function parseTrpSubmitResponse(responseText: string): { hash?: string } {
+    const parsed = JSON.parse(responseText);
+    if (parsed.error) {
+        const detail = typeof parsed.error.data === 'string'
+            ? parsed.error.data
+            : JSON.stringify(parsed.error.data);
+        throw new Error(`TRP submit rejected: ${parsed.error.message} — ${detail}`);
+    }
+    return { hash: parsed.result?.hash ?? parsed.hash };
+}
+
 /** Recursively convert BigInt values to strings for JSON serialization. */
 export function sanitizeBigInts(obj: any): any {
     if (typeof obj === 'bigint') {

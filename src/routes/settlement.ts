@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { createNativeScript, submitTx, Wrangler } from '@lerna-labs/hydra-sdk';
 import { blake2b256, bytesToHex, computePackage } from '@lerna-labs/hydra-proof';
 import type { FileLeaf } from '@lerna-labs/hydra-proof';
-import { initialize, voterIdToTokenName, TRP_URL, CLOSE_TOKEN, ipfs, voteCache, success, error, debug } from '../helpers.js';
+import { initialize, voterIdToTokenName, TRP_URL, CLOSE_TOKEN, ipfs, voteCache, success, error, debug, parseTrpSubmitResponse } from '../helpers.js';
 import { getCachedBallot } from './lifecycle.js';
 import type {
     FullResults,
@@ -231,13 +231,7 @@ router.post('/finalize', async (req, res) => {
         const submit_response = await submitTx(TRP_URL, signedTx, `0:${ballotName}`);
         const submit_text = await submit_response.text();
         debug(`[finalize] submitTx response (${submit_response.status}):`, submit_text);
-        let txHash: string | undefined;
-        try {
-            const parsed = JSON.parse(submit_text);
-            txHash = parsed.result?.hash ?? parsed.hash;
-        } catch {
-            console.error('[finalize] Failed to parse submit response:', submit_text);
-        }
+        const { hash: txHash } = parseTrpSubmitResponse(submit_text);
 
         return success(res, {
             txHash,
@@ -301,14 +295,7 @@ router.post('/count', async (req, res) => {
                 const submit_response = await submitTx(TRP_URL, signedTx, `0:${tokenName}`);
                 const submit_text = await submit_response.text();
                 debug(`[count] submitTx response for ${vote.voterId} (${submit_response.status}):`, submit_text);
-                let txHash: string | undefined;
-                try {
-                    const parsed = JSON.parse(submit_text);
-                    txHash = parsed.result?.hash ?? parsed.hash;
-                } catch {
-                    // non-JSON response
-                }
-
+                const { hash: txHash } = parseTrpSubmitResponse(submit_text);
                 results.push({ voterId: vote.voterId, txHash });
             } catch (err: any) {
                 console.error(`[count] FULL ERROR for ${vote.voterId}:`, err);
@@ -380,7 +367,35 @@ router.post('/settle', async (req, res) => {
 
         const allVotes = voteCache.getAll();
 
-        // Tally
+        // --- Step 1: Burn all voter tokens ---
+        let burned = 0;
+        let burnFailed = 0;
+        for (const vote of allVotes) {
+            const tokenName = voterIdToTokenName(vote.voterId);
+            try {
+                const burnTrp = await client.countVoteTx({
+                    votingAuthority: admin_payment_address,
+                    mintingScript: Buffer.from(TOKEN_SCRIPT as string, 'hex'),
+                    tokenPolicy: Buffer.from(TOKEN_POLICY as string, 'hex'),
+                    userId: Buffer.from(tokenName, 'hex'),
+                });
+                const burnSignedTx = await admin_wallet.signTx(burnTrp.tx);
+                const burnSubmitText = await (await submitTx(TRP_URL, burnSignedTx, `0:${tokenName}`)).text();
+                parseTrpSubmitResponse(burnSubmitText);
+                burned++;
+            } catch (err: any) {
+                console.error(`[settle/burn] FULL ERROR for ${vote.voterId}:`, err);
+                burnFailed++;
+            }
+        }
+
+        steps.push({
+            step: 'burn',
+            status: burnFailed === 0 ? 'SUCCESS' : 'PARTIAL',
+            data: { burned, failed: burnFailed, total: allVotes.length },
+        });
+
+        // --- Step 2: Tally + finalize (after all tokens burned, clean UTxO set) ---
         const fileLeaves: FileLeaf[] = allVotes.map((v) => ({
             name: v.voterId,
             contentHashHex: v.voteHash,
@@ -441,40 +456,13 @@ router.post('/settle', async (req, res) => {
         });
 
         const finalizeSignedTx = await admin_wallet.signTx(finalizeTrp.tx);
-        const finalizeSubmit = await submitTx(TRP_URL, finalizeSignedTx, `0:${ballotName}`);
-        const finalizeJson = await finalizeSubmit.json() as { hash?: string };
+        const finalizeSubmitText = await (await submitTx(TRP_URL, finalizeSignedTx, `0:${ballotName}`)).text();
+        const { hash: finalizeTxHash } = parseTrpSubmitResponse(finalizeSubmitText);
 
         steps.push({
             step: 'finalize',
             status: 'SUCCESS',
-            data: { txHash: finalizeJson.hash, resultsHash, evidenceDirectoryCid, totalVoters: allVotes.length },
-        });
-
-        // --- Step 2: Burn all voter tokens ---
-        let burned = 0;
-        let burnFailed = 0;
-        for (const vote of allVotes) {
-            const tokenName = voterIdToTokenName(vote.voterId);
-            try {
-                const burnTrp = await client.countVoteTx({
-                    votingAuthority: admin_payment_address,
-                    mintingScript: Buffer.from(TOKEN_SCRIPT as string, 'hex'),
-                    tokenPolicy: Buffer.from(TOKEN_POLICY as string, 'hex'),
-                    userId: Buffer.from(tokenName, 'hex'),
-                });
-                const burnSignedTx = await admin_wallet.signTx(burnTrp.tx);
-                await submitTx(TRP_URL, burnSignedTx, `0:${tokenName}`);
-                burned++;
-            } catch (err: any) {
-                console.error(`[settle/burn] FULL ERROR for ${vote.voterId}:`, err);
-                burnFailed++;
-            }
-        }
-
-        steps.push({
-            step: 'burn',
-            status: burnFailed === 0 ? 'SUCCESS' : 'PARTIAL',
-            data: { burned, failed: burnFailed, total: allVotes.length },
+            data: { txHash: finalizeTxHash, resultsHash, evidenceDirectoryCid, totalVoters: allVotes.length },
         });
 
         // --- Step 3: Close head ---

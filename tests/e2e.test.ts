@@ -538,7 +538,20 @@ describe('Ekklesia Hydra E2E — Full Ballot Lifecycle', () => {
     });
 
     // -----------------------------------------------------------------------
-    // Phase 7: Finalization
+    // Phase 7: Burn voter tokens
+    // -----------------------------------------------------------------------
+
+    describe('POST /count — burn all voter tokens', () => {
+        it('should burn voter tokens', async () => {
+            const { status, json } = await api('POST', '/count');
+
+            expect(status).toBe(200);
+            console.log(`  Burned: ${json.data?.burned ?? 0}/${json.data?.total ?? 0}`);
+        }, 120_000);
+    });
+
+    // -----------------------------------------------------------------------
+    // Phase 8: Finalize (after all tokens burned, clean UTxO set)
     // -----------------------------------------------------------------------
 
     describe('POST /finalize — tally and update (601) datum', () => {
@@ -559,19 +572,6 @@ describe('Ekklesia Hydra E2E — Full Ballot Lifecycle', () => {
             console.log(`  Finalized: ${json.data.evidenceDirectoryCid}`);
             console.log(`  Results hash: ${json.data.resultsHash}`);
             console.log(`  Total voters: ${json.data.totalVoters}`);
-        }, 120_000);
-    });
-
-    // -----------------------------------------------------------------------
-    // Phase 8: Burn + Close
-    // -----------------------------------------------------------------------
-
-    describe('POST /count — burn all voter tokens', () => {
-        it('should burn voter tokens', async () => {
-            const { status, json } = await api('POST', '/count');
-
-            expect(status).toBe(200);
-            console.log(`  Burned: ${json.data?.burned ?? 0}/${json.data?.total ?? 0}`);
         }, 120_000);
     });
 

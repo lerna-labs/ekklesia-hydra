@@ -15,6 +15,7 @@ import {
     voterIdHrp,
     voterIdToTokenName,
     debug,
+    parseTrpSubmitResponse,
 } from '../helpers.js';
 import {getCachedBallot} from './lifecycle.js';
 import type {
@@ -382,8 +383,7 @@ router.post('/register', async (req, res) => {
 
         const signedTx = await admin_wallet.signTx(trp_response.tx);
         const submit_response = await submitTx(TRP_URL, signedTx, `0:${tokenName}`);
-        const parsed = await submit_response.json() as any;
-        const txHash = parsed.result?.hash ?? parsed.hash;
+        const { hash: txHash } = parseTrpSubmitResponse(await submit_response.text());
 
         return success(res, { txHash, tokenName });
     } catch (err: any) {
@@ -512,13 +512,7 @@ router.post('/vote-and-register', async (req, res) => {
         const submit_response = await submitTx(TRP_URL, signedTx, `0:${tokenName}`);
         const submit_text = await submit_response.text();
         debug(`[vote-and-register] submitTx response (${submit_response.status}):`, submit_text);
-        let txHash: string | undefined;
-        try {
-            const parsed = JSON.parse(submit_text);
-            txHash = parsed.result?.hash ?? parsed.hash;
-        } catch {
-            console.error('[vote-and-register] Failed to parse submit response:', submit_text);
-        }
+        const { hash: txHash } = parseTrpSubmitResponse(submit_text);
 
         // --- 5. Cache ---
         const cacheEntry: VoteCacheEntry = {
@@ -693,13 +687,7 @@ router.post('/vote', async (req, res) => {
         const submit_response = await submitTx(TRP_URL, signedTx, `0:${tokenName}`);
         const submit_text = await submit_response.text();
         debug(`[vote] submitTx response (${submit_response.status}):`, submit_text);
-        let txHash: string | undefined;
-        try {
-            const parsed = JSON.parse(submit_text);
-            txHash = parsed.result?.hash ?? parsed.hash;
-        } catch {
-            console.error('[vote] Failed to parse submit response:', submit_text);
-        }
+        const { hash: txHash } = parseTrpSubmitResponse(submit_text);
 
         // --- 5. Write to cache ---
         const cacheEntry: VoteCacheEntry = {
