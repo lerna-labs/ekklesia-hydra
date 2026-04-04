@@ -23,7 +23,15 @@ The E2E tests are configured via environment variables:
 |----------|----------|-------------|
 | `E2E_API_URL` | Yes | Middleware base URL (e.g., `http://10.0.0.5:3000`) |
 | `E2E_API_KEY` | Yes | Value for the `x-api-key` header |
+| `E2E_BLOCKFROST_KEY` | Yes | Blockfrost project ID (for L1 tx confirmation polling) |
 | `E2E_CLOSE_TOKEN` | No | Token to close the head (default: `shutitdown`) |
+| `E2E_DUMP_ADDRESS` | No | Bech32 address to sweep stale tokens to before testing |
+
+### Middleware container environment
+
+Set `VERBOSE=1` on the middleware container to enable debug logging of
+TRP requests, unsigned/signed transaction CBOR, and submit responses.
+Omit it in production for quiet logs (errors always log regardless).
 
 ---
 

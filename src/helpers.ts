@@ -1,7 +1,7 @@
 import { getAdmin, createIpfsClient, createDiskCache } from '@lerna-labs/hydra-sdk';
 import type { IpfsClient, DiskCache } from '@lerna-labs/hydra-sdk';
 import { MeshWallet } from '@meshsdk/core';
-import { Client } from './protocol.js';
+import { TRPClientLogged as Client } from './trp-client.js';
 import { bech32 } from 'bech32';
 import { createHash } from 'crypto';
 import { CREDENTIAL_PREFIX } from './types.js';
@@ -15,6 +15,12 @@ export const HYDRA_NETWORK = parseInt(process.env.HYDRA_NETWORK || '0', 10);
 export const CLOSE_TOKEN = process.env.CLOSE_TOKEN || 'shutitdown';
 export const IPFS_API_URL = process.env.IPFS_API_URL || 'http://localhost:5001';
 export const IPFS_STAGING_DIR = process.env.IPFS_STAGING_DIR || '/ipfs-staging';
+export const VERBOSE = process.env.VERBOSE === '1' || process.env.VERBOSE === 'true';
+
+/** Log only when VERBOSE mode is enabled. Errors always log regardless. */
+export function debug(...args: unknown[]): void {
+    if (VERBOSE) console.log(...args);
+}
 
 // ---------------------------------------------------------------------------
 // IPFS Client (singleton)

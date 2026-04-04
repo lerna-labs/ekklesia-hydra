@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { createNativeScript, submitTx, Wrangler } from '@lerna-labs/hydra-sdk';
 import { blake2b256, bytesToHex, computePackage } from '@lerna-labs/hydra-proof';
 import type { FileLeaf } from '@lerna-labs/hydra-proof';
-import { initialize, voterIdToTokenName, TRP_URL, CLOSE_TOKEN, ipfs, voteCache, success, error } from '../helpers.js';
+import { initialize, voterIdToTokenName, TRP_URL, CLOSE_TOKEN, ipfs, voteCache, success, error, debug } from '../helpers.js';
 import { getCachedBallot } from './lifecycle.js';
 import type {
     FullResults,
@@ -212,7 +212,6 @@ router.post('/finalize', async (req, res) => {
         const resultsHash = bytesToHex(blake2b256(JSON.stringify(fullResults)));
 
         // --- 7. Update (601) datum via TRP ---
-        console.log(`[finalize] TRP resolve for ballot ${ballotId}...`);
         const trp_response = await client.finalizeBallotTx({
             votingAuthority: admin_payment_address,
             tokenPolicy: Buffer.from(TOKEN_POLICY as string, 'hex'),
@@ -223,18 +222,18 @@ router.post('/finalize', async (req, res) => {
             totalVoters: allVotes.length,
             merkleRoot: Buffer.from(evidenceMerkleRoot, 'hex'),
         });
-        console.log(`[finalize] TRP resolved, tx length: ${trp_response.tx?.length ?? 'null'}`);
 
+        debug(`[finalize] unsigned tx (${trp_response.tx?.length ?? 0} chars):`, trp_response.tx);
         const signedTx = await admin_wallet.signTx(trp_response.tx);
-        console.log(`[finalize] Tx signed, submitting to TRP...`);
+        debug(`[finalize] signed tx (${signedTx?.length ?? 0} chars):`, signedTx);
         const submit_response = await submitTx(TRP_URL, signedTx, `0:${ballotName}`);
         const submit_text = await submit_response.text();
-        console.log(`[finalize] Submit response (${submit_response.status}):`, submit_text.slice(0, 500));
+        debug(`[finalize] submitTx response (${submit_response.status}):`, submit_text);
         let response_json: { hash?: string };
         try {
             response_json = JSON.parse(submit_text);
         } catch {
-            console.error('[finalize] Failed to parse submit response as JSON');
+            console.error('[finalize] Failed to parse submit response:', submit_text);
             response_json = {};
         }
 
@@ -287,19 +286,19 @@ router.post('/count', async (req, res) => {
         for (const vote of allVotes) {
             const tokenName = voterIdToTokenName(vote.voterId);
             try {
-                console.log(`[count] TRP resolve burn for ${vote.voterId}...`);
                 const trp_response = await client.countVoteTx({
                     votingAuthority: admin_payment_address,
                     mintingScript: Buffer.from(TOKEN_SCRIPT as string, 'hex'),
                     tokenPolicy: Buffer.from(TOKEN_POLICY as string, 'hex'),
                     userId: Buffer.from(tokenName, 'hex'),
                 });
-                console.log(`[count] TRP resolved, tx length: ${trp_response.tx?.length ?? 'null'}`);
 
+                debug(`[count] unsigned tx for ${vote.voterId} (${trp_response.tx?.length ?? 0} chars):`, trp_response.tx);
                 const signedTx = await admin_wallet.signTx(trp_response.tx);
+                debug(`[count] signed tx for ${vote.voterId} (${signedTx?.length ?? 0} chars):`, signedTx);
                 const submit_response = await submitTx(TRP_URL, signedTx, `0:${tokenName}`);
                 const submit_text = await submit_response.text();
-                console.log(`[count] Submit response (${submit_response.status}):`, submit_text.slice(0, 500));
+                debug(`[count] submitTx response for ${vote.voterId} (${submit_response.status}):`, submit_text);
                 let response_json: { hash?: string };
                 try {
                     response_json = JSON.parse(submit_text);

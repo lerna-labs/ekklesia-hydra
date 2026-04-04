@@ -209,6 +209,19 @@ describe('Ekklesia Hydra E2E — Full Ballot Lifecycle', () => {
     });
 
     // -----------------------------------------------------------------------
+    // Phase 0c: Flush vote cache
+    // -----------------------------------------------------------------------
+
+    describe('Flush vote cache — clear stale entries from previous runs', () => {
+        it('should flush the vote cache', async () => {
+            const { status, json } = await api('POST', '/flush-cache');
+
+            expect(status).toBe(200);
+            console.log(`  Cache flushed: cleared ${json.data?.cleared ?? 0}, remaining ${json.data?.remaining ?? 0}`);
+        });
+    });
+
+    // -----------------------------------------------------------------------
     // Phase 1: Ballot Preparation (L1)
     // -----------------------------------------------------------------------
 

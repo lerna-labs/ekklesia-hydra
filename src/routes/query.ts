@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { getUtxoSet } from '@lerna-labs/hydra-sdk';
-import { initialize, voteCache, success, error } from '../helpers.js';
+import { initialize, voteCache, IPFS_STAGING_DIR, success, error } from '../helpers.js';
 import { getCachedBallot } from './lifecycle.js';
 
 const router = Router();
@@ -74,6 +74,46 @@ router.get('/voter/:voterId', (req, res) => {
     }
 
     return success(res, vote);
+});
+
+/**
+ * POST /flush-cache
+ *
+ * Clear the in-memory vote cache and wipe the disk staging directories.
+ * Used between E2E test runs to prevent stale votes from previous sessions
+ * interfering with the current test.
+ */
+router.post('/flush-cache', async (_, res) => {
+    try {
+        const fs = await import('node:fs/promises');
+        const path = await import('node:path');
+
+        const before = voteCache.getAll().length;
+
+        // Wipe the staging subdirectories
+        const votesDir = path.join(IPFS_STAGING_DIR, 'votes');
+        const latestDir = path.join(IPFS_STAGING_DIR, 'latest');
+        const historyDir = path.join(IPFS_STAGING_DIR, 'history');
+        const proofsDir = path.join(IPFS_STAGING_DIR, 'votes', 'proofs');
+
+        for (const dir of [votesDir, latestDir, historyDir, proofsDir]) {
+            try {
+                await fs.rm(dir, { recursive: true, force: true });
+                await fs.mkdir(dir, { recursive: true });
+            } catch {
+                // Directory may not exist yet
+            }
+        }
+
+        // Rehydrate the cache (which will now find nothing on disk)
+        const after = await voteCache.rehydrate();
+
+        console.log(`[flush-cache] Cleared ${before} entries, rehydrated ${after}`);
+        return success(res, { cleared: before, remaining: after });
+    } catch (err: any) {
+        console.error('[flush-cache] FULL ERROR:', err);
+        return error(res, 'INTERNAL_ERROR', err.message || 'Failed to flush cache', 500);
+    }
 });
 
 export default router;

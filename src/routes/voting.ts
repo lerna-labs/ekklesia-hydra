@@ -13,7 +13,8 @@ import {
     TRP_URL,
     voteCache,
     voterIdHrp,
-    voterIdToTokenName
+    voterIdToTokenName,
+    debug,
 } from '../helpers.js';
 import {getCachedBallot} from './lifecycle.js';
 import type {
@@ -494,7 +495,6 @@ router.post('/vote-and-register', async (req, res) => {
         );
 
         // --- 4. Submit combined register+vote via TRP ---
-        console.log(`[vote-and-register] TRP resolve for voter ${voterId}...`);
         const trp_response = await client.voteAndRegisterTx({
             votingAuthority: admin_payment_address,
             mintingScript: Buffer.from(TOKEN_SCRIPT as string, 'hex'),
@@ -504,18 +504,18 @@ router.post('/vote-and-register', async (req, res) => {
             voteHash: Buffer.from(voteHash, 'hex'),
             ipfsCid: Buffer.from(ipfsCid),
         });
-        console.log(`[vote-and-register] TRP resolved, tx length: ${trp_response.tx?.length ?? 'null'}`);
 
+        debug(`[vote-and-register] unsigned tx (${trp_response.tx?.length ?? 0} chars):`, trp_response.tx);
         const signedTx = await admin_wallet.signTx(trp_response.tx);
-        console.log(`[vote-and-register] Tx signed, submitting to TRP...`);
+        debug(`[vote-and-register] signed tx (${signedTx?.length ?? 0} chars):`, signedTx);
         const submit_response = await submitTx(TRP_URL, signedTx, `0:${tokenName}`);
         const submit_text = await submit_response.text();
-        console.log(`[vote-and-register] Submit response (${submit_response.status}):`, submit_text.slice(0, 500));
+        debug(`[vote-and-register] submitTx response (${submit_response.status}):`, submit_text);
         let response_json: { hash?: string };
         try {
             response_json = JSON.parse(submit_text);
         } catch {
-            console.error('[vote-and-register] Failed to parse submit response as JSON');
+            console.error('[vote-and-register] Failed to parse submit response:', submit_text);
             response_json = {};
         }
 
@@ -676,7 +676,6 @@ router.post('/vote', async (req, res) => {
         );
 
         // --- 4. Submit slim params to TRP ---
-        console.log(`[vote] TRP resolve for voter ${voterId}, nonce ${nonce}...`);
         const trp_response = await client.castVoteTx({
             votingAuthority: admin_payment_address,
             tokenPolicy: Buffer.from(TOKEN_POLICY as string, 'hex'),
@@ -686,18 +685,18 @@ router.post('/vote', async (req, res) => {
             voteHash: Buffer.from(voteHash, 'hex'),
             ipfsCid: Buffer.from(ipfsCid),
         });
-        console.log(`[vote] TRP resolved, tx length: ${trp_response.tx?.length ?? 'null'}`);
 
+        debug(`[vote] unsigned tx (${trp_response.tx?.length ?? 0} chars):`, trp_response.tx);
         const signedTx = await admin_wallet.signTx(trp_response.tx);
-        console.log(`[vote] Tx signed, submitting to TRP...`);
+        debug(`[vote] signed tx (${signedTx?.length ?? 0} chars):`, signedTx);
         const submit_response = await submitTx(TRP_URL, signedTx, `0:${tokenName}`);
         const submit_text = await submit_response.text();
-        console.log(`[vote] Submit response (${submit_response.status}):`, submit_text.slice(0, 500));
+        debug(`[vote] submitTx response (${submit_response.status}):`, submit_text);
         let response_json: { hash?: string };
         try {
             response_json = JSON.parse(submit_text);
         } catch {
-            console.error('[vote] Failed to parse submit response as JSON');
+            console.error('[vote] Failed to parse submit response:', submit_text);
             response_json = {};
         }
 
