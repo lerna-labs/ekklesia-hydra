@@ -309,7 +309,7 @@ router.post('/count', async (req, res) => {
 
                 results.push({ voterId: vote.voterId, txHash: response_json.hash });
             } catch (err: any) {
-                console.error(`Failed to burn token for ${vote.voterId}:`, err.message);
+                console.error(`[count] FULL ERROR for ${vote.voterId}:`, err);
                 results.push({ voterId: vote.voterId, error: err.message });
             }
         }
@@ -319,7 +319,7 @@ router.post('/count', async (req, res) => {
 
         return success(res, { burned, failed, total: allVotes.length, results });
     } catch (err: any) {
-        console.error('Failed to batch burn voter tokens:', err);
+        console.error('[count] FULL ERROR:', err);
         return error(res, 'INTERNAL_ERROR', err.message || 'Failed to burn voter tokens', 500);
     }
 });
@@ -462,7 +462,7 @@ router.post('/settle', async (req, res) => {
                 await submitTx(TRP_URL, burnSignedTx, `0:${tokenName}`);
                 burned++;
             } catch (err: any) {
-                console.error(`Burn failed for ${vote.voterId}:`, err.message);
+                console.error(`[settle/burn] FULL ERROR for ${vote.voterId}:`, err);
                 burnFailed++;
             }
         }

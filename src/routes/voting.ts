@@ -555,12 +555,7 @@ router.post('/vote-and-register', async (req, res) => {
             registered: true,
         });
     } catch (err: any) {
-        console.error('vote-and-register failed:', {
-            message: err.message,
-            code: err.code,
-            data: err.data,
-            stack: err.stack?.split('\n').slice(0, 3).join('\n'),
-        });
+        console.error('[vote-and-register] FULL ERROR:', err);
         if (err.message?.includes('IPFS') || err.message?.includes('fetch')) {
             return error(res, 'IPFS_UNAVAILABLE', `IPFS pin failed — retryable: ${err.message}`, 503);
         }
@@ -742,6 +737,7 @@ router.post('/vote', async (req, res) => {
             tokenName,
         });
     } catch (err: any) {
+        console.error('[vote] FULL ERROR:', err);
         if (err.message?.includes('IPFS') || err.message?.includes('fetch')) {
             return error(res, 'IPFS_UNAVAILABLE', `IPFS pin failed — retryable: ${err.message}`, 503);
         }
