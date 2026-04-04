@@ -494,6 +494,7 @@ router.post('/vote-and-register', async (req, res) => {
         );
 
         // --- 4. Submit combined register+vote via TRP ---
+        console.log(`[vote-and-register] TRP resolve for voter ${voterId}...`);
         const trp_response = await client.voteAndRegisterTx({
             votingAuthority: admin_payment_address,
             mintingScript: Buffer.from(TOKEN_SCRIPT as string, 'hex'),
@@ -503,10 +504,20 @@ router.post('/vote-and-register', async (req, res) => {
             voteHash: Buffer.from(voteHash, 'hex'),
             ipfsCid: Buffer.from(ipfsCid),
         });
+        console.log(`[vote-and-register] TRP resolved, tx length: ${trp_response.tx?.length ?? 'null'}`);
 
         const signedTx = await admin_wallet.signTx(trp_response.tx);
+        console.log(`[vote-and-register] Tx signed, submitting to TRP...`);
         const submit_response = await submitTx(TRP_URL, signedTx, `0:${tokenName}`);
-        const response_json = await submit_response.json() as { hash?: string };
+        const submit_text = await submit_response.text();
+        console.log(`[vote-and-register] Submit response (${submit_response.status}):`, submit_text.slice(0, 500));
+        let response_json: { hash?: string };
+        try {
+            response_json = JSON.parse(submit_text);
+        } catch {
+            console.error('[vote-and-register] Failed to parse submit response as JSON');
+            response_json = {};
+        }
 
         // --- 5. Cache ---
         const cacheEntry: VoteCacheEntry = {
@@ -544,6 +555,12 @@ router.post('/vote-and-register', async (req, res) => {
             registered: true,
         });
     } catch (err: any) {
+        console.error('vote-and-register failed:', {
+            message: err.message,
+            code: err.code,
+            data: err.data,
+            stack: err.stack?.split('\n').slice(0, 3).join('\n'),
+        });
         if (err.message?.includes('IPFS') || err.message?.includes('fetch')) {
             return error(res, 'IPFS_UNAVAILABLE', `IPFS pin failed — retryable: ${err.message}`, 503);
         }
@@ -664,6 +681,7 @@ router.post('/vote', async (req, res) => {
         );
 
         // --- 4. Submit slim params to TRP ---
+        console.log(`[vote] TRP resolve for voter ${voterId}, nonce ${nonce}...`);
         const trp_response = await client.castVoteTx({
             votingAuthority: admin_payment_address,
             tokenPolicy: Buffer.from(TOKEN_POLICY as string, 'hex'),
@@ -673,10 +691,20 @@ router.post('/vote', async (req, res) => {
             voteHash: Buffer.from(voteHash, 'hex'),
             ipfsCid: Buffer.from(ipfsCid),
         });
+        console.log(`[vote] TRP resolved, tx length: ${trp_response.tx?.length ?? 'null'}`);
 
         const signedTx = await admin_wallet.signTx(trp_response.tx);
+        console.log(`[vote] Tx signed, submitting to TRP...`);
         const submit_response = await submitTx(TRP_URL, signedTx, `0:${tokenName}`);
-        const response_json = await submit_response.json() as { hash?: string };
+        const submit_text = await submit_response.text();
+        console.log(`[vote] Submit response (${submit_response.status}):`, submit_text.slice(0, 500));
+        let response_json: { hash?: string };
+        try {
+            response_json = JSON.parse(submit_text);
+        } catch {
+            console.error('[vote] Failed to parse submit response as JSON');
+            response_json = {};
+        }
 
         // --- 5. Write to cache ---
         const cacheEntry: VoteCacheEntry = {

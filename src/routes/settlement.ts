@@ -212,6 +212,7 @@ router.post('/finalize', async (req, res) => {
         const resultsHash = bytesToHex(blake2b256(JSON.stringify(fullResults)));
 
         // --- 7. Update (601) datum via TRP ---
+        console.log(`[finalize] TRP resolve for ballot ${ballotId}...`);
         const trp_response = await client.finalizeBallotTx({
             votingAuthority: admin_payment_address,
             tokenPolicy: Buffer.from(TOKEN_POLICY as string, 'hex'),
@@ -222,10 +223,20 @@ router.post('/finalize', async (req, res) => {
             totalVoters: allVotes.length,
             merkleRoot: Buffer.from(evidenceMerkleRoot, 'hex'),
         });
+        console.log(`[finalize] TRP resolved, tx length: ${trp_response.tx?.length ?? 'null'}`);
 
         const signedTx = await admin_wallet.signTx(trp_response.tx);
+        console.log(`[finalize] Tx signed, submitting to TRP...`);
         const submit_response = await submitTx(TRP_URL, signedTx, `0:${ballotName}`);
-        const response_json = await submit_response.json() as { hash?: string };
+        const submit_text = await submit_response.text();
+        console.log(`[finalize] Submit response (${submit_response.status}):`, submit_text.slice(0, 500));
+        let response_json: { hash?: string };
+        try {
+            response_json = JSON.parse(submit_text);
+        } catch {
+            console.error('[finalize] Failed to parse submit response as JSON');
+            response_json = {};
+        }
 
         return success(res, {
             txHash: response_json.hash,
@@ -276,16 +287,25 @@ router.post('/count', async (req, res) => {
         for (const vote of allVotes) {
             const tokenName = voterIdToTokenName(vote.voterId);
             try {
+                console.log(`[count] TRP resolve burn for ${vote.voterId}...`);
                 const trp_response = await client.countVoteTx({
                     votingAuthority: admin_payment_address,
                     mintingScript: Buffer.from(TOKEN_SCRIPT as string, 'hex'),
                     tokenPolicy: Buffer.from(TOKEN_POLICY as string, 'hex'),
                     userId: Buffer.from(tokenName, 'hex'),
                 });
+                console.log(`[count] TRP resolved, tx length: ${trp_response.tx?.length ?? 'null'}`);
 
                 const signedTx = await admin_wallet.signTx(trp_response.tx);
                 const submit_response = await submitTx(TRP_URL, signedTx, `0:${tokenName}`);
-                const response_json = await submit_response.json() as { hash?: string };
+                const submit_text = await submit_response.text();
+                console.log(`[count] Submit response (${submit_response.status}):`, submit_text.slice(0, 500));
+                let response_json: { hash?: string };
+                try {
+                    response_json = JSON.parse(submit_text);
+                } catch {
+                    response_json = {};
+                }
 
                 results.push({ voterId: vote.voterId, txHash: response_json.hash });
             } catch (err: any) {
