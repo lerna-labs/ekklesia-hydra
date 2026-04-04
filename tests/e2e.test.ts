@@ -206,15 +206,22 @@ describe('Ekklesia Hydra E2E — Full Ballot Lifecycle', () => {
                     : BLOCKFROST_KEY.startsWith('mainnet')
                         ? 'cardano-mainnet'
                         : 'cardano-preview';
-                console.log('  Waiting for sweep tx confirmation...');
+                const MIN_DEPTH = 2;
+                const bfHeaders = { project_id: BLOCKFROST_KEY };
+                const bfBase = `https://${networkPrefix}.blockfrost.io/api/v0`;
+                console.log(`  Waiting for sweep tx confirmation (${MIN_DEPTH} blocks deep)...`);
                 for (let attempt = 0; attempt < 10; attempt++) {
-                    const txRes = await fetch(
-                        `https://${networkPrefix}.blockfrost.io/api/v0/txs/${json.data.txHash}`,
-                        { headers: { project_id: BLOCKFROST_KEY } },
-                    );
+                    const txRes = await fetch(`${bfBase}/txs/${json.data.txHash}`, { headers: bfHeaders });
                     if (txRes.ok) {
-                        console.log(`  Sweep confirmed after ~${attempt * 40}s`);
-                        break;
+                        const txData = await txRes.json() as { block_height: number };
+                        const tipRes = await fetch(`${bfBase}/blocks/latest`, { headers: bfHeaders });
+                        const tipData = await tipRes.json() as { height: number };
+                        const depth = tipData.height - txData.block_height;
+                        console.log(`  Sweep tx depth: ${depth}`);
+                        if (depth >= MIN_DEPTH) {
+                            console.log(`  Sweep confirmed ${depth} blocks deep after ~${attempt * 40}s`);
+                            break;
+                        }
                     }
                     if (attempt === 9) throw new Error('Sweep tx not confirmed after 400s');
                     await new Promise(r => setTimeout(r, 40_000));
@@ -313,23 +320,30 @@ describe('Ekklesia Hydra E2E — Full Ballot Lifecycle', () => {
             console.log(`  Policy ID: ${policyId}`);
             console.log(`  IPFS CID: ${ballotIpfsCid}`);
 
-            // Poll Blockfrost until the transaction is confirmed on L1
-            console.log('  Waiting for L1 confirmation...');
+            // Poll Blockfrost until the transaction is confirmed and at least 2 blocks deep
+            const MIN_DEPTH = 2;
+            console.log(`  Waiting for L1 confirmation (${MIN_DEPTH} blocks deep)...`);
             if (!BLOCKFROST_KEY) throw new Error('E2E_BLOCKFROST_KEY is required to confirm L1 transactions');
             const networkPrefix = BLOCKFROST_KEY.startsWith('mainnet')
                 ? 'cardano-mainnet'
                 : BLOCKFROST_KEY.startsWith('preprod')
                     ? 'cardano-preprod'
                     : 'cardano-preview';
+            const bfHeaders = { project_id: BLOCKFROST_KEY };
+            const bfBase = `https://${networkPrefix}.blockfrost.io/api/v0`;
 
             for (let attempt = 0; attempt < 15; attempt++) {
-                const txRes = await fetch(
-                    `https://${networkPrefix}.blockfrost.io/api/v0/txs/${prepareTxHash}`,
-                    { headers: { project_id: BLOCKFROST_KEY } },
-                );
+                const txRes = await fetch(`${bfBase}/txs/${prepareTxHash}`, { headers: bfHeaders });
                 if (txRes.ok) {
-                    console.log(`  Confirmed on L1 after ~${attempt * 40}s`);
-                    break;
+                    const txData = await txRes.json() as { block_height: number };
+                    const tipRes = await fetch(`${bfBase}/blocks/latest`, { headers: bfHeaders });
+                    const tipData = await tipRes.json() as { height: number };
+                    const depth = tipData.height - txData.block_height;
+                    console.log(`  Tx at height ${txData.block_height}, tip ${tipData.height}, depth ${depth}`);
+                    if (depth >= MIN_DEPTH) {
+                        console.log(`  Confirmed ${depth} blocks deep after ~${attempt * 40}s`);
+                        break;
+                    }
                 }
                 if (attempt === 14) throw new Error('Transaction not confirmed after 10 minutes');
                 await new Promise(r => setTimeout(r, 40_000));
@@ -356,7 +370,7 @@ describe('Ekklesia Hydra E2E — Full Ballot Lifecycle', () => {
             expect(json.data.ballotCached).toBe(true);
 
             console.log('  Head opened, ballot cached');
-        }, 240_000);
+        }, 660_000); // up to ~11 min — head init + L1 commit can be slow on preprod
     });
 
     // -----------------------------------------------------------------------

@@ -77,7 +77,7 @@ router.post('/start', async (req, res) => {
             description: 'Commit Blueprint',
         };
 
-        await wrangler.waitForHeadOpen({ utxos, blueprintTx }, 180000);
+        await wrangler.waitForHeadOpen({ utxos, blueprintTx }, 600000); // 10 min — init + L1 commit can be slow
 
         // Cache the ballot definition from IPFS if CID was provided
         if (ballotIpfsCid) {
