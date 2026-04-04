@@ -121,13 +121,14 @@ async function tallyVotes(
  *   ballotName: string     — hex asset name suffix (fingerprint) of the (601) token
  */
 router.post('/finalize', async (req, res) => {
-    const { ballotId, ballotName } = req.body as {
+    const { ballotId, ballotName, ballotPolicy } = req.body as {
         ballotId: string;
         ballotName: string;
+        ballotPolicy: string;
     };
 
-    if (!ballotId || !ballotName) {
-        return error(res, 'MISSING_FIELDS', 'Missing required fields: ballotId, ballotName', 400);
+    if (!ballotId || !ballotName || !ballotPolicy) {
+        return error(res, 'MISSING_FIELDS', 'Missing required fields: ballotId, ballotName, ballotPolicy', 400);
     }
 
     const ballot = getCachedBallot();
@@ -215,6 +216,7 @@ router.post('/finalize', async (req, res) => {
         const trp_response = await client.finalizeBallotTx({
             votingAuthority: admin_payment_address,
             tokenPolicy: Buffer.from(TOKEN_POLICY as string, 'hex'),
+            ballotPolicy: Buffer.from(ballotPolicy, 'hex'),
             ballotName: Buffer.from(ballotName, 'hex'),
             ballotId: Buffer.from(ballotId, 'hex'),
             resultsHash: Buffer.from(resultsHash, 'hex'),
@@ -340,9 +342,10 @@ router.post('/count', async (req, res) => {
  *   closeToken: string     — required to authorize head close
  */
 router.post('/settle', async (req, res) => {
-    const { ballotId, ballotName, closeToken } = req.body as {
+    const { ballotId, ballotName, ballotPolicy, closeToken } = req.body as {
         ballotId: string;
         ballotName: string;
+        ballotPolicy: string;
         closeToken: string;
     };
 
@@ -428,6 +431,7 @@ router.post('/settle', async (req, res) => {
         const finalizeTrp = await client.finalizeBallotTx({
             votingAuthority: admin_payment_address,
             tokenPolicy: Buffer.from(TOKEN_POLICY as string, 'hex'),
+            ballotPolicy: Buffer.from(ballotPolicy, 'hex'),
             ballotName: Buffer.from(ballotName, 'hex'),
             ballotId: Buffer.from(ballotId, 'hex'),
             resultsHash: Buffer.from(resultsHash, 'hex'),

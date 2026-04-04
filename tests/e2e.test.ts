@@ -532,6 +532,7 @@ describe('Ekklesia Hydra E2E — Full Ballot Lifecycle', () => {
             const { status, json } = await api('POST', '/finalize', {
                 ballotId: prepareTxHash,
                 ballotName: instanceAssetName,
+                ballotPolicy: policyId,
             });
 
             expect(status).toBe(200);
