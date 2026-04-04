@@ -267,18 +267,17 @@ router.post('/prepare', async (req, res) => {
 /**
  * POST /sweep
  *
- * Sweep all native tokens from the admin wallet to a dump address,
- * leaving only clean ADA UTxOs (needed for Hydra collateral).
+ * Consolidate the admin wallet: sweep all native tokens to a dump address
+ * and combine all remaining ADA into a single UTxO.
+ *
+ * If there are no tokens to sweep, it still consolidates fragmented
+ * ADA UTxOs (from previous test runs) into one output.
  *
  * Body:
- *   dumpAddress: string — bech32 address to receive the swept tokens
+ *   dumpAddress: string — bech32 address to receive any swept tokens
  */
 router.post('/sweep', async (req, res) => {
     const { dumpAddress } = req.body as { dumpAddress?: string };
-
-    if (!dumpAddress) {
-        return error(res, 'MISSING_FIELDS', 'Missing required field: dumpAddress', 400);
-    }
 
     try {
         const blockfrostKey = process.env.BLOCKFROST_API_KEY as string;
@@ -287,6 +286,14 @@ router.post('/sweep', async (req, res) => {
         const admin_address = admin_wallet.addresses.enterpriseAddressBech32 as string;
 
         const utxos = await blockfrost.fetchAddressUTxOs(admin_address);
+
+        if (utxos.length <= 1) {
+            // Already consolidated (0 or 1 UTxO), check for tokens
+            const tokens = utxos.flatMap(u => u.output.amount.filter(a => a.unit !== 'lovelace'));
+            if (tokens.length === 0) {
+                return success(res, { swept: 0, consolidated: false, message: 'Wallet is already clean' });
+            }
+        }
 
         // Collect all non-ADA assets
         const tokens: Array<{ unit: string; quantity: string }> = [];
@@ -298,16 +305,20 @@ router.post('/sweep', async (req, res) => {
             }
         }
 
-        if (tokens.length === 0) {
-            return success(res, { swept: 0, message: 'Wallet is clean' });
+        const txBuilder = new MeshTxBuilder({ fetcher: blockfrost, evaluator: blockfrost });
+
+        // If there are tokens, send them to the dump address
+        if (tokens.length > 0) {
+            if (!dumpAddress) {
+                return error(res, 'MISSING_FIELDS', 'Wallet has native tokens — dumpAddress is required to sweep them', 400);
+            }
+            txBuilder.txOut(dumpAddress, [
+                { unit: 'lovelace', quantity: '5000000' },
+                ...tokens,
+            ]);
         }
 
-        const txBuilder = new MeshTxBuilder({ fetcher: blockfrost, evaluator: blockfrost });
-        txBuilder.txOut(dumpAddress, [
-            { unit: 'lovelace', quantity: '5000000' },
-            ...tokens,
-        ]);
-
+        // All remaining ADA consolidates into the change output (single UTxO)
         const unsignedTx = await txBuilder
             .changeAddress(admin_address)
             .selectUtxosFrom(utxos)
@@ -316,7 +327,12 @@ router.post('/sweep', async (req, res) => {
         const signedTx = await admin_wallet.signTx(unsignedTx);
         const txHash = await blockfrost.submitTx(signedTx);
 
-        return success(res, { swept: tokens.length, txHash });
+        return success(res, {
+            swept: tokens.length,
+            consolidated: utxos.length > 1,
+            utxosBefore: utxos.length,
+            txHash,
+        });
     } catch (err: any) {
         console.error('Failed to sweep wallet:', err);
         return error(res, 'INTERNAL_ERROR', err.message || 'Failed to sweep wallet', 500);

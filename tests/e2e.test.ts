@@ -16,7 +16,7 @@
  * Run: npm run test:e2e
  */
 
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
 import { execSync } from 'node:child_process';
 import { blake2b256, bytesToHex } from '@lerna-labs/hydra-proof';
 import type { SignedVotePayload } from '../src/types.js';
@@ -130,6 +130,9 @@ let ballotContentHash: string;
 let drepKeys: DRepKeys;
 let voteReceipt: { txHash: string; voteHash: string; ipfsCid: string; tokenName: string };
 
+/** Set to true when any test fails — subsequent tests skip immediately. */
+let bail = false;
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -147,6 +150,20 @@ describe('Ekklesia Hydra E2E — Full Ballot Lifecycle', () => {
         // Generate DRep keys once for the entire test run
         drepKeys = generateDRepKeys();
         console.log(`  Generated DRep: ${drepKeys.drepId}`);
+    });
+
+    // Skip all remaining tests once any test fails (sequential pipeline)
+    beforeEach(({ task }) => {
+        if (bail) {
+            console.log(`  SKIPPED: ${task.name} — a prior phase failed`);
+            throw new Error('Skipped — a prior phase failed');
+        }
+    });
+
+    afterEach(({ task }) => {
+        if (task.result?.state === 'fail') {
+            bail = true;
+        }
     });
 
     it('should be reachable', async () => {

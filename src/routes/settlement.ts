@@ -229,16 +229,16 @@ router.post('/finalize', async (req, res) => {
         const submit_response = await submitTx(TRP_URL, signedTx, `0:${ballotName}`);
         const submit_text = await submit_response.text();
         debug(`[finalize] submitTx response (${submit_response.status}):`, submit_text);
-        let response_json: { hash?: string };
+        let txHash: string | undefined;
         try {
-            response_json = JSON.parse(submit_text);
+            const parsed = JSON.parse(submit_text);
+            txHash = parsed.result?.hash ?? parsed.hash;
         } catch {
             console.error('[finalize] Failed to parse submit response:', submit_text);
-            response_json = {};
         }
 
         return success(res, {
-            txHash: response_json.hash,
+            txHash,
             resultsHash,
             evidenceDirectoryCid,
             resultsCid,
@@ -299,14 +299,15 @@ router.post('/count', async (req, res) => {
                 const submit_response = await submitTx(TRP_URL, signedTx, `0:${tokenName}`);
                 const submit_text = await submit_response.text();
                 debug(`[count] submitTx response for ${vote.voterId} (${submit_response.status}):`, submit_text);
-                let response_json: { hash?: string };
+                let txHash: string | undefined;
                 try {
-                    response_json = JSON.parse(submit_text);
+                    const parsed = JSON.parse(submit_text);
+                    txHash = parsed.result?.hash ?? parsed.hash;
                 } catch {
-                    response_json = {};
+                    // non-JSON response
                 }
 
-                results.push({ voterId: vote.voterId, txHash: response_json.hash });
+                results.push({ voterId: vote.voterId, txHash });
             } catch (err: any) {
                 console.error(`[count] FULL ERROR for ${vote.voterId}:`, err);
                 results.push({ voterId: vote.voterId, error: err.message });

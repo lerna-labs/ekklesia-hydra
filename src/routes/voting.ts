@@ -382,9 +382,10 @@ router.post('/register', async (req, res) => {
 
         const signedTx = await admin_wallet.signTx(trp_response.tx);
         const submit_response = await submitTx(TRP_URL, signedTx, `0:${tokenName}`);
-        const response_json = await submit_response.json() as { hash?: string };
+        const parsed = await submit_response.json() as any;
+        const txHash = parsed.result?.hash ?? parsed.hash;
 
-        return success(res, { txHash: response_json.hash, tokenName });
+        return success(res, { txHash, tokenName });
     } catch (err: any) {
         return error(res, 'INTERNAL_ERROR', err.message || 'Failed to register voter', 400);
     }
@@ -511,12 +512,12 @@ router.post('/vote-and-register', async (req, res) => {
         const submit_response = await submitTx(TRP_URL, signedTx, `0:${tokenName}`);
         const submit_text = await submit_response.text();
         debug(`[vote-and-register] submitTx response (${submit_response.status}):`, submit_text);
-        let response_json: { hash?: string };
+        let txHash: string | undefined;
         try {
-            response_json = JSON.parse(submit_text);
+            const parsed = JSON.parse(submit_text);
+            txHash = parsed.result?.hash ?? parsed.hash;
         } catch {
             console.error('[vote-and-register] Failed to parse submit response:', submit_text);
-            response_json = {};
         }
 
         // --- 5. Cache ---
@@ -525,7 +526,7 @@ router.post('/vote-and-register', async (req, res) => {
             credentialHrp,
             voteHash,
             ipfsCid,
-            txHash: response_json.hash,
+            txHash: txHash,
             version: nonce,
             timestamp: Date.now(),
         };
@@ -541,13 +542,13 @@ router.post('/vote-and-register', async (req, res) => {
             version: nonce,
             voteHash,
             ipfsCid,
-            txHash: response_json.hash ?? '',
+            txHash: txHash ?? '',
             timestamp: Date.now(),
         });
 
         // --- 6. Receipt ---
         return success(res, {
-            txHash: response_json.hash,
+            txHash: txHash,
             voteHash,
             ipfsCid,
             version: nonce,
@@ -692,12 +693,12 @@ router.post('/vote', async (req, res) => {
         const submit_response = await submitTx(TRP_URL, signedTx, `0:${tokenName}`);
         const submit_text = await submit_response.text();
         debug(`[vote] submitTx response (${submit_response.status}):`, submit_text);
-        let response_json: { hash?: string };
+        let txHash: string | undefined;
         try {
-            response_json = JSON.parse(submit_text);
+            const parsed = JSON.parse(submit_text);
+            txHash = parsed.result?.hash ?? parsed.hash;
         } catch {
             console.error('[vote] Failed to parse submit response:', submit_text);
-            response_json = {};
         }
 
         // --- 5. Write to cache ---
@@ -706,7 +707,7 @@ router.post('/vote', async (req, res) => {
             credentialHrp,
             voteHash,
             ipfsCid,
-            txHash: response_json.hash,
+            txHash: txHash,
             version: nonce,
             timestamp: Date.now(),
         };
@@ -722,14 +723,14 @@ router.post('/vote', async (req, res) => {
             version: nonce,
             voteHash,
             ipfsCid,
-            txHash: response_json.hash ?? '',
+            txHash: txHash ?? '',
             prevTxHash: existingVote?.txHash,
             timestamp: Date.now(),
         });
 
         // --- 6. Return receipt ---
         return success(res, {
-            txHash: response_json.hash,
+            txHash: txHash,
             voteHash,
             ipfsCid,
             version: nonce,
