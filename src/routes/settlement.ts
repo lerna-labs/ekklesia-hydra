@@ -215,7 +215,6 @@ router.post('/finalize', async (req, res) => {
         // --- 7. Update (601) datum via TRP ---
         const trp_response = await client.finalizeBallotTx({
             votingAuthority: admin_payment_address,
-            tokenPolicy: Buffer.from(TOKEN_POLICY as string, 'hex'),
             ballotPolicy: Buffer.from(ballotPolicy, 'hex'),
             ballotName: Buffer.from(ballotName, 'hex'),
             ballotId: Buffer.from(ballotId, 'hex'),
@@ -445,7 +444,6 @@ router.post('/settle', async (req, res) => {
         // Update (601) datum
         const finalizeTrp = await client.finalizeBallotTx({
             votingAuthority: admin_payment_address,
-            tokenPolicy: Buffer.from(TOKEN_POLICY as string, 'hex'),
             ballotPolicy: Buffer.from(ballotPolicy, 'hex'),
             ballotName: Buffer.from(ballotName, 'hex'),
             ballotId: Buffer.from(ballotId, 'hex'),
