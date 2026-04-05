@@ -4,6 +4,7 @@ import { blake2b256, bytesToHex, computePackage } from '@lerna-labs/hydra-proof'
 import type { FileLeaf } from '@lerna-labs/hydra-proof';
 import { initialize, voterIdToTokenName, TRP_URL, CLOSE_TOKEN, ipfs, voteCache, success, error, debug, parseTrpSubmitResponse } from '../helpers.js';
 import { getCachedBallot } from './lifecycle.js';
+import { BALLOT_INSTANCE_PREFIX, BALLOT_DEFINITION_PREFIX } from '../types.js';
 import type {
     FullResults,
     QuestionTally,
@@ -16,42 +17,99 @@ import type {
 const router = Router();
 
 // ---------------------------------------------------------------------------
+// Head UTxO–driven voter discovery
+// ---------------------------------------------------------------------------
+
+/** Voter info derived from an on-chain voter token UTxO in the Hydra head. */
+interface HeadVoterInfo {
+    /** Hex asset name (1-byte prefix + 28-byte hash = 58 hex chars). */
+    tokenName: string;
+    version: number;
+    voteHash: string;
+    ipfsCid: string;
+}
+
+/**
+ * Query the Hydra head snapshot and return info for every voter token UTxO.
+ *
+ * This is the authoritative source for "who has voted" — it reads the actual
+ * on-chain state rather than relying on the middleware's disk cache.
+ */
+async function getVotersFromHead(
+    wrangler: Wrangler,
+    tokenPolicy: string,
+): Promise<HeadVoterInfo[]> {
+    const snapshotUtxos = await wrangler.http.getSnapshotUtxo();
+    const voters: HeadVoterInfo[] = [];
+
+    for (const [, utxo] of Object.entries(snapshotUtxos)) {
+        const policyAssets = utxo.value[tokenPolicy];
+        if (!policyAssets || typeof policyAssets !== 'object') continue;
+
+        for (const assetName of Object.keys(policyAssets as Record<string, number>)) {
+            // Skip ballot tokens — only voter tokens
+            if (assetName.startsWith(BALLOT_INSTANCE_PREFIX)) continue;
+            if (assetName.startsWith(BALLOT_DEFINITION_PREFIX)) continue;
+
+            // Parse the Vote datum: constructor 0, fields [VoterId, Version, MerkleRoot, VoteHash, IpfsCid]
+            const datum = utxo.inlineDatum as any;
+            if (!datum || datum.constructor !== 0 || !datum.fields || datum.fields.length < 5) {
+                console.warn(`[getVotersFromHead] Skipping UTxO with unexpected datum for asset ${assetName}`);
+                continue;
+            }
+
+            voters.push({
+                tokenName: assetName,
+                version: datum.fields[1].int,
+                voteHash: datum.fields[3].bytes,
+                ipfsCid: Buffer.from(datum.fields[4].bytes, 'hex').toString('utf-8'),
+            });
+        }
+    }
+
+    debug(`[getVotersFromHead] Found ${voters.length} voter token(s) in head`);
+    return voters;
+}
+
+// ---------------------------------------------------------------------------
 // Tallying logic
 // ---------------------------------------------------------------------------
 
+/** Minimal voter reference needed for tallying — works with both cache and head-derived data. */
+interface VoterRef {
+    tokenName: string;
+    version: number;
+    voteHash: string;
+}
+
 /**
- * Build raw (unweighted) tallies from all cached votes.
+ * Build raw (unweighted) tallies from voter evidence files on disk.
  *
- * Ekklesia provides only cryptographically verified vote intents.
- * Stake-based weighting is intentionally external — the snapshot amounts
- * are a separate concern and potential point of contention.
+ * Accepts a `VoterRef[]` so it can be driven by either the vote cache
+ * (for the standalone /finalize endpoint) or the head UTxO set (for /settle).
  *
- * Consumers of the results (governance tools, frontends) apply their own
- * weighting using L1 stake snapshots + the verified voter credentials.
+ * Evidence files are looked up by `vote-{tokenName}-v{version}.json`.
  */
 async function tallyVotes(
     ballot: BallotDefinition,
-    votes: VoteCacheEntry[],
+    voters: VoterRef[],
     evidenceDir: string,
 ): Promise<QuestionTally[]> {
-    // Load full evidence for each voter to extract their selections
     const fs = await import('node:fs/promises');
     const path = await import('node:path');
 
-    const evidenceByVoter = new Map<string, VoteEvidence>();
-    for (const vote of votes) {
+    const evidenceList: VoteEvidence[] = [];
+    for (const voter of voters) {
         try {
-            const filePath = path.join(evidenceDir, `vote-${voterIdToTokenName(vote.voterId)}-v${vote.version}.json`);
+            const filePath = path.join(evidenceDir, `vote-${voter.tokenName}-v${voter.version}.json`);
             const raw = await fs.readFile(filePath, 'utf-8');
-            evidenceByVoter.set(vote.voterId, JSON.parse(raw));
+            evidenceList.push(JSON.parse(raw));
         } catch {
-            // If evidence file missing, skip this voter in tally
-            console.warn(`Missing evidence file for voter ${vote.voterId}, skipping`);
+            console.warn(`Missing evidence file for token ${voter.tokenName} v${voter.version}, skipping`);
         }
     }
 
     return ballot.questions.map((q) => {
-        // Raw counts per option value (unweighted — 1 vote = 1 count)
         const counts = new Map<number, number>();
         if (q.options) {
             for (const opt of q.options) {
@@ -59,21 +117,16 @@ async function tallyVotes(
             }
         }
 
-        for (const [, evidence] of evidenceByVoter) {
+        for (const evidence of evidenceList) {
             const answer = evidence.answers.find((a) => a.questionId === q.questionId);
             if (!answer) continue;
 
-            // Handle different method types
             if (answer.selection) {
                 for (const v of answer.selection) {
                     counts.set(v, (counts.get(v) ?? 0) + 1);
                 }
             }
-            // For ranked/weighted, store raw counts of participation
-            // The full ranked/weighted data is in the IPFS evidence for
-            // consumers to apply their own interpretation
             if (answer.ranking) {
-                // Count first-preference for basic tally; full ranking in evidence
                 const firstPref = answer.ranking[0];
                 if (firstPref !== undefined) {
                     counts.set(firstPref, (counts.get(firstPref) ?? 0) + 1);
@@ -90,7 +143,7 @@ async function tallyVotes(
             ([option, count]) => ({
                 option,
                 count,
-                weight: '0', // Unweighted — consumers apply stake weights externally
+                weight: '0',
             }),
         );
 
@@ -104,6 +157,18 @@ async function tallyVotes(
             },
         };
     });
+}
+
+/**
+ * Convert cache entries to VoterRef for the standalone /finalize endpoint.
+ * /settle uses head UTxOs instead.
+ */
+function cacheToVoterRefs(votes: VoteCacheEntry[]): VoterRef[] {
+    return votes.map((v) => ({
+        tokenName: voterIdToTokenName(v.voterId),
+        version: v.version,
+        voteHash: v.voteHash,
+    }));
 }
 
 // ---------------------------------------------------------------------------
@@ -148,12 +213,13 @@ router.post('/finalize', async (req, res) => {
         const admin_payment_address = admin_wallet.addresses.enterpriseAddressBech32 as string;
         const { scriptHash: TOKEN_POLICY } = createNativeScript(admin_payment_address);
 
-        // --- 1. Gather all votes ---
+        // --- 1. Gather all votes (cache-based for standalone /finalize) ---
         const allVotes = voteCache.getAll();
+        const voterRefs = cacheToVoterRefs(allVotes);
 
         // --- 2. Build merkle tree of vote evidence ---
-        const fileLeaves: FileLeaf[] = allVotes.map((v) => ({
-            name: v.voterId,
+        const fileLeaves: FileLeaf[] = voterRefs.map((v) => ({
+            name: v.tokenName,
             contentHashHex: v.voteHash,
         }));
 
@@ -161,7 +227,7 @@ router.post('/finalize', async (req, res) => {
         const evidenceMerkleRoot = proofPackage.rootHex;
 
         // --- 3. Tally ---
-        const tallies = await tallyVotes(ballot, allVotes, voteCache.getDocumentsDir());
+        const tallies = await tallyVotes(ballot, voterRefs, voteCache.getDocumentsDir());
 
         // --- 4. Build full results object ---
         const fullResults: FullResults = {
@@ -369,26 +435,29 @@ router.post('/settle', async (req, res) => {
         } = createNativeScript(admin_payment_address);
 
         const wrangler = new Wrangler(process.env.HYDRA_API_URL, process.env.HYDRA_WS_URL);
-        const allVotes = voteCache.getAll();
+
+        // --- Step 0: Query authoritative voter list from head UTxOs ---
+        // The head's UTxO set is the ground truth. The disk cache can have
+        // stale entries from previous sessions — never use it for settlement.
+        const headVoters = await getVotersFromHead(wrangler, TOKEN_POLICY as string);
 
         // --- Step 1: Burn all voter tokens (in-head via TRP) ---
         let burned = 0;
         let burnFailed = 0;
-        for (const vote of allVotes) {
-            const tokenName = voterIdToTokenName(vote.voterId);
+        for (const voter of headVoters) {
             try {
                 const burnTrp = await client.countVoteTx({
                     votingAuthority: admin_payment_address,
                     mintingScript: Buffer.from(TOKEN_SCRIPT as string, 'hex'),
                     tokenPolicy: Buffer.from(TOKEN_POLICY as string, 'hex'),
-                    userId: Buffer.from(tokenName, 'hex'),
+                    userId: Buffer.from(voter.tokenName, 'hex'),
                 });
                 const burnSignedTx = await admin_wallet.signTx(burnTrp.tx);
-                const burnSubmitText = await (await submitTx(TRP_URL, burnSignedTx, `0:${tokenName}`)).text();
+                const burnSubmitText = await (await submitTx(TRP_URL, burnSignedTx, `0:${voter.tokenName}`)).text();
                 parseTrpSubmitResponse(burnSubmitText);
                 burned++;
             } catch (err: any) {
-                console.error(`[settle/burn] FULL ERROR for ${vote.voterId}:`, err);
+                console.error(`[settle/burn] FULL ERROR for token ${voter.tokenName}:`, err);
                 burnFailed++;
             }
         }
@@ -396,24 +465,24 @@ router.post('/settle', async (req, res) => {
         steps.push({
             step: 'burn',
             status: burnFailed === 0 ? 'SUCCESS' : 'PARTIAL',
-            data: { burned, failed: burnFailed, total: allVotes.length },
+            data: { burned, failed: burnFailed, total: headVoters.length },
         });
 
         // --- Step 2: Tally + IPFS evidence ---
-        const fileLeaves: FileLeaf[] = allVotes.map((v) => ({
-            name: v.voterId,
+        const fileLeaves: FileLeaf[] = headVoters.map((v) => ({
+            name: v.tokenName,
             contentHashHex: v.voteHash,
         }));
         const proofPackage = computePackage(fileLeaves, 'content+path');
         const evidenceMerkleRoot = proofPackage.rootHex;
-        const tallies = await tallyVotes(ballot, allVotes, voteCache.getDocumentsDir());
+        const tallies = await tallyVotes(ballot, headVoters, voteCache.getDocumentsDir());
 
         const fullResults: FullResults = {
             specVersion: '0.3.0',
             ballotId,
             status: 'finalized',
             tallies,
-            totalVoters: allVotes.length,
+            totalVoters: headVoters.length,
             evidenceIpfsCid: '',
             headId: process.env.HYDRA_API_URL ?? '',
             finalizedAt: new Date().toISOString(),
@@ -458,7 +527,7 @@ router.post('/settle', async (req, res) => {
             ballotId: Buffer.from(ballotId, 'hex'),
             resultsHash: Buffer.from(resultsHash, 'hex'),
             evidenceCid: Buffer.from(evidenceDirectoryCid),
-            totalVoters: allVotes.length,
+            totalVoters: headVoters.length,
             merkleRoot: Buffer.from(evidenceMerkleRoot, 'hex'),
         });
 
@@ -478,7 +547,7 @@ router.post('/settle', async (req, res) => {
         steps.push({
             step: 'decommit-finalize',
             status: 'SUCCESS',
-            data: { resultsHash, evidenceDirectoryCid, totalVoters: allVotes.length },
+            data: { resultsHash, evidenceDirectoryCid, totalVoters: headVoters.length },
         });
 
         // --- Step 4: Close head (only ADA remains — trivial fanout) ---
@@ -491,7 +560,7 @@ router.post('/settle', async (req, res) => {
             resultsHash,
             evidenceDirectoryCid,
             evidenceMerkleRoot,
-            totalVoters: allVotes.length,
+            totalVoters: headVoters.length,
         });
     } catch (err: any) {
         console.error('Settlement failed:', err);
