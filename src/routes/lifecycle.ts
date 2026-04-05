@@ -1,7 +1,9 @@
 import { Router } from 'express';
 import { BlockfrostProvider, MeshTxBuilder } from '@meshsdk/core';
 import { getAdmin, Wrangler } from '@lerna-labs/hydra-sdk';
-import { CLOSE_TOKEN, ipfs, success, error } from '../helpers.js';
+import { CLOSE_TOKEN, ipfs, voteCache, IPFS_STAGING_DIR, success, error } from '../helpers.js';
+import { promises as fs } from 'node:fs';
+import path from 'node:path';
 import type { BallotDefinition } from '../types.js';
 
 const router = Router();
@@ -56,6 +58,18 @@ router.post('/start', async (req, res) => {
     }
 
     try {
+        // Flush stale vote cache from any previous head session.
+        // DiskCache doesn't expose clear(), so wipe disk dirs + rehydrate (loads 0 entries).
+        cachedBallot = null;
+        const votesDir = path.join(IPFS_STAGING_DIR, 'votes');
+        const latestDir = path.join(IPFS_STAGING_DIR, 'latest');
+        const historyDir = path.join(IPFS_STAGING_DIR, 'history');
+        for (const dir of [votesDir, latestDir, historyDir]) {
+            try { await fs.rm(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+        }
+        await voteCache.rehydrate(); // rebuilds in-memory map from now-empty latest/
+        console.log('Vote cache, history, and ballot cache cleared for new head session.');
+
         // Build a blueprint transaction that spends all the UTxOs to commit.
         // The Hydra node uses this to determine which UTxOs enter the head.
         const blockfrostKey = process.env.BLOCKFROST_API_KEY as string;
