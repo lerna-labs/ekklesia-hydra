@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { createNativeScript, submitTx, Wrangler } from '@lerna-labs/hydra-sdk';
 import { blake2b256, bytesToHex, computePackage } from '@lerna-labs/hydra-proof';
 import type { FileLeaf } from '@lerna-labs/hydra-proof';
-import { initialize, voterIdToTokenName, TRP_URL, CLOSE_TOKEN, ipfs, voteCache, success, error, debug, parseTrpSubmitResponse } from '../helpers.js';
+import { initialize, voterIdToTokenName, TRP_URL, CLOSE_TOKEN, VERBOSE, ipfs, voteCache, success, error, debug, parseTrpSubmitResponse } from '../helpers.js';
 import { getCachedBallot } from './lifecycle.js';
 import { BALLOT_INSTANCE_PREFIX, BALLOT_DEFINITION_PREFIX } from '../types.js';
 import type {
@@ -15,6 +15,37 @@ import type {
 } from '../types.js';
 
 const router = Router();
+
+// ---------------------------------------------------------------------------
+// Diagnostic: log head UTxO snapshot
+// ---------------------------------------------------------------------------
+
+/** Log the full head UTxO set for diagnostics (only when VERBOSE). */
+async function logHeadSnapshot(label: string, wrangler: Wrangler): Promise<void> {
+    if (!VERBOSE) return;
+    try {
+        const snapshot = await wrangler.http.getSnapshotUtxo();
+        const entries = Object.entries(snapshot);
+        debug(`[settle/${label}] Head UTxO snapshot — ${entries.length} UTxO(s):`);
+        for (const [ref, utxo] of entries) {
+            const u = utxo as any;
+            const tokens: string[] = [];
+            for (const [pid, assets] of Object.entries(u.value)) {
+                if (pid === 'lovelace') continue;
+                if (typeof assets === 'object') {
+                    for (const [name, qty] of Object.entries(assets as Record<string, number>)) {
+                        tokens.push(`${pid.slice(0, 8)}…${name.slice(0, 16)}…(${qty})`);
+                    }
+                }
+            }
+            const lovelace = u.value.lovelace ?? 0;
+            const datumTag = u.inlineDatum ? ` datum:constructor=${(u.inlineDatum as any)?.constructor}` : '';
+            debug(`  ${ref}: ${lovelace} lovelace${tokens.length ? ' + ' + tokens.join(', ') : ''}${datumTag}`);
+        }
+    } catch (err: any) {
+        debug(`[settle/${label}] Could not fetch snapshot: ${err.message}`);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Head UTxO–driven voter discovery
@@ -436,9 +467,10 @@ router.post('/settle', async (req, res) => {
 
         const wrangler = new Wrangler(process.env.HYDRA_API_URL, process.env.HYDRA_WS_URL);
 
-        // --- Step 0: Query authoritative voter list from head UTxOs ---
+        // --- Step 0: Snapshot + query authoritative voter list from head UTxOs ---
         // The head's UTxO set is the ground truth. The disk cache can have
         // stale entries from previous sessions — never use it for settlement.
+        await logHeadSnapshot('pre-burn', wrangler);
         const headVoters = await getVotersFromHead(wrangler, TOKEN_POLICY as string);
 
         // --- Step 1: Burn all voter tokens (in-head via TRP) ---
@@ -513,6 +545,8 @@ router.post('/settle', async (req, res) => {
         const { cid: evidenceDirectoryCid } = await ipfs.pinDirectory(evidenceDir);
         fullResults.evidenceIpfsCid = evidenceDirectoryCid;
         const resultsHash = bytesToHex(blake2b256(JSON.stringify(fullResults)));
+
+        await logHeadSnapshot('post-burn', wrangler);
 
         // --- Step 3: Build finalize tx via TRP, submit as decommit ---
         // The finalize tx spends the ballot token + gas, and produces the ballot
@@ -592,6 +626,8 @@ router.post('/settle', async (req, res) => {
             status: 'SUCCESS',
             data: { resultsHash, evidenceDirectoryCid, totalVoters: headVoters.length },
         });
+
+        await logHeadSnapshot('post-decommit', wrangler);
 
         // --- Step 4: Close head (only ADA remains — trivial fanout) ---
         await wrangler.waitForHeadClose(180000);

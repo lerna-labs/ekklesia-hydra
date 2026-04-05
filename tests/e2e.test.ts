@@ -97,11 +97,12 @@ const headers = () => ({
     'x-api-key': API_KEY,
 });
 
-async function api(method: string, path: string, body?: unknown) {
+async function api(method: string, path: string, body?: unknown, timeoutMs = 300_000) {
     const res = await fetch(`${API_URL}${path}`, {
         method,
         headers: headers(),
         body: body ? JSON.stringify(body) : undefined,
+        signal: AbortSignal.timeout(timeoutMs),
     });
     const text = await res.text();
     let json: any;
@@ -538,35 +539,72 @@ describe('Ekklesia Hydra E2E — Full Ballot Lifecycle', () => {
     });
 
     // -----------------------------------------------------------------------
-    // Phase 7: Settle — burn → finalize+decommit → close
+    // Phase 7: Ledger snapshot before settlement
     // -----------------------------------------------------------------------
-    // Uses /settle which burns voter tokens, builds the finalize tx via TRP,
-    // submits it as a decommit (ballot token + datum settles to L1 directly),
-    // then closes the head (fanout only handles ADA — no tokens or datums).
 
-    describe('POST /settle — full settlement with decommit', () => {
-        it('should burn, decommit finalized ballot, and close head', async () => {
-            const { status, json } = await api('POST', '/settle', {
-                ballotId: prepareTxHash,
-                ballotName: instanceAssetName,
-                ballotPolicy: policyId,
+    describe('POST /ledger — snapshot head UTxOs before settlement', () => {
+        it('should capture the full UTxO set for diagnostics', async () => {
+            const { status, json } = await api('POST', '/ledger');
+
+            expect(status).toBe(200);
+            const utxos = json.data?.utxos ?? [];
+            console.log(`  Head UTxOs before settlement: ${utxos.length}`);
+            for (const utxo of utxos) {
+                const assets = utxo.amount
+                    .filter((a: any) => a.unit !== 'lovelace')
+                    .map((a: any) => `${a.unit.slice(0, 20)}…(${a.quantity})`)
+                    .join(', ');
+                const lovelace = utxo.amount.find((a: any) => a.unit === 'lovelace')?.quantity ?? '0';
+                console.log(`    ${utxo.tx_hash}#${utxo.output_index}: ${lovelace} lovelace${assets ? ' + ' + assets : ''}`);
+            }
+        });
+    });
+
+    // -----------------------------------------------------------------------
+    // Phase 8: Burn voter tokens + close (NO finalize — diagnostic test)
+    // -----------------------------------------------------------------------
+    // Tests whether Hydra can fanout with the ballot token carrying its
+    // original inline datum (from L1 commit). If this succeeds, the issue
+    // is specifically with the tx3-modified BallotResult datum.
+    // If it fails too, inline datums are the universal problem.
+
+    describe('POST /count — burn voter tokens', () => {
+        it('should burn all voter tokens', async () => {
+            const { status, json } = await api('POST', '/count');
+
+            expect(status).toBe(200);
+            console.log(`  Burned: ${json.data?.burned ?? 0}/${json.data?.total ?? 0}`);
+        }, 120_000);
+    });
+
+    describe('POST /ledger — snapshot head UTxOs after burn (before close)', () => {
+        it('should show ballot token + gas only', async () => {
+            const { status, json } = await api('POST', '/ledger');
+
+            expect(status).toBe(200);
+            const utxos = json.data?.utxos ?? [];
+            console.log(`  Head UTxOs after burn: ${utxos.length}`);
+            for (const utxo of utxos) {
+                const assets = utxo.amount
+                    .filter((a: any) => a.unit !== 'lovelace')
+                    .map((a: any) => `${a.unit.slice(0, 20)}…(${a.quantity})`)
+                    .join(', ');
+                const lovelace = utxo.amount.find((a: any) => a.unit === 'lovelace')?.quantity ?? '0';
+                console.log(`    ${utxo.tx_hash}#${utxo.output_index}: ${lovelace} lovelace${assets ? ' + ' + assets : ''}`);
+            }
+        });
+    });
+
+    describe('POST /close — close head with original ballot datum', () => {
+        it('should close the head and trigger fanout', async () => {
+            const { status, json } = await api('POST', '/close', {
                 closeToken: CLOSE_TOKEN,
-            });
+            }, 540_000);
 
             expect(status).toBe(200);
             expect(json.status).toBe('SUCCESS');
-            expect(json.data.resultsHash).toBeDefined();
-            expect(json.data.evidenceDirectoryCid).toBeDefined();
-            expect(json.data.totalVoters).toBe(1);
-
-            console.log('  Settlement steps:');
-            for (const step of json.data.steps ?? []) {
-                console.log(`    ${step.step}: ${step.status}`, step.data ? JSON.stringify(step.data).slice(0, 200) : '');
-            }
-            console.log(`  Results hash: ${json.data.resultsHash}`);
-            console.log(`  Evidence CID: ${json.data.evidenceDirectoryCid}`);
-            console.log(`  Total voters: ${json.data.totalVoters}`);
-        }, 600_000); // 10 min — burn + decommit + contestation + fanout
+            console.log('  Head closed (no finalize — ballot token has original L1 datum)');
+        }, 600_000);
     });
 
     // -----------------------------------------------------------------------
