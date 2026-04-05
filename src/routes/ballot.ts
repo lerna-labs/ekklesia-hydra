@@ -207,7 +207,7 @@ router.post('/prepare', async (req, res) => {
             evaluator: blockfrost,
         });
 
-        const gas = gasAmount ?? 100;
+        const gas = gasAmount ?? 3;
         const gasLovelace = String(gas * 1_000_000);
 
         // Build the transaction

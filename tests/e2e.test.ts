@@ -113,12 +113,24 @@ async function snapshotHead(label: string) {
     const utxos = json.data?.utxos ?? [];
     console.log(`  [${label}] Head UTxOs: ${utxos.length}`);
     for (const u of utxos) {
-        const tokens = u.amount
-            .filter((a: any) => a.unit !== 'lovelace')
-            .map((a: any) => `${a.unit.slice(0, 16)}…(${a.quantity})`)
-            .join(', ');
-        const lovelace = u.amount.find((a: any) => a.unit === 'lovelace')?.quantity ?? '0';
-        console.log(`    ${u.tx_hash.slice(0, 12)}…#${u.output_index}: ${lovelace} lovelace${tokens ? ' + ' + tokens : ''}`);
+        let lovelace = '0';
+        const tokens: string[] = [];
+
+        for (const a of u.amount) {
+            if (a.unit === 'lovelace') {
+                lovelace = String(a.quantity);
+            } else if (typeof a.quantity === 'object' && a.quantity !== null) {
+                // Hydra nested: { unit: policyId, quantity: { assetNameHex: amount } }
+                for (const [name, qty] of Object.entries(a.quantity as Record<string, number>)) {
+                    const prefix = name.startsWith('00259a20') ? '(601)' : name.startsWith('00258a50') ? '(600)' : name.slice(0, 8);
+                    tokens.push(`${prefix}:${qty}`);
+                }
+            } else {
+                tokens.push(`${a.unit.slice(0, 12)}…:${a.quantity}`);
+            }
+        }
+
+        console.log(`    ${u.tx_hash.slice(0, 12)}…#${u.output_index}: ${lovelace} lovelace${tokens.length ? ' + ' + tokens.join(', ') : ''}`);
     }
 }
 
@@ -265,7 +277,7 @@ describe('Ekklesia Hydra E2E — Full Ballot Lifecycle (2 DReps)', () => {
         const { status, json } = await api('POST', '/prepare', {
             namespace: 'vote.ekklesia.e2e.2drep',
             ballot,
-            gasAmount: 50,
+            gasAmount: 3,
         });
 
         expect(status).toBe(200);

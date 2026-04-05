@@ -68,10 +68,11 @@ interface HeadVoterInfo {
 
 /**
  * Build and submit a finalize transaction inside the Hydra head using
- * MeshTxBuilder instead of tx3. This produces the same CBOR datum encoding
- * as the L1 /prepare endpoint (JSON-based inline datum), letting us test
- * whether the Hydra fanout issue is caused by tx3's Plutus constructor
- * encoding vs MeshTxBuilder's encoding.
+ * MeshTxBuilder. The ballot token UTxO is the sole input (it carries all
+ * the ADA + the token). Output is the same UTxO with updated datum.
+ *
+ * Datum shape: Constr 0 [[ballotId, resultsHash, evidenceCid, merkleRoot], 1]
+ * Matches the tx3 BallotResult { Fields: List<Bytes>, Version: Int } type.
  */
 async function finalizeBallotViaMesh(
     wrangler: Wrangler,
@@ -80,94 +81,71 @@ async function finalizeBallotViaMesh(
     ballotId: string,
     resultsHash: string,
     evidenceCid: string,
-    totalVoters: number,
     merkleRoot: string,
 ): Promise<string> {
     const snapshot = await wrangler.http.getSnapshotUtxo();
 
-    // Find the ballot token UTxO and a gas UTxO
+    // Find the ballot token UTxO (the only UTxO with the ballot instance token)
     let ballotRef: string | null = null;
     let ballotEntry: any = null;
-    let gasRef: string | null = null;
-    let gasEntry: any = null;
 
     for (const [ref, utxo] of Object.entries(snapshot)) {
         const u = utxo as any;
-        let hasBallotToken = false;
-
         for (const [pid, assets] of Object.entries(u.value)) {
             if (pid === 'lovelace' || typeof assets !== 'object') continue;
             for (const name of Object.keys(assets as Record<string, number>)) {
                 if (name.startsWith(BALLOT_INSTANCE_PREFIX)) {
-                    hasBallotToken = true;
+                    ballotRef = ref;
+                    ballotEntry = u;
                     break;
                 }
             }
-            if (hasBallotToken) break;
+            if (ballotRef) break;
         }
-
-        if (hasBallotToken) {
-            ballotRef = ref;
-            ballotEntry = u;
-        } else if (!gasRef) {
-            // First non-ballot UTxO is gas
-            gasRef = ref;
-            gasEntry = u;
-        }
+        if (ballotRef) break;
     }
 
     if (!ballotRef || !ballotEntry) throw new Error('Ballot token UTxO not found in head');
-    if (!gasRef || !gasEntry) throw new Error('Gas UTxO not found in head');
 
-    // Parse UTxO refs
-    const [ballotTxHash, ballotTxIdx] = ballotRef.split('#');
-    const [gasTxHash, gasTxIdx] = gasRef.split('#');
+    const [txHash, txIdx] = ballotRef.split('#');
 
-    // Build amount arrays from snapshot values
-    const ballotAmount: Array<{ unit: string; quantity: string }> = [];
-    const gasAmount: Array<{ unit: string; quantity: string }> = [];
-
+    // Build amount array from snapshot value
+    const amount: Array<{ unit: string; quantity: string }> = [];
     for (const [key, val] of Object.entries(ballotEntry.value)) {
         if (key === 'lovelace') {
-            ballotAmount.push({ unit: 'lovelace', quantity: String(val) });
+            amount.push({ unit: 'lovelace', quantity: String(val) });
         } else if (typeof val === 'object') {
             for (const [name, qty] of Object.entries(val as Record<string, number>)) {
-                ballotAmount.push({ unit: key + name, quantity: String(qty) });
+                amount.push({ unit: key + name, quantity: String(qty) });
             }
         }
     }
 
-    for (const [key, val] of Object.entries(gasEntry.value)) {
-        if (key === 'lovelace') {
-            gasAmount.push({ unit: 'lovelace', quantity: String(val) });
-        } else if (typeof val === 'object') {
-            for (const [name, qty] of Object.entries(val as Record<string, number>)) {
-                gasAmount.push({ unit: key + name, quantity: String(qty) });
-            }
-        }
-    }
-
-    // Build the updated datum using the SAME encoding as /prepare (JSON.stringify)
-    const updatedDatum: BallotInstanceDatum = {
-        ballotId,
-        status: BallotStatus.Finalized,
-        resultsHash,
-        evidenceCid,
-        totalVoters,
-        merkleRoot,
+    // Build updated datum: Constr 0 [[fields...], version]
+    const toHex = (s: string) => s ? Buffer.from(s, 'utf-8').toString('hex') : '';
+    const updatedDatum = {
+        alternative: 0,
+        fields: [
+            [
+                ballotId || '',                 // BallotId: Bytes (already hex)
+                resultsHash || '',              // ResultsHash: Bytes (already hex)
+                toHex(evidenceCid),             // EvidenceCid: Bytes (IPFS CID → hex)
+                merkleRoot || '',               // MerkleRoot: Bytes (already hex)
+            ],
+            1,  // datum schema version
+        ],
     };
 
     debug('[finalizeMesh] Building in-head finalize tx via MeshTxBuilder');
-    debug('[finalizeMesh] Datum (JSON):', JSON.stringify(updatedDatum));
+    debug('[finalizeMesh] Ballot UTxO:', ballotRef);
+    debug('[finalizeMesh] Datum fields:', JSON.stringify(updatedDatum));
 
-    // Build zero-fee transaction: spend ballot + gas, output ballot with new datum + gas return
+    // Single input → single output, zero fee
     const txBuilder = new MeshTxBuilder();
     txBuilder
-        .txIn(ballotTxHash, parseInt(ballotTxIdx), ballotAmount, ballotEntry.address)
-        .txIn(gasTxHash, parseInt(gasTxIdx), gasAmount, gasEntry.address)
-        .txOut(adminAddress, ballotAmount)
-        .txOutInlineDatumValue(JSON.stringify(updatedDatum))
-        .txOut(adminAddress, gasAmount)
+        .txIn(txHash, parseInt(txIdx), amount, ballotEntry.address)
+        .txOut(adminAddress, amount)
+        .txOutInlineDatumValue(updatedDatum)
         .setFee('0')
         .changeAddress(adminAddress);
 
@@ -176,14 +154,14 @@ async function finalizeBallotViaMesh(
 
     debug(`[finalizeMesh] Signed tx (${signedTx.length} chars)`);
 
-    // Submit to head via TRP (same as other in-head txs)
-    const ballotName = ballotAmount.find(a => a.unit !== 'lovelace')?.unit.slice(-64) ?? '';
+    // Submit to head via TRP
+    const ballotName = amount.find(a => a.unit !== 'lovelace')?.unit.slice(-64) ?? '';
     const submitRes = await submitTx(TRP_URL, signedTx, `0:${ballotName}`);
     const submitText = await submitRes.text();
     debug('[finalizeMesh] submitTx response:', submitText);
-    const { hash: txHash } = parseTrpSubmitResponse(submitText);
+    const { hash: finalizeHash } = parseTrpSubmitResponse(submitText);
 
-    return txHash ?? '';
+    return finalizeHash ?? '';
 }
 
 /**
@@ -673,21 +651,22 @@ router.post('/settle', async (req, res) => {
 
         await logHeadSnapshot('post-burn', wrangler);
 
-        // --- Step 3: Finalize ballot datum in-head via MeshTxBuilder ---
-        // Uses MeshTxBuilder (same encoding as L1 /prepare) instead of tx3,
-        // so the inline datum CBOR is consistent with what Hydra originally
-        // committed. This tests whether tx3's Plutus constructor encoding
-        // is what breaks the fanout/decommit.
-        const finalizeTxHash = await finalizeBallotViaMesh(
-            wrangler,
-            admin_wallet,
-            admin_payment_address,
-            ballotId,
-            resultsHash,
-            evidenceDirectoryCid,
-            headVoters.length,
-            evidenceMerkleRoot,
-        );
+        // --- Step 3: Finalize ballot datum in-head via tx3 ---
+        const finalizeTrp = await client.finalizeBallotTx({
+            votingAuthority: admin_payment_address,
+            ballotPolicy: Buffer.from(ballotPolicy, 'hex'),
+            ballotToken: Buffer.from(ballotName, 'hex'),
+            ballotId: Buffer.from(ballotId, 'hex'),
+            resultsHash: Buffer.from(resultsHash, 'hex'),
+            evidenceCid: Buffer.from(evidenceDirectoryCid),
+            merkleRoot: Buffer.from(evidenceMerkleRoot, 'hex'),
+        });
+
+        debug(`[settle/finalize] tx (${finalizeTrp.tx?.length ?? 0} chars):`, finalizeTrp.tx);
+        const finalizeSignedTx = await admin_wallet.signTx(finalizeTrp.tx);
+        const finalizeSubmitText = await (await submitTx(TRP_URL, finalizeSignedTx, `0:${ballotName}`)).text();
+        debug('[settle/finalize] submitTx response:', finalizeSubmitText);
+        const { hash: finalizeTxHash } = parseTrpSubmitResponse(finalizeSubmitText);
 
         steps.push({
             step: 'finalize',
@@ -697,7 +676,7 @@ router.post('/settle', async (req, res) => {
 
         await logHeadSnapshot('post-finalize', wrangler);
 
-        // --- Step 4: Close head — fanout includes ballot token with MeshTxBuilder datum ---
+        // --- Step 4: Close head — fanout includes ballot token with finalized datum ---
         await wrangler.waitForHeadClose(180000);
 
         steps.push({ step: 'close', status: 'SUCCESS' });
