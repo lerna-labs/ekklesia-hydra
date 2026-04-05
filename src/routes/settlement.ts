@@ -313,18 +313,24 @@ router.post('/count', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// POST /settle — orchestrate full settlement: finalize → burn → close → fanout
+// POST /settle — orchestrate full settlement: burn → decommit+finalize → close
 // ---------------------------------------------------------------------------
 
 /**
  * POST /settle
  *
- * Full settlement orchestration. Calls finalize, burns all voter tokens,
- * then closes the head (which triggers fanout).
+ * Full settlement orchestration:
+ *   1. Burn all voter tokens (in-head via TRP)
+ *   2. Tally votes + pin evidence to IPFS
+ *   3. Build finalize tx via TRP and submit it as a **decommit** — the ballot
+ *      token leaves the head with its updated BallotResult datum and settles
+ *      directly to L1, bypassing fanout entirely
+ *   4. Close the head — fanout is trivial (ADA-only, no datums/tokens)
  *
  * Body:
  *   ballotId: string       — ballot identifier (ULID or tx hash)
  *   ballotName: string     — hex fingerprint of the ballot tokens
+ *   ballotPolicy: string   — hex policy ID of the ballot tokens
  *   closeToken: string     — required to authorize head close
  */
 router.post('/settle', async (req, res) => {
@@ -335,8 +341,8 @@ router.post('/settle', async (req, res) => {
         closeToken: string;
     };
 
-    if (!ballotId || !ballotName || !closeToken) {
-        return error(res, 'MISSING_FIELDS', 'Missing required fields: ballotId, ballotName, closeToken', 400);
+    if (!ballotId || !ballotName || !ballotPolicy || !closeToken) {
+        return error(res, 'MISSING_FIELDS', 'Missing required fields: ballotId, ballotName, ballotPolicy, closeToken', 400);
     }
 
     if (closeToken !== CLOSE_TOKEN) {
@@ -346,8 +352,6 @@ router.post('/settle', async (req, res) => {
     const steps: Array<{ step: string; status: string; data?: any; error?: string }> = [];
 
     try {
-        // --- Step 1: Finalize ---
-        // We call the finalization logic inline rather than HTTP to avoid circular deps
         const ballot = getCachedBallot();
         if (!ballot) {
             return error(res, 'NO_BALLOT_CACHED', 'No ballot definition cached', 400);
@@ -364,9 +368,10 @@ router.post('/settle', async (req, res) => {
             scriptHash: TOKEN_POLICY,
         } = createNativeScript(admin_payment_address);
 
+        const wrangler = new Wrangler(process.env.HYDRA_API_URL, process.env.HYDRA_WS_URL);
         const allVotes = voteCache.getAll();
 
-        // --- Step 1: Burn all voter tokens ---
+        // --- Step 1: Burn all voter tokens (in-head via TRP) ---
         let burned = 0;
         let burnFailed = 0;
         for (const vote of allVotes) {
@@ -394,7 +399,7 @@ router.post('/settle', async (req, res) => {
             data: { burned, failed: burnFailed, total: allVotes.length },
         });
 
-        // --- Step 2: Tally + finalize (after all tokens burned, clean UTxO set) ---
+        // --- Step 2: Tally + IPFS evidence ---
         const fileLeaves: FileLeaf[] = allVotes.map((v) => ({
             name: v.voterId,
             contentHashHex: v.voteHash,
@@ -414,7 +419,6 @@ router.post('/settle', async (req, res) => {
             finalizedAt: new Date().toISOString(),
         };
 
-        // Write per-voter proof files + pin evidence
         const fs = await import('node:fs/promises');
         const pathMod = await import('node:path');
         const evidenceDir = voteCache.getDocumentsDir();
@@ -441,7 +445,12 @@ router.post('/settle', async (req, res) => {
         fullResults.evidenceIpfsCid = evidenceDirectoryCid;
         const resultsHash = bytesToHex(blake2b256(JSON.stringify(fullResults)));
 
-        // Update (601) datum
+        // --- Step 3: Build finalize tx via TRP, submit as decommit ---
+        // The finalize tx spends the ballot token + gas, and produces the ballot
+        // token with updated BallotResult datum + gas return. By submitting this
+        // as a decommit instead of an in-head tx, both outputs leave the head
+        // and settle directly to L1 — the ballot arrives on L1 with the finalized
+        // datum intact, bypassing the fanout Plutus validator entirely.
         const finalizeTrp = await client.finalizeBallotTx({
             votingAuthority: admin_payment_address,
             ballotPolicy: Buffer.from(ballotPolicy, 'hex'),
@@ -453,18 +462,26 @@ router.post('/settle', async (req, res) => {
             merkleRoot: Buffer.from(evidenceMerkleRoot, 'hex'),
         });
 
+        debug(`[settle/decommit] finalize tx (${finalizeTrp.tx?.length ?? 0} chars):`, finalizeTrp.tx);
         const finalizeSignedTx = await admin_wallet.signTx(finalizeTrp.tx);
-        const finalizeSubmitText = await (await submitTx(TRP_URL, finalizeSignedTx, `0:${ballotName}`)).text();
-        const { hash: finalizeTxHash } = parseTrpSubmitResponse(finalizeSubmitText);
+
+        const decommitTx = {
+            type: 'Tx ConwayEra' as const,
+            cborHex: finalizeSignedTx,
+            description: 'Decommit finalized ballot token to L1',
+        };
+
+        debug('[settle/decommit] Submitting finalize tx as decommit…');
+        await wrangler.decommit(decommitTx, 120000);
+        debug('[settle/decommit] Decommit approved — ballot token settling to L1');
 
         steps.push({
-            step: 'finalize',
+            step: 'decommit-finalize',
             status: 'SUCCESS',
-            data: { txHash: finalizeTxHash, resultsHash, evidenceDirectoryCid, totalVoters: allVotes.length },
+            data: { resultsHash, evidenceDirectoryCid, totalVoters: allVotes.length },
         });
 
-        // --- Step 3: Close head ---
-        const wrangler = new Wrangler(process.env.HYDRA_API_URL, process.env.HYDRA_WS_URL);
+        // --- Step 4: Close head (only ADA remains — trivial fanout) ---
         await wrangler.waitForHeadClose(180000);
 
         steps.push({ step: 'close', status: 'SUCCESS' });
