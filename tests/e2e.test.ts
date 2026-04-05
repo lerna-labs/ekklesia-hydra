@@ -538,53 +538,35 @@ describe('Ekklesia Hydra E2E — Full Ballot Lifecycle', () => {
     });
 
     // -----------------------------------------------------------------------
-    // Phase 7: Burn voter tokens
+    // Phase 7: Settle — burn → finalize+decommit → close
     // -----------------------------------------------------------------------
+    // Uses /settle which burns voter tokens, builds the finalize tx via TRP,
+    // submits it as a decommit (ballot token + datum settles to L1 directly),
+    // then closes the head (fanout only handles ADA — no tokens or datums).
 
-    describe('POST /count — burn all voter tokens', () => {
-        it('should burn voter tokens', async () => {
-            const { status, json } = await api('POST', '/count');
-
-            expect(status).toBe(200);
-            console.log(`  Burned: ${json.data?.burned ?? 0}/${json.data?.total ?? 0}`);
-        }, 120_000);
-    });
-
-    // -----------------------------------------------------------------------
-    // Phase 8: Finalize (after all tokens burned, clean UTxO set)
-    // -----------------------------------------------------------------------
-
-    describe('POST /finalize — tally and update (601) datum', () => {
-        it('should finalize the ballot', async () => {
-            const { status, json } = await api('POST', '/finalize', {
+    describe('POST /settle — full settlement with decommit', () => {
+        it('should burn, decommit finalized ballot, and close head', async () => {
+            const { status, json } = await api('POST', '/settle', {
                 ballotId: prepareTxHash,
                 ballotName: instanceAssetName,
                 ballotPolicy: policyId,
+                closeToken: CLOSE_TOKEN,
             });
 
             expect(status).toBe(200);
             expect(json.status).toBe('SUCCESS');
             expect(json.data.resultsHash).toBeDefined();
             expect(json.data.evidenceDirectoryCid).toBeDefined();
-            expect(json.data.evidenceMerkleRoot).toBeDefined();
-            expect(json.data.totalVoters).toBeGreaterThanOrEqual(1);
+            expect(json.data.totalVoters).toBe(1);
 
-            console.log(`  Finalized: ${json.data.evidenceDirectoryCid}`);
+            console.log('  Settlement steps:');
+            for (const step of json.data.steps ?? []) {
+                console.log(`    ${step.step}: ${step.status}`, step.data ? JSON.stringify(step.data).slice(0, 200) : '');
+            }
             console.log(`  Results hash: ${json.data.resultsHash}`);
+            console.log(`  Evidence CID: ${json.data.evidenceDirectoryCid}`);
             console.log(`  Total voters: ${json.data.totalVoters}`);
-        }, 120_000);
-    });
-
-    describe('POST /close — close the head', () => {
-        it('should close the head and fanout to L1', async () => {
-            const { status, json } = await api('POST', '/close', {
-                closeToken: CLOSE_TOKEN,
-            });
-
-            expect(status).toBe(200);
-            expect(json.status).toBe('SUCCESS');
-            console.log('  Head closed');
-        }, 240_000);
+        }, 600_000); // 10 min — burn + decommit + contestation + fanout
     });
 
     // -----------------------------------------------------------------------

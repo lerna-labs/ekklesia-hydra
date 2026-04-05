@@ -540,9 +540,52 @@ router.post('/settle', async (req, res) => {
             description: 'Decommit finalized ballot token to L1',
         };
 
-        debug('[settle/decommit] Submitting finalize tx as decommit…');
-        await wrangler.decommit(decommitTx, 120000);
-        debug('[settle/decommit] Decommit approved — ballot token settling to L1');
+        // POST directly to Hydra node — the SDK's publishDecommit wraps the
+        // payload in { tag: 'Decommit', transaction: ... } but the Hydra 1.x
+        // REST API expects the raw transaction envelope at the top level.
+        const hydraApiUrl = (process.env.HYDRA_API_URL ?? 'http://localhost:4001').replace(/\/+$/, '');
+        debug('[settle/decommit] POSTing decommit to', `${hydraApiUrl}/decommit`);
+
+        const decommitRes = await fetch(`${hydraApiUrl}/decommit`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(decommitTx),
+        });
+
+        if (!decommitRes.ok && decommitRes.status !== 202) {
+            const body = await decommitRes.text().catch(() => '');
+            throw new Error(`Decommit rejected (${decommitRes.status}): ${body}`);
+        }
+
+        debug('[settle/decommit] Decommit accepted, waiting for approval…');
+
+        // Poll the head snapshot until the ballot token disappears (decommit confirmed)
+        const DECOMMIT_TIMEOUT = 120_000;
+        const POLL_INTERVAL = 3_000;
+        const deadline = Date.now() + DECOMMIT_TIMEOUT;
+
+        while (Date.now() < deadline) {
+            await new Promise((r) => setTimeout(r, POLL_INTERVAL));
+            const snapshot = await wrangler.http.getSnapshotUtxo();
+            const stillInHead = Object.values(snapshot).some((utxo: any) => {
+                for (const [pid, assets] of Object.entries(utxo.value)) {
+                    if (pid === 'lovelace' || typeof assets !== 'object') continue;
+                    for (const name of Object.keys(assets as Record<string, number>)) {
+                        if (name.startsWith(BALLOT_INSTANCE_PREFIX)) return true;
+                    }
+                }
+                return false;
+            });
+            if (!stillInHead) {
+                debug('[settle/decommit] Ballot token decommitted — no longer in head');
+                break;
+            }
+            debug('[settle/decommit] Ballot token still in head, polling…');
+        }
+
+        if (Date.now() >= deadline) {
+            throw new Error('Timeout waiting for decommit to be confirmed');
+        }
 
         steps.push({
             step: 'decommit-finalize',
