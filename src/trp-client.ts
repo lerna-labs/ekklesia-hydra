@@ -18,6 +18,13 @@ import type {
     CountVoteParams,
     FinalizeBallotParams,
 } from './protocol.js';
+export type {
+    RegisterVoterParams,
+    VoteAndRegisterParams,
+    CastVoteParams,
+    CountVoteParams,
+    FinalizeBallotParams,
+};
 import type { ClientOptions, ResolveResponse, SubmitParams } from 'tx3-sdk/trp';
 import { debug } from './helpers.js';
 

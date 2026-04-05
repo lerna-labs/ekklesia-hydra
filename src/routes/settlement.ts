@@ -1,15 +1,17 @@
 import { Router } from 'express';
+import { MeshTxBuilder } from '@meshsdk/core';
 import { createNativeScript, submitTx, Wrangler } from '@lerna-labs/hydra-sdk';
 import { blake2b256, bytesToHex, computePackage } from '@lerna-labs/hydra-proof';
 import type { FileLeaf } from '@lerna-labs/hydra-proof';
 import { initialize, voterIdToTokenName, TRP_URL, CLOSE_TOKEN, VERBOSE, ipfs, voteCache, success, error, debug, parseTrpSubmitResponse } from '../helpers.js';
 import { getCachedBallot } from './lifecycle.js';
-import { BALLOT_INSTANCE_PREFIX, BALLOT_DEFINITION_PREFIX } from '../types.js';
+import { BALLOT_INSTANCE_PREFIX, BALLOT_DEFINITION_PREFIX, BallotStatus } from '../types.js';
 import type {
     FullResults,
     QuestionTally,
     OptionTally,
     BallotDefinition,
+    BallotInstanceDatum,
     VoteCacheEntry,
     VoteEvidence,
 } from '../types.js';
@@ -58,6 +60,130 @@ interface HeadVoterInfo {
     version: number;
     voteHash: string;
     ipfsCid: string;
+}
+
+// ---------------------------------------------------------------------------
+// MeshTxBuilder-based in-head finalize (bypasses tx3 for datum encoding test)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build and submit a finalize transaction inside the Hydra head using
+ * MeshTxBuilder instead of tx3. This produces the same CBOR datum encoding
+ * as the L1 /prepare endpoint (JSON-based inline datum), letting us test
+ * whether the Hydra fanout issue is caused by tx3's Plutus constructor
+ * encoding vs MeshTxBuilder's encoding.
+ */
+async function finalizeBallotViaMesh(
+    wrangler: Wrangler,
+    adminWallet: any,
+    adminAddress: string,
+    ballotId: string,
+    resultsHash: string,
+    evidenceCid: string,
+    totalVoters: number,
+    merkleRoot: string,
+): Promise<string> {
+    const snapshot = await wrangler.http.getSnapshotUtxo();
+
+    // Find the ballot token UTxO and a gas UTxO
+    let ballotRef: string | null = null;
+    let ballotEntry: any = null;
+    let gasRef: string | null = null;
+    let gasEntry: any = null;
+
+    for (const [ref, utxo] of Object.entries(snapshot)) {
+        const u = utxo as any;
+        let hasBallotToken = false;
+
+        for (const [pid, assets] of Object.entries(u.value)) {
+            if (pid === 'lovelace' || typeof assets !== 'object') continue;
+            for (const name of Object.keys(assets as Record<string, number>)) {
+                if (name.startsWith(BALLOT_INSTANCE_PREFIX)) {
+                    hasBallotToken = true;
+                    break;
+                }
+            }
+            if (hasBallotToken) break;
+        }
+
+        if (hasBallotToken) {
+            ballotRef = ref;
+            ballotEntry = u;
+        } else if (!gasRef) {
+            // First non-ballot UTxO is gas
+            gasRef = ref;
+            gasEntry = u;
+        }
+    }
+
+    if (!ballotRef || !ballotEntry) throw new Error('Ballot token UTxO not found in head');
+    if (!gasRef || !gasEntry) throw new Error('Gas UTxO not found in head');
+
+    // Parse UTxO refs
+    const [ballotTxHash, ballotTxIdx] = ballotRef.split('#');
+    const [gasTxHash, gasTxIdx] = gasRef.split('#');
+
+    // Build amount arrays from snapshot values
+    const ballotAmount: Array<{ unit: string; quantity: string }> = [];
+    const gasAmount: Array<{ unit: string; quantity: string }> = [];
+
+    for (const [key, val] of Object.entries(ballotEntry.value)) {
+        if (key === 'lovelace') {
+            ballotAmount.push({ unit: 'lovelace', quantity: String(val) });
+        } else if (typeof val === 'object') {
+            for (const [name, qty] of Object.entries(val as Record<string, number>)) {
+                ballotAmount.push({ unit: key + name, quantity: String(qty) });
+            }
+        }
+    }
+
+    for (const [key, val] of Object.entries(gasEntry.value)) {
+        if (key === 'lovelace') {
+            gasAmount.push({ unit: 'lovelace', quantity: String(val) });
+        } else if (typeof val === 'object') {
+            for (const [name, qty] of Object.entries(val as Record<string, number>)) {
+                gasAmount.push({ unit: key + name, quantity: String(qty) });
+            }
+        }
+    }
+
+    // Build the updated datum using the SAME encoding as /prepare (JSON.stringify)
+    const updatedDatum: BallotInstanceDatum = {
+        ballotId,
+        status: BallotStatus.Finalized,
+        resultsHash,
+        evidenceCid,
+        totalVoters,
+        merkleRoot,
+    };
+
+    debug('[finalizeMesh] Building in-head finalize tx via MeshTxBuilder');
+    debug('[finalizeMesh] Datum (JSON):', JSON.stringify(updatedDatum));
+
+    // Build zero-fee transaction: spend ballot + gas, output ballot with new datum + gas return
+    const txBuilder = new MeshTxBuilder();
+    txBuilder
+        .txIn(ballotTxHash, parseInt(ballotTxIdx), ballotAmount, ballotEntry.address)
+        .txIn(gasTxHash, parseInt(gasTxIdx), gasAmount, gasEntry.address)
+        .txOut(adminAddress, ballotAmount)
+        .txOutInlineDatumValue(JSON.stringify(updatedDatum))
+        .txOut(adminAddress, gasAmount)
+        .setFee('0')
+        .changeAddress(adminAddress);
+
+    const unsignedTx = txBuilder.completeSync();
+    const signedTx = await adminWallet.signTx(unsignedTx);
+
+    debug(`[finalizeMesh] Signed tx (${signedTx.length} chars)`);
+
+    // Submit to head via TRP (same as other in-head txs)
+    const ballotName = ballotAmount.find(a => a.unit !== 'lovelace')?.unit.slice(-64) ?? '';
+    const submitRes = await submitTx(TRP_URL, signedTx, `0:${ballotName}`);
+    const submitText = await submitRes.text();
+    debug('[finalizeMesh] submitTx response:', submitText);
+    const { hash: txHash } = parseTrpSubmitResponse(submitText);
+
+    return txHash ?? '';
 }
 
 /**
@@ -313,11 +439,10 @@ router.post('/finalize', async (req, res) => {
         const trp_response = await client.finalizeBallotTx({
             votingAuthority: admin_payment_address,
             ballotPolicy: Buffer.from(ballotPolicy, 'hex'),
-            ballotName: Buffer.from(ballotName, 'hex'),
+            ballotToken: Buffer.from(ballotName, 'hex'),
             ballotId: Buffer.from(ballotId, 'hex'),
             resultsHash: Buffer.from(resultsHash, 'hex'),
             evidenceCid: Buffer.from(evidenceDirectoryCid),
-            totalVoters: allVotes.length,
             merkleRoot: Buffer.from(evidenceMerkleRoot, 'hex'),
         });
 
@@ -548,88 +673,31 @@ router.post('/settle', async (req, res) => {
 
         await logHeadSnapshot('post-burn', wrangler);
 
-        // --- Step 3: Build finalize tx via TRP, submit as decommit ---
-        // The finalize tx spends the ballot token + gas, and produces the ballot
-        // token with updated BallotResult datum + gas return. By submitting this
-        // as a decommit instead of an in-head tx, both outputs leave the head
-        // and settle directly to L1 — the ballot arrives on L1 with the finalized
-        // datum intact, bypassing the fanout Plutus validator entirely.
-        const finalizeTrp = await client.finalizeBallotTx({
-            votingAuthority: admin_payment_address,
-            ballotPolicy: Buffer.from(ballotPolicy, 'hex'),
-            ballotName: Buffer.from(ballotName, 'hex'),
-            ballotId: Buffer.from(ballotId, 'hex'),
-            resultsHash: Buffer.from(resultsHash, 'hex'),
-            evidenceCid: Buffer.from(evidenceDirectoryCid),
-            totalVoters: headVoters.length,
-            merkleRoot: Buffer.from(evidenceMerkleRoot, 'hex'),
-        });
-
-        debug(`[settle/decommit] finalize tx (${finalizeTrp.tx?.length ?? 0} chars):`, finalizeTrp.tx);
-        const finalizeSignedTx = await admin_wallet.signTx(finalizeTrp.tx);
-
-        const decommitTx = {
-            type: 'Tx ConwayEra' as const,
-            cborHex: finalizeSignedTx,
-            description: 'Decommit finalized ballot token to L1',
-        };
-
-        // POST directly to Hydra node — the SDK's publishDecommit wraps the
-        // payload in { tag: 'Decommit', transaction: ... } but the Hydra 1.x
-        // REST API expects the raw transaction envelope at the top level.
-        const hydraApiUrl = (process.env.HYDRA_API_URL ?? 'http://localhost:4001').replace(/\/+$/, '');
-        debug('[settle/decommit] POSTing decommit to', `${hydraApiUrl}/decommit`);
-
-        const decommitRes = await fetch(`${hydraApiUrl}/decommit`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(decommitTx),
-        });
-
-        if (!decommitRes.ok && decommitRes.status !== 202) {
-            const body = await decommitRes.text().catch(() => '');
-            throw new Error(`Decommit rejected (${decommitRes.status}): ${body}`);
-        }
-
-        debug('[settle/decommit] Decommit accepted, waiting for approval…');
-
-        // Poll the head snapshot until the ballot token disappears (decommit confirmed)
-        const DECOMMIT_TIMEOUT = 120_000;
-        const POLL_INTERVAL = 3_000;
-        const deadline = Date.now() + DECOMMIT_TIMEOUT;
-
-        while (Date.now() < deadline) {
-            await new Promise((r) => setTimeout(r, POLL_INTERVAL));
-            const snapshot = await wrangler.http.getSnapshotUtxo();
-            const stillInHead = Object.values(snapshot).some((utxo: any) => {
-                for (const [pid, assets] of Object.entries(utxo.value)) {
-                    if (pid === 'lovelace' || typeof assets !== 'object') continue;
-                    for (const name of Object.keys(assets as Record<string, number>)) {
-                        if (name.startsWith(BALLOT_INSTANCE_PREFIX)) return true;
-                    }
-                }
-                return false;
-            });
-            if (!stillInHead) {
-                debug('[settle/decommit] Ballot token decommitted — no longer in head');
-                break;
-            }
-            debug('[settle/decommit] Ballot token still in head, polling…');
-        }
-
-        if (Date.now() >= deadline) {
-            throw new Error('Timeout waiting for decommit to be confirmed');
-        }
+        // --- Step 3: Finalize ballot datum in-head via MeshTxBuilder ---
+        // Uses MeshTxBuilder (same encoding as L1 /prepare) instead of tx3,
+        // so the inline datum CBOR is consistent with what Hydra originally
+        // committed. This tests whether tx3's Plutus constructor encoding
+        // is what breaks the fanout/decommit.
+        const finalizeTxHash = await finalizeBallotViaMesh(
+            wrangler,
+            admin_wallet,
+            admin_payment_address,
+            ballotId,
+            resultsHash,
+            evidenceDirectoryCid,
+            headVoters.length,
+            evidenceMerkleRoot,
+        );
 
         steps.push({
-            step: 'decommit-finalize',
+            step: 'finalize',
             status: 'SUCCESS',
-            data: { resultsHash, evidenceDirectoryCid, totalVoters: headVoters.length },
+            data: { txHash: finalizeTxHash, resultsHash, evidenceDirectoryCid, totalVoters: headVoters.length },
         });
 
-        await logHeadSnapshot('post-decommit', wrangler);
+        await logHeadSnapshot('post-finalize', wrangler);
 
-        // --- Step 4: Close head (only ADA remains — trivial fanout) ---
+        // --- Step 4: Close head — fanout includes ballot token with MeshTxBuilder datum ---
         await wrangler.waitForHeadClose(180000);
 
         steps.push({ step: 'close', status: 'SUCCESS' });

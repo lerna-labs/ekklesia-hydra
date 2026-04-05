@@ -17,7 +17,7 @@ import {
     debug,
     parseTrpSubmitResponse,
 } from '../helpers.js';
-import {getCachedBallot} from './lifecycle.js';
+import {getCachedBallot, getCachedBallotIdentity} from './lifecycle.js';
 import type {
     BallotDefinition,
     CoseWitness,
@@ -374,11 +374,18 @@ router.post('/register', async (req, res) => {
             scriptHash: TOKEN_POLICY,
         } = createNativeScript(admin_payment_address);
 
+        const ballotIdentity = getCachedBallotIdentity();
+        if (!ballotIdentity) {
+            return error(res, 'CLIENT_INIT_FAILED', 'Ballot identity not cached. Was /start called with ballotPolicy and ballotToken?', 503);
+        }
+
         const trp_response = await client.registerVoterTx({
             votingAuthority: admin_payment_address,
             mintingScript: Buffer.from(TOKEN_SCRIPT as string, 'hex'),
             tokenPolicy: Buffer.from(TOKEN_POLICY as string, 'hex'),
             userId: Buffer.from(tokenName, 'hex'),
+            ballotPolicy: Buffer.from(ballotIdentity.ballotPolicy, 'hex'),
+            ballotToken: Buffer.from(ballotIdentity.ballotToken, 'hex'),
         });
 
         const signedTx = await admin_wallet.signTx(trp_response.tx);
@@ -496,6 +503,11 @@ router.post('/vote-and-register', async (req, res) => {
         );
 
         // --- 4. Submit combined register+vote via TRP ---
+        const ballotIdentity = getCachedBallotIdentity();
+        if (!ballotIdentity) {
+            return error(res, 'CLIENT_INIT_FAILED', 'Ballot identity not cached. Was /start called with ballotPolicy and ballotToken?', 503);
+        }
+
         const trp_response = await client.voteAndRegisterTx({
             votingAuthority: admin_payment_address,
             mintingScript: Buffer.from(TOKEN_SCRIPT as string, 'hex'),
@@ -504,6 +516,8 @@ router.post('/vote-and-register', async (req, res) => {
             merkleRoot: Buffer.from(merkleRoot, 'hex'),
             voteHash: Buffer.from(voteHash, 'hex'),
             ipfsCid: Buffer.from(ipfsCid),
+            ballotPolicy: Buffer.from(ballotIdentity.ballotPolicy, 'hex'),
+            ballotToken: Buffer.from(ballotIdentity.ballotToken, 'hex'),
         });
 
         debug(`[vote-and-register] unsigned tx (${trp_response.tx?.length ?? 0} chars):`, trp_response.tx);

@@ -5,8 +5,8 @@ import type {FileLeaf} from '@lerna-labs/hydra-proof';
 import {blake2b256, bytesToHex, computePackage} from '@lerna-labs/hydra-proof';
 import {error, HYDRA_NETWORK, ipfs, success} from '../helpers.js';
 import {toBallotSurveyDetails} from '../cip179.js';
-import type {BallotDefinition, BallotDefinitionDatum, BallotInstanceDatum} from '../types.js';
-import {BALLOT_DEFINITION_PREFIX, BALLOT_INSTANCE_PREFIX, BallotStatus, buildAssetName,} from '../types.js';
+import type {BallotDefinition} from '../types.js';
+import {BALLOT_DEFINITION_PREFIX, BALLOT_INSTANCE_PREFIX, buildAssetName} from '../types.js';
 
 const router = Router();
 
@@ -160,28 +160,45 @@ router.post('/prepare', async (req, res) => {
         // Pin the ballot content proof package (for auditor verification of questions)
         await ipfs.pinJson(`ballot-proof-${fingerprint}.json`, ballotProofPackage);
 
-        // --- 5. Build slim inline datums ---
+        // --- 5. Build inline datums as Constr 0 [[ordered_fields], version] ---
+        // Both (600) and (601) use the same shape so they can be read
+        // consistently on L1. The inner list holds the data fields; the
+        // trailing integer is the datum schema version.
 
-        // (600) Ballot Definition datum — slim: merkle root + IPFS CID (NOT full content)
-        const definitionDatum: BallotDefinitionDatum = {
-            title: ballot.title,
-            namespace,
-            votingAuthority: admin_address,
-            contentHash: ballotContentHash,
-            ballotCid: ballotIpfsCid,
-            questionCount: ballot.questions.length,
-            votingWindow: ballot.ekklesia.votingWindow,
-            endEpoch: ballot.endEpoch,
+        const toHex = (s: string) => s ? Buffer.from(s, 'utf-8').toString('hex') : '';
+
+        // (600) Ballot Definition datum
+        const definitionDatumPlutus = {
+            alternative: 0,
+            fields: [
+                [   // ordered field set
+                    toHex(ballot.title),                              // Title: Bytes
+                    toHex(namespace),                                 // Namespace: Bytes
+                    toHex(admin_address),                             // VotingAuthority: Bytes
+                    ballotContentHash,                                // ContentHash: Bytes (already hex)
+                    toHex(ballotIpfsCid),                             // BallotCid: Bytes
+                    ballot.questions.length,                          // QuestionCount: Int
+                    toHex(ballot.ekklesia.votingWindow.open),         // VotingWindowOpen: Bytes
+                    toHex(ballot.ekklesia.votingWindow.close),        // VotingWindowClose: Bytes
+                    ballot.endEpoch,                                  // EndEpoch: Int
+                ],
+                1,  // datum schema version
+            ],
         };
 
-        // (601) Ballot Instance datum — initial state (all proof fields zeroed)
-        const instanceDatum: BallotInstanceDatum = {
-            ballotId: '',
-            status: BallotStatus.Created,
-            resultsHash: '',
-            evidenceCid: '',
-            totalVoters: 0,
-            merkleRoot: '',
+        // (601) Ballot Instance datum — initial state (all fields empty).
+        // Must match the tx3 BallotResult shape so TRP can resolve via datum_is.
+        const instanceDatumPlutus = {
+            alternative: 0,
+            fields: [
+                [   // ordered field set
+                    '',  // BallotId: empty bytes
+                    '',  // ResultsHash: empty bytes
+                    '',  // EvidenceCid: empty bytes
+                    '',  // MerkleRoot: empty bytes
+                ],
+                1,  // datum schema version
+            ],
         };
 
         // --- 5. Build the L1 minting transaction ---
@@ -202,26 +219,19 @@ router.post('/prepare', async (req, res) => {
             .mint('1', POLICY_ID, instanceAssetName)
             .mintingScript(SCRIPT_CBOR)
             // Output: (600) token with inline datum → stays on L1
-            // Min UTxO for token + inline datum is ~3-4 ADA on Conway; use 5 ADA for safety
             .txOut(admin_address, [
                 { unit: 'lovelace', quantity: '5000000' },
                 { unit: POLICY_ID + definitionAssetName, quantity: '1' },
             ])
-            .txOutInlineDatumValue(JSON.stringify(definitionDatum))
-            // Output: (601) token with inline datum → will be committed to Hydra
-            .txOut(admin_address, [
-                { unit: 'lovelace', quantity: '5000000' },
-                { unit: POLICY_ID + instanceAssetName, quantity: '1' },
-            ])
-            .txOutInlineDatumValue(JSON.stringify(instanceDatum))
-            // Output: Gas UTxO for in-head operations
+            .txOutInlineDatumValue(definitionDatumPlutus)
+            // Output: (601) token with gas ADA + inline datum → committed to Hydra
+            // The ballot token carries all the ADA for in-head operations.
+            // No separate gas UTxO — the ballot token IS the gas.
             .txOut(admin_address, [
                 { unit: 'lovelace', quantity: gasLovelace },
+                { unit: POLICY_ID + instanceAssetName, quantity: '1' },
             ])
-            // Output: ADA-only collateral UTxO for Hydra node init/commit transactions
-            .txOut(admin_address, [
-                { unit: 'lovelace', quantity: '5000000' },
-            ]);
+            .txOutInlineDatumValue(instanceDatumPlutus);
 
         // Transaction validity must not exceed the timelocked script's invalidHereafter.
         // The voting window open time MUST be in the future to allow minting.
@@ -254,8 +264,7 @@ router.post('/prepare', async (req, res) => {
             gasAmount: gas,
             timelockSlot: votingOpenSlot,
             commitUtxos: [
-                { txHash, outputIndex: 1, description: '(601) ballot instance token' },
-                { txHash, outputIndex: 2, description: 'Gas UTxO' },
+                { txHash, outputIndex: 1, description: '(601) ballot instance token + gas' },
             ],
         });
     } catch (err: any) {

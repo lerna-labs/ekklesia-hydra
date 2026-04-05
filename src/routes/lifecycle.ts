@@ -1,6 +1,5 @@
 import { Router } from 'express';
-import { BlockfrostProvider, MeshTxBuilder } from '@meshsdk/core';
-import { getAdmin, Wrangler } from '@lerna-labs/hydra-sdk';
+import { Wrangler } from '@lerna-labs/hydra-sdk';
 import { CLOSE_TOKEN, ipfs, voteCache, IPFS_STAGING_DIR, success, error } from '../helpers.js';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
@@ -13,10 +12,18 @@ const router = Router();
  * Populated after head opens if a (601) ballot instance token is found.
  */
 let cachedBallot: BallotDefinition | null = null;
+let cachedBallotPolicy: string | null = null;
+let cachedBallotToken: string | null = null;
 
 /** Get the cached ballot definition (used by other routes). */
 export function getCachedBallot(): BallotDefinition | null {
     return cachedBallot;
+}
+
+/** Get the cached ballot policy ID and instance asset name (set during /start). */
+export function getCachedBallotIdentity(): { ballotPolicy: string; ballotToken: string } | null {
+    if (!cachedBallotPolicy || !cachedBallotToken) return null;
+    return { ballotPolicy: cachedBallotPolicy, ballotToken: cachedBallotToken };
 }
 
 router.get('/health', async (_, res) => {
@@ -41,11 +48,17 @@ router.get('/health', async (_, res) => {
  *   ballotIpfsCid?: string
  *     — IPFS CID of the ballot definition (returned by /prepare). If provided,
  *       the ballot is fetched and cached for use by voting/query endpoints.
+ *   ballotPolicy: string
+ *     — hex policy ID of the ballot tokens (returned by /prepare as policyId)
+ *   ballotToken: string
+ *     — hex instance asset name of the (601) token (returned by /prepare as instanceAssetName)
  */
 router.post('/start', async (req, res) => {
     const wrangler = new Wrangler(process.env.HYDRA_API_URL, process.env.HYDRA_WS_URL);
     const utxos = req.body.utxos as Array<{ txHash: string; outputIndex: number }> | undefined;
     const ballotIpfsCid = req.body.ballotIpfsCid as string | undefined;
+    const ballotPolicy = req.body.ballotPolicy as string | undefined;
+    const ballotToken = req.body.ballotToken as string | undefined;
 
     if (!utxos || !Array.isArray(utxos) || utxos.length === 0) {
         return error(res, 'MISSING_FIELDS', 'Missing or empty utxos array. Provide [{txHash, outputIndex}, ...]', 400);
@@ -61,6 +74,8 @@ router.post('/start', async (req, res) => {
         // Flush stale vote cache from any previous head session.
         // DiskCache doesn't expose clear(), so wipe disk dirs + rehydrate (loads 0 entries).
         cachedBallot = null;
+        cachedBallotPolicy = null;
+        cachedBallotToken = null;
         const votesDir = path.join(IPFS_STAGING_DIR, 'votes');
         const latestDir = path.join(IPFS_STAGING_DIR, 'latest');
         const historyDir = path.join(IPFS_STAGING_DIR, 'history');
@@ -70,28 +85,10 @@ router.post('/start', async (req, res) => {
         await voteCache.rehydrate(); // rebuilds in-memory map from now-empty latest/
         console.log('Vote cache, history, and ballot cache cleared for new head session.');
 
-        // Build a blueprint transaction that spends all the UTxOs to commit.
-        // The Hydra node uses this to determine which UTxOs enter the head.
-        const blockfrostKey = process.env.BLOCKFROST_API_KEY as string;
-        const blockfrost = new BlockfrostProvider(blockfrostKey);
-        const admin_wallet = await getAdmin(blockfrostKey);
-        const admin_address = admin_wallet.addresses.enterpriseAddressBech32 as string;
-
-        const txBuilder = new MeshTxBuilder({ fetcher: blockfrost });
-        for (const u of utxos) {
-            txBuilder.txIn(u.txHash, u.outputIndex);
-        }
-        const blueprintCbor = await txBuilder
-            .changeAddress(admin_address)
-            .complete();
-
-        const blueprintTx = {
-            type: 'Tx ConwayEra' as const,
-            cborHex: blueprintCbor,
-            description: 'Commit Blueprint',
-        };
-
-        await wrangler.waitForHeadOpen({ utxos, blueprintTx }, 600000); // 10 min — init + L1 commit can be slow
+        // Simple commit — single UTxO (ballot token + gas ADA).
+        // The SDK fetches UTxO details from Blockfrost and builds the commit
+        // automatically for single-UTxO commits (no blueprint needed).
+        await wrangler.waitForHeadOpen({ utxos }, 600000); // 10 min — init + L1 commit can be slow
 
         // Cache the ballot definition from IPFS if CID was provided
         if (ballotIpfsCid) {
@@ -101,6 +98,13 @@ router.post('/start', async (req, res) => {
             } catch (fetchErr: any) {
                 console.warn(`Warning: Could not fetch ballot from IPFS (${ballotIpfsCid}):`, fetchErr.message);
             }
+        }
+
+        // Cache ballot identity for voting routes
+        if (ballotPolicy && ballotToken) {
+            cachedBallotPolicy = ballotPolicy;
+            cachedBallotToken = ballotToken;
+            console.log(`Ballot identity cached: policy=${ballotPolicy.slice(0, 16)}… token=${ballotToken.slice(0, 16)}…`);
         }
 
         return success(res, { ballotCached: cachedBallot !== null });
