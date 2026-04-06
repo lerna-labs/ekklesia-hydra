@@ -3,7 +3,7 @@ import { MeshTxBuilder } from '@meshsdk/core';
 import { createNativeScript, submitTx, Wrangler } from '@lerna-labs/hydra-sdk';
 import { blake2b256, bytesToHex, computePackage } from '@lerna-labs/hydra-proof';
 import type { FileLeaf } from '@lerna-labs/hydra-proof';
-import { initialize, voterIdToTokenName, TRP_URL, CLOSE_TOKEN, VERBOSE, IPFS_STAGING_DIR, ipfs, voteCache, success, error, debug, parseTrpSubmitResponse, submitWithRetry } from '../helpers.js';
+import { initialize, voterIdToTokenName, TRP_URL, CLOSE_TOKEN, VERBOSE, IPFS_STAGING_DIR, ipfs, voteCache, success, error, debug, parseTrpSubmitResponse, submitWithRetry, hydraMonitor, getHeadId } from '../helpers.js';
 import { getCachedBallot } from './lifecycle.js';
 import { BALLOT_INSTANCE_PREFIX, BALLOT_DEFINITION_PREFIX, BallotStatus } from '../types.js';
 import type {
@@ -372,7 +372,7 @@ router.post('/finalize', async (req, res) => {
             tallies,
             totalVoters: allVotes.length,
             evidenceIpfsCid: '', // filled after pinning
-            headId: process.env.HYDRA_API_URL ?? '',
+            headId: getHeadId() ?? '',
             finalizedAt: new Date().toISOString(),
         };
 
@@ -579,7 +579,7 @@ router.post('/settle', async (req, res) => {
             scriptHash: TOKEN_POLICY,
         } = createNativeScript(admin_payment_address);
 
-        const wrangler = new Wrangler(process.env.HYDRA_API_URL, process.env.HYDRA_WS_URL);
+        const wrangler = new Wrangler(process.env.HYDRA_API_URL, undefined, hydraMonitor);
 
         // --- Step 0: Snapshot + query authoritative voter list from head UTxOs ---
         // The head's UTxO set is the ground truth. The disk cache can have
@@ -637,7 +637,7 @@ router.post('/settle', async (req, res) => {
             tallies,
             totalVoters: headVoters.length,
             evidenceIpfsCid: '',
-            headId: process.env.HYDRA_API_URL ?? '',
+            headId: getHeadId() ?? '',
             finalizedAt: new Date().toISOString(),
         };
 

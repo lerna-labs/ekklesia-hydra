@@ -1,4 +1,4 @@
-import { getAdmin, createIpfsClient, createDiskCache, submitTx } from '@lerna-labs/hydra-sdk';
+import { getAdmin, createIpfsClient, createDiskCache, submitTx, HydraMonitor } from '@lerna-labs/hydra-sdk';
 import type { IpfsClient, DiskCache } from '@lerna-labs/hydra-sdk';
 import { MeshWallet } from '@meshsdk/core';
 import { TRPClientLogged as Client } from './trp-client.js';
@@ -20,6 +20,21 @@ export const VERBOSE = process.env.VERBOSE === '1' || process.env.VERBOSE === 't
 /** Log only when VERBOSE mode is enabled. Errors always log regardless. */
 export function debug(...args: unknown[]): void {
     if (VERBOSE) console.log(...args);
+}
+
+// ---------------------------------------------------------------------------
+// Hydra Monitor (singleton)
+// ---------------------------------------------------------------------------
+
+export const hydraMonitor = new HydraMonitor({
+    wsUrl: process.env.HYDRA_WS_URL as string,
+    reconnect: { enabled: true, maxAttempts: Infinity },
+    eventBufferSize: 200,
+});
+
+/** Get the on-chain Hydra head ID from the monitor's Greetings. */
+export function getHeadId(): string | null {
+    return hydraMonitor.headInfo?.headId ?? null;
 }
 
 // ---------------------------------------------------------------------------

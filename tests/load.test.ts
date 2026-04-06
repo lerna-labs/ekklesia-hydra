@@ -120,7 +120,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
     });
 
     beforeEach(({ task }) => {
-        if (bail) {
+        if (bail && task.name !== 'should write performance report') {
             console.log(`  SKIPPED: ${task.name}`);
             throw new Error('Skipped — a prior phase failed');
         }

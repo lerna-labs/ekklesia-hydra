@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { Wrangler } from '@lerna-labs/hydra-sdk';
-import { CLOSE_TOKEN, ipfs, voteCache, IPFS_STAGING_DIR, success, error } from '../helpers.js';
+import { CLOSE_TOKEN, ipfs, voteCache, IPFS_STAGING_DIR, success, error, hydraMonitor } from '../helpers.js';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import type { BallotDefinition } from '../types.js';
@@ -27,14 +27,29 @@ export function getCachedBallotIdentity(): { ballotPolicy: string; ballotToken: 
 }
 
 router.get('/health', async (_, res) => {
-    const wrangler = new Wrangler(process.env.HYDRA_API_URL, process.env.HYDRA_WS_URL);
     try {
-        const headStatus = await wrangler.getHeadStatus(5000);
-        return success(res, { headStatus });
+        if (!hydraMonitor.connected) {
+            return error(res, 'HYDRA_UNREACHABLE', 'Monitor not connected to Hydra node', 503);
+        }
+        const info = hydraMonitor.headInfo;
+        return success(res, {
+            headStatus: info?.headStatus ?? 'Unknown',
+            headId: info?.headId ?? null,
+            nodeVersion: info?.nodeVersion ?? null,
+            connected: hydraMonitor.connected,
+        });
     } catch (e: any) {
         console.error('Health check failed:', e);
-        return error(res, 'HYDRA_UNREACHABLE', 'Could not connect to Hydra node', 503);
+        return error(res, 'HYDRA_UNREACHABLE', 'Could not get head status', 503);
     }
+});
+
+router.get('/head-info', async (_, res) => {
+    const info = hydraMonitor.headInfo;
+    if (!info) {
+        return error(res, 'HYDRA_UNREACHABLE', 'No Greetings received yet', 503);
+    }
+    return success(res, info);
 });
 
 /**
@@ -54,7 +69,7 @@ router.get('/health', async (_, res) => {
  *     — hex instance asset name of the (601) token (returned by /prepare as instanceAssetName)
  */
 router.post('/start', async (req, res) => {
-    const wrangler = new Wrangler(process.env.HYDRA_API_URL, process.env.HYDRA_WS_URL);
+    const wrangler = new Wrangler(process.env.HYDRA_API_URL, undefined, hydraMonitor);
     const utxos = req.body.utxos as Array<{ txHash: string; outputIndex: number }> | undefined;
     const ballotIpfsCid = req.body.ballotIpfsCid as string | undefined;
     const ballotPolicy = req.body.ballotPolicy as string | undefined;
@@ -115,7 +130,7 @@ router.post('/start', async (req, res) => {
 });
 
 router.post('/close', async (req, res) => {
-    const wrangler = new Wrangler(process.env.HYDRA_API_URL, process.env.HYDRA_WS_URL);
+    const wrangler = new Wrangler(process.env.HYDRA_API_URL, undefined, hydraMonitor);
     const close_token = req.body.closeToken;
 
     if (!close_token || close_token !== CLOSE_TOKEN) {

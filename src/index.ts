@@ -1,8 +1,20 @@
 import './load.js';
 
+// Raise Node's global HTTP connection limits for concurrent TRP/IPFS requests.
+// Default Undici Agent allows ~10 connections per origin, which causes socket
+// errors when 100+ votes hit TRP simultaneously. This must run before any
+// fetch() calls.
+import { Agent, setGlobalDispatcher } from 'undici';
+setGlobalDispatcher(new Agent({
+    connections: 256,       // max connections per origin
+    pipelining: 1,          // HTTP/1.1 pipelining (1 = disabled, safe default)
+    keepAliveTimeout: 30_000,
+    keepAliveMaxTimeout: 60_000,
+}));
+
 import express from 'express';
 import { authHeaderMiddleware } from './middleware.js';
-import { HYDRA_NETWORK, voteCache } from './helpers.js';
+import { HYDRA_NETWORK, voteCache, hydraMonitor } from './helpers.js';
 
 import auditRoutes from './routes/audit.js';
 import ballotRoutes from './routes/ballot.js';
@@ -39,12 +51,14 @@ process.on('unhandledRejection', (reason) => {
     console.error('UNHANDLED REJECTION (process kept alive):', reason);
 });
 
-process.on('SIGTERM', () => {
-    console.log('🔻 SIGTERM received, shutting down gracefully');
+process.on('SIGTERM', async () => {
+    console.log('SIGTERM received, shutting down gracefully');
+    await hydraMonitor.stop();
     process.exit(0);
 });
-process.on('SIGINT', () => {
-    console.log('🔻 SIGINT received, shutting down gracefully');
+process.on('SIGINT', async () => {
+    console.log('SIGINT received, shutting down gracefully');
+    await hydraMonitor.stop();
     process.exit(0);
 });
 
@@ -53,11 +67,19 @@ const port = 3000;
 async function start() {
     // Rehydrate vote cache from disk before accepting requests
     const cacheCount = await voteCache.rehydrate();
-    console.log(`✅ Vote cache rehydrated: ${cacheCount} entries loaded from disk`);
+    console.log(`Vote cache rehydrated: ${cacheCount} entries loaded from disk`);
+
+    // Start persistent Hydra head monitor (auto-reconnects)
+    try {
+        await hydraMonitor.start();
+        const info = hydraMonitor.headInfo;
+        console.log(`HydraMonitor connected — status: ${info?.headStatus ?? 'unknown'}, headId: ${info?.headId ?? 'n/a'}, node: ${info?.nodeVersion ?? 'n/a'}`);
+    } catch (err: any) {
+        console.warn(`HydraMonitor failed to connect (will auto-reconnect): ${err.message}`);
+    }
 
     app.listen(port, () => {
-        console.log(`✅ Hydra SDK API server is running on http://localhost:${port}`);
-        console.log(`✅ Hydra Network: ${HYDRA_NETWORK}`);
+        console.log(`Hydra middleware running on http://localhost:${port} (network ${HYDRA_NETWORK})`);
     });
 }
 
