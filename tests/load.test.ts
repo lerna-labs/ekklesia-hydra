@@ -10,9 +10,8 @@
  *   E2E_BLOCKFROST_KEY — Blockfrost project ID
  *   E2E_CLOSE_TOKEN    — close token (default: shutitdown)
  *   LOAD_VOTERS        — number of voters to register (default: 10)
- *   LOAD_BAD_VOTES     — number of bad vote attempts per batch (default: 5)
  *
- * Run: LOAD_VOTERS=20 npm run test:e2e -- tests/load.test.ts
+ * Run: LOAD_VOTERS=20 npm run test:load
  */
 
 import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
@@ -22,7 +21,7 @@ import {
     API_KEY,
     CLOSE_TOKEN,
     DUMP_ADDRESS,
-    generateDRepKeys,
+    generateDRepKeysBatch,
     signMerkleRoot,
     computeMerkleRoot,
     api,
@@ -35,7 +34,6 @@ import type { DRepKeys } from './helpers.js';
 // ---------------------------------------------------------------------------
 
 const VOTER_COUNT = parseInt(process.env.LOAD_VOTERS ?? '10', 10);
-const BAD_VOTE_COUNT = parseInt(process.env.LOAD_BAD_VOTES ?? '5', 10);
 
 // ---------------------------------------------------------------------------
 // Load-test-specific types
@@ -81,8 +79,15 @@ let instanceAssetName: string;
 let ballotIpfsCid: string;
 let votingOpenTime: number;
 let bail = false;
+let setupStartTime: number;
+let setupDurationMs: number;
+let keyGenDurationMs: number;
 const voters: DRepKeys[] = [];
 const results: TimedResult[] = [];
+
+// Key generation runs concurrently with setup phases.
+// Started in beforeAll, awaited before voting begins.
+let keyGenPromise: Promise<DRepKeys[]>;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -94,12 +99,15 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
         if (!API_URL) throw new Error('E2E_API_URL is required');
         if (!API_KEY) throw new Error('E2E_API_KEY is required');
 
-        console.log(`  Generating ${VOTER_COUNT} DRep key pairs…`);
+        // Fire off key generation in the background — runs concurrently with
+        // sweep, prepare, L1 confirmation, and head open. Awaited before voting.
         const genStart = performance.now();
-        for (let i = 0; i < VOTER_COUNT; i++) {
-            voters.push(generateDRepKeys());
-        }
-        console.log(`  Keys generated in ${Math.round(performance.now() - genStart)}ms`);
+        console.log(`  Generating ${VOTER_COUNT} DRep key pairs (concurrent, background)…`);
+        keyGenPromise = generateDRepKeysBatch(VOTER_COUNT).then((keys) => {
+            keyGenDurationMs = Math.round(performance.now() - genStart);
+            console.log(`  Keys generated in ${keyGenDurationMs}ms`);
+            return keys;
+        });
     });
 
     beforeEach(({ task }) => {
@@ -127,6 +135,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
     }, 15_000);
 
     it('should sweep stale tokens', async () => {
+        setupStartTime = performance.now();
         if (!DUMP_ADDRESS) { console.log('  Skipped: E2E_DUMP_ADDRESS not set'); return; }
         const { status, json } = await api('POST', '/sweep', { dumpAddress: DUMP_ADDRESS });
         if (status === 200 && json.data?.swept > 0) {
@@ -204,7 +213,8 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
 
         expect(status).toBe(200);
         expect(json.data.ballotCached).toBe(true);
-        console.log('  Head opened');
+        setupDurationMs = Math.round(performance.now() - setupStartTime);
+        console.log(`  Head opened (setup: ${Math.round(setupDurationMs / 1000)}s)`);
     }, 660_000);
 
     // ===== Phase 3: Wait for voting window =====
@@ -221,6 +231,9 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
     // ===== Phase 1: Register all voters via vote-and-register =====
 
     it('should register and vote for all voters', async () => {
+        // Await key generation — may already be done if setup took long enough
+        const keys = await keyGenPromise;
+        voters.push(...keys);
         console.log(`  Registering ${VOTER_COUNT} voters via vote-and-register…`);
 
         for (let i = 0; i < VOTER_COUNT; i++) {
@@ -302,81 +315,436 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
         printStats('cast_vote', updateResults);
     }, VOTER_COUNT * 30_000);
 
-    // ===== Phase 3: Bad votes =====
+    // ===== Phase 3: Adversarial input testing =====
+    //
+    // Fixed test matrix — every case runs exactly once.
+    // Covers: missing/malformed fields, replay attacks, identity spoofing,
+    // invalid selections, bad signatures, type confusion, and injection attempts.
 
-    it('should reject bad votes', async () => {
-        console.log(`  Sending ${BAD_VOTE_COUNT} bad vote attempts…`);
-        const badResults: TimedResult[] = [];
+    it('should reject all adversarial inputs', async () => {
+        const voter = voters[0];
+        const otherVoter = voters[1 % VOTER_COUNT];
 
-        for (let i = 0; i < BAD_VOTE_COUNT; i++) {
-            const voter = voters[i % VOTER_COUNT];
-            let body: any;
-            let expectedError: string;
+        // Valid signature helper — produces a real sig so we can test deeper validation layers
+        const validVotes = [{ questionId: 'q1', selection: [1] }];
+        const validPayload: SignedVotePayload = { ballotId: prepareTxHash, nonce: 3, votes: validVotes };
+        const validMerkleRoot = computeMerkleRoot(validPayload);
+        const validSig = signMerkleRoot(validMerkleRoot, voter.secretKey, voter.drepId);
 
-            switch (i % 5) {
-                case 0: // Wrong nonce (too low)
-                    body = {
-                        voterId: voter.drepId, nonce: 1, ballotId: prepareTxHash,
-                        votes: [{ questionId: 'q1', selection: [1] }],
-                        signature: { coseSign1Hex: 'dead', coseKeyHex: 'beef', key: '', signature: '' },
-                    };
-                    expectedError = 'nonce';
-                    break;
-                case 1: // Missing fields
-                    body = { voterId: voter.drepId };
-                    expectedError = 'missing';
-                    break;
-                case 2: // Unknown voter
-                    body = {
-                        voterId: 'drep1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq4e87a0',
-                        nonce: 1, ballotId: prepareTxHash,
-                        votes: [{ questionId: 'q1', selection: [1] }],
-                        signature: { coseSign1Hex: 'dead', coseKeyHex: 'beef', key: '', signature: '' },
-                    };
-                    expectedError = 'signature';
-                    break;
-                case 3: // Invalid selection
-                    body = {
-                        voterId: voter.drepId, nonce: 3, ballotId: prepareTxHash,
-                        votes: [{ questionId: 'q1', selection: [99] }],
-                        signature: { coseSign1Hex: 'dead', coseKeyHex: 'beef', key: '', signature: '' },
-                    };
-                    expectedError = 'invalid';
-                    break;
-                case 4: // Bad signature
-                    {
-                        const votes = [{ questionId: 'q1', selection: [1] }];
-                        const payload: SignedVotePayload = { ballotId: prepareTxHash, nonce: 3, votes };
-                        computeMerkleRoot(payload);
-                        body = {
-                            voterId: voter.drepId, nonce: 3, ballotId: prepareTxHash, votes,
-                            signature: { coseSign1Hex: 'deadbeef', coseKeyHex: 'cafebabe', key: 'bad', signature: 'bad' },
-                        };
-                        expectedError = 'signature';
-                    }
-                    break;
-            }
+        // Wrong-content signature (signed different data than what's submitted)
+        const wrongPayload: SignedVotePayload = { ballotId: 'wrong', nonce: 99, votes: validVotes };
+        const wrongMerkleRoot = computeMerkleRoot(wrongPayload);
+        const wrongContentSig = signMerkleRoot(wrongMerkleRoot, voter.secretKey, voter.drepId);
 
-            const path = (i % 5 === 2) ? '/vote-and-register' : '/vote';
-            const { status, json, durationMs } = await api('POST', path, body);
+        // Cross-voter signature (voter A signs, submitted as voter B)
+        const crossSig = signMerkleRoot(validMerkleRoot, voter.secretKey, voter.drepId);
 
-            badResults.push({
-                operation: `bad_vote_${i % 5}`,
-                voterIndex: i,
-                utxoCount: 1 + VOTER_COUNT,
-                durationMs,
-                status,
-                success: status >= 400, // Success means it was rejected
-                error: json.message,
-            });
+        const cases: Array<{
+            name: string;
+            endpoint: string;
+            body: any;
+            expectedStatus: number;
+            expectedCode?: string;
+        }> = [
+            // --- Missing / malformed fields ---
+            {
+                name: 'empty body',
+                endpoint: '/vote',
+                body: {},
+                expectedStatus: 400,
+                expectedCode: 'MISSING_FIELDS',
+            },
+            {
+                name: 'null body',
+                endpoint: '/vote',
+                body: null,
+                expectedStatus: 400,
+            },
+            {
+                name: 'only voterId (missing nonce, ballotId, votes, signature)',
+                endpoint: '/vote',
+                body: { voterId: voter.drepId },
+                expectedStatus: 400,
+                expectedCode: 'MISSING_FIELDS',
+            },
+            {
+                name: 'missing signature',
+                endpoint: '/vote',
+                body: { voterId: voter.drepId, nonce: 3, ballotId: prepareTxHash, votes: validVotes },
+                expectedStatus: 400,
+                expectedCode: 'MISSING_FIELDS',
+            },
+            {
+                name: 'missing votes array',
+                endpoint: '/vote',
+                body: { voterId: voter.drepId, nonce: 3, ballotId: prepareTxHash, signature: validSig },
+                expectedStatus: 400,
+                expectedCode: 'MISSING_FIELDS',
+            },
+            {
+                name: 'empty string voterId',
+                endpoint: '/vote',
+                body: { voterId: '', nonce: 3, ballotId: prepareTxHash, votes: validVotes, signature: validSig },
+                expectedStatus: 400,
+                expectedCode: 'MISSING_FIELDS',
+            },
 
+            // --- Invalid voter IDs (bech32 attacks) ---
+            {
+                name: 'invalid bech32 checksum',
+                endpoint: '/vote',
+                body: {
+                    voterId: 'drep1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq4e87a0',
+                    nonce: 1, ballotId: prepareTxHash, votes: validVotes,
+                    signature: { coseSign1Hex: 'dead', coseKeyHex: 'beef', key: '', signature: '' },
+                },
+                expectedStatus: 400,
+                expectedCode: 'INVALID_VOTER_ID',
+            },
+            {
+                name: 'invalid bech32 checksum (vote-and-register)',
+                endpoint: '/vote-and-register',
+                body: {
+                    voterId: 'drep1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq4e87a0',
+                    ballotId: prepareTxHash, votes: validVotes,
+                    signature: { coseSign1Hex: 'dead', coseKeyHex: 'beef', key: '', signature: '' },
+                },
+                expectedStatus: 400,
+                expectedCode: 'INVALID_VOTER_ID',
+            },
+            {
+                name: 'invalid bech32 checksum (register)',
+                endpoint: '/register',
+                body: { voterId: 'drep1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq4e87a0' },
+                expectedStatus: 400,
+                expectedCode: 'INVALID_VOTER_ID',
+            },
+            {
+                name: 'completely garbage voterId',
+                endpoint: '/vote',
+                body: {
+                    voterId: 'not-a-bech32-string-at-all!!!',
+                    nonce: 3, ballotId: prepareTxHash, votes: validVotes,
+                    signature: { coseSign1Hex: 'dead', coseKeyHex: 'beef', key: '', signature: '' },
+                },
+                expectedStatus: 400,
+                expectedCode: 'INVALID_VOTER_ID',
+            },
+            {
+                name: 'wrong bech32 prefix (addr instead of drep)',
+                endpoint: '/vote',
+                body: {
+                    voterId: 'addr_test1qz2fxv2umyhttkxyxp8x0dlpdt3k6cwng5pxj3jhsydzer3jcu5d8ps7zex2k2xt3uqxgjqnnj83ws8lhrn648jjxtwq2ytjqp',
+                    nonce: 3, ballotId: prepareTxHash, votes: validVotes,
+                    signature: { coseSign1Hex: 'dead', coseKeyHex: 'beef', key: '', signature: '' },
+                },
+                expectedStatus: 400,
+                expectedCode: 'INVALID_VOTER_ID',
+            },
+
+            // --- Replay / nonce attacks ---
+            {
+                name: 'stale nonce (nonce=1, current version=2)',
+                endpoint: '/vote',
+                body: {
+                    voterId: voter.drepId, nonce: 1, ballotId: prepareTxHash,
+                    votes: validVotes, signature: validSig,
+                },
+                expectedStatus: 409,
+                expectedCode: 'CONFLICT',
+            },
+            {
+                name: 'same nonce as current (nonce=2, current=2)',
+                endpoint: '/vote',
+                body: {
+                    voterId: voter.drepId, nonce: 2, ballotId: prepareTxHash,
+                    votes: validVotes, signature: validSig,
+                },
+                expectedStatus: 409,
+                expectedCode: 'CONFLICT',
+            },
+            {
+                name: 'nonce zero',
+                endpoint: '/vote',
+                body: {
+                    voterId: voter.drepId, nonce: 0, ballotId: prepareTxHash,
+                    votes: validVotes, signature: validSig,
+                },
+                expectedStatus: 400,
+                // nonce: 0 is falsy → caught by !nonce in MISSING_FIELDS check
+            },
+            {
+                name: 'negative nonce',
+                endpoint: '/vote',
+                body: {
+                    voterId: voter.drepId, nonce: -1, ballotId: prepareTxHash,
+                    votes: validVotes, signature: validSig,
+                },
+                expectedStatus: 409,
+                // -1 <= 2, caught by replay protection
+            },
+
+            // --- Duplicate registration ---
+            {
+                name: 'vote-and-register for already registered voter',
+                endpoint: '/vote-and-register',
+                body: {
+                    voterId: voter.drepId, ballotId: prepareTxHash,
+                    votes: validVotes, signature: validSig,
+                },
+                expectedStatus: 409,
+                expectedCode: 'CONFLICT',
+            },
+
+            // --- Invalid vote selections ---
+            {
+                name: 'option value not in ballot (99)',
+                endpoint: '/vote',
+                body: {
+                    voterId: voter.drepId, nonce: 3, ballotId: prepareTxHash,
+                    votes: [{ questionId: 'q1', selection: [99] }],
+                    signature: validSig,
+                },
+                expectedStatus: 400,
+                expectedCode: 'INVALID_INPUT',
+            },
+            {
+                name: 'unknown questionId',
+                endpoint: '/vote',
+                body: {
+                    voterId: voter.drepId, nonce: 3, ballotId: prepareTxHash,
+                    votes: [{ questionId: 'nonexistent_question', selection: [1] }],
+                    signature: validSig,
+                },
+                expectedStatus: 400,
+                expectedCode: 'INVALID_INPUT',
+            },
+            {
+                name: 'empty votes array',
+                endpoint: '/vote',
+                body: {
+                    voterId: voter.drepId, nonce: 3, ballotId: prepareTxHash,
+                    votes: [],
+                    signature: validSig,
+                },
+                // [] is truthy → passes !votes. validateSelections([]) returns null
+                // (no questions to check). Proceeds to sig verification → SIGNATURE_INVALID
+                // (merkle root of empty votes won't match what was signed)
+                expectedStatus: 401,
+                expectedCode: 'SIGNATURE_INVALID',
+            },
+            {
+                name: 'multiple selections on binary question',
+                endpoint: '/vote',
+                body: {
+                    voterId: voter.drepId, nonce: 3, ballotId: prepareTxHash,
+                    votes: [{ questionId: 'q1', selection: [1, 0] }],
+                    signature: validSig,
+                },
+                expectedStatus: 400,
+                expectedCode: 'INVALID_INPUT',
+            },
+            {
+                name: 'no selection on binary question',
+                endpoint: '/vote',
+                body: {
+                    voterId: voter.drepId, nonce: 3, ballotId: prepareTxHash,
+                    votes: [{ questionId: 'q1', selection: [] }],
+                    signature: validSig,
+                },
+                expectedStatus: 400,
+                expectedCode: 'INVALID_INPUT',
+            },
+            {
+                name: 'missing selection field entirely',
+                endpoint: '/vote',
+                body: {
+                    voterId: voter.drepId, nonce: 3, ballotId: prepareTxHash,
+                    votes: [{ questionId: 'q1' }],
+                    signature: validSig,
+                },
+                expectedStatus: 400,
+                expectedCode: 'INVALID_INPUT',
+            },
+
+            // --- Signature attacks ---
+            {
+                name: 'garbage signature bytes',
+                endpoint: '/vote',
+                body: {
+                    voterId: voter.drepId, nonce: 3, ballotId: prepareTxHash,
+                    votes: validVotes,
+                    signature: { coseSign1Hex: 'deadbeef', coseKeyHex: 'cafebabe', key: 'bad', signature: 'bad' },
+                },
+                expectedStatus: 401,
+                expectedCode: 'SIGNATURE_INVALID',
+            },
+            {
+                name: 'empty signature fields',
+                endpoint: '/vote',
+                body: {
+                    voterId: voter.drepId, nonce: 3, ballotId: prepareTxHash,
+                    votes: validVotes,
+                    signature: { coseSign1Hex: '', coseKeyHex: '', key: '', signature: '' },
+                },
+                // Empty strings are falsy → falls through to 'No valid signature data provided'
+                expectedStatus: 401,
+                expectedCode: 'SIGNATURE_INVALID',
+            },
+            {
+                name: 'valid signature but wrong content (signed different payload)',
+                endpoint: '/vote',
+                body: {
+                    voterId: voter.drepId, nonce: 3, ballotId: prepareTxHash,
+                    votes: validVotes,
+                    signature: wrongContentSig,
+                },
+                expectedStatus: 401,
+                expectedCode: 'SIGNATURE_INVALID',
+            },
+            {
+                name: 'cross-voter: voter A signature submitted as voter B',
+                endpoint: '/vote',
+                body: {
+                    voterId: otherVoter.drepId, nonce: 3, ballotId: prepareTxHash,
+                    votes: validVotes,
+                    signature: crossSig, // signed by voter A
+                },
+                expectedStatus: 401,
+                expectedCode: 'SIGNATURE_INVALID',
+            },
+
+            // --- Type confusion / injection ---
+            {
+                name: 'nonce as string instead of number',
+                endpoint: '/vote',
+                body: {
+                    voterId: voter.drepId, nonce: '3', ballotId: prepareTxHash,
+                    votes: validVotes, signature: validSig,
+                },
+                // String '3' is truthy → passes !nonce. JS coerces '3' to 3 for <= check
+                // → passes replay. Proceeds to sig verification → SIGNATURE_INVALID
+                // (merkle root computed from string nonce won't match what was signed)
+                expectedStatus: 401,
+                expectedCode: 'SIGNATURE_INVALID',
+            },
+            {
+                name: 'selection as string instead of number',
+                endpoint: '/vote',
+                body: {
+                    voterId: voter.drepId, nonce: 3, ballotId: prepareTxHash,
+                    votes: [{ questionId: 'q1', selection: ['1'] }],
+                    signature: validSig,
+                },
+                expectedStatus: 400,
+                expectedCode: 'INVALID_INPUT',
+            },
+            {
+                name: 'votes as object instead of array',
+                endpoint: '/vote',
+                body: {
+                    voterId: voter.drepId, nonce: 3, ballotId: prepareTxHash,
+                    votes: { questionId: 'q1', selection: [1] },
+                    signature: validSig,
+                },
+                // {} is truthy → passes !votes. for..of on object throws
+                // "is not iterable" → caught by outer try/catch → 400
+                expectedStatus: 400,
+            },
+            {
+                name: 'extremely long voterId (buffer overflow attempt)',
+                endpoint: '/vote',
+                body: {
+                    voterId: 'drep1' + 'q'.repeat(10000),
+                    nonce: 3, ballotId: prepareTxHash, votes: validVotes,
+                    signature: validSig,
+                },
+                expectedStatus: 400,
+                expectedCode: 'INVALID_VOTER_ID',
+            },
+            {
+                name: 'SQL injection in ballotId',
+                endpoint: '/vote',
+                body: {
+                    voterId: voter.drepId, nonce: 3,
+                    ballotId: "'; DROP TABLE votes; --",
+                    votes: validVotes, signature: validSig,
+                },
+                // Merkle root computed from injected ballotId won't match signed payload
+                expectedStatus: 401,
+                expectedCode: 'SIGNATURE_INVALID',
+            },
+            {
+                name: 'XSS in questionId',
+                endpoint: '/vote',
+                body: {
+                    voterId: voter.drepId, nonce: 3, ballotId: prepareTxHash,
+                    votes: [{ questionId: '<script>alert(1)</script>', selection: [1] }],
+                    signature: validSig,
+                },
+                expectedStatus: 400,
+                expectedCode: 'INVALID_INPUT', // Unknown questionId
+            },
+            {
+                name: 'enormous payload (1000 vote entries)',
+                endpoint: '/vote',
+                body: {
+                    voterId: voter.drepId, nonce: 3, ballotId: prepareTxHash,
+                    votes: Array.from({ length: 1000 }, (_, i) => ({ questionId: `q${i}`, selection: [1] })),
+                    signature: validSig,
+                },
+                expectedStatus: 400,
+                expectedCode: 'INVALID_INPUT', // Unknown questionIds
+            },
+
+            // --- Auth / endpoint abuse ---
+            {
+                name: 'register already-registered voter',
+                endpoint: '/register',
+                body: { voterId: voter.drepId },
+                // Should fail at TRP level (token already minted)
+                expectedStatus: 400,
+            },
+        ];
+
+        console.log(`  Running ${cases.length} adversarial test cases…`);
+        const badResults: Array<{ name: string; status: number; expected: number; code?: string; pass: boolean; durationMs: number }> = [];
+        let passed = 0;
+        let failed = 0;
+
+        for (const tc of cases) {
+            const { status, json, durationMs } = await api('POST', tc.endpoint, tc.body);
             const rejected = status >= 400;
-            console.log(`  [bad ${i}] ${rejected ? 'REJECTED' : 'UNEXPECTED OK'} (${status}, ${durationMs}ms): ${json.message?.slice(0, 80) ?? json.code}`);
+            const statusMatch = tc.expectedStatus ? status === tc.expectedStatus : rejected;
+            const codeMatch = !tc.expectedCode || json.code === tc.expectedCode;
+            const pass = rejected && statusMatch && codeMatch;
+
+            badResults.push({ name: tc.name, status, expected: tc.expectedStatus, code: json.code, pass, durationMs });
+
+            if (pass) {
+                passed++;
+                console.log(`  ✓ ${tc.name} → ${status} ${json.code ?? ''} (${durationMs}ms)`);
+            } else {
+                failed++;
+                console.log(`  ✗ ${tc.name} → ${status} ${json.code ?? ''} (expected ${tc.expectedStatus}${tc.expectedCode ? ' ' + tc.expectedCode : ''}) (${durationMs}ms): ${json.message?.slice(0, 100) ?? ''}`);
+            }
         }
 
+        console.log(`\n  Adversarial results: ${passed}/${cases.length} passed, ${failed} failed`);
+
+        // Every bad request must be rejected (status >= 400)
         const allRejected = badResults.every(r => r.status >= 400);
         expect(allRejected).toBe(true);
-    }, BAD_VOTE_COUNT * 10_000);
+
+        // Log any unexpected acceptances for investigation
+        const unexpected = badResults.filter(r => !r.pass);
+        if (unexpected.length > 0) {
+            console.log('\n  Unexpected results:');
+            for (const r of unexpected) {
+                console.log(`    ${r.name}: got ${r.status} ${r.code}, expected ${r.expected}`);
+            }
+        }
+    }, 120_000);
 
     // ===== Phase 4: Query performance =====
 
@@ -404,7 +772,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
             ballotName: instanceAssetName,
             ballotPolicy: policyId,
             closeToken: CLOSE_TOKEN,
-        }, 540_000);
+        }, 660_000);
 
         expect(status).toBe(200);
         console.log(`  Settle completed in ${durationMs}ms`);
@@ -420,7 +788,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
             status,
             success: status === 200,
         });
-    }, 600_000);
+    }, 720_000);
 
     // ===== Phase 6: Fanout =====
 
@@ -473,7 +841,8 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
 
         log('========== PERFORMANCE SUMMARY ==========');
         log(`Voters: ${VOTER_COUNT}`);
-        log(`Bad vote attempts: ${BAD_VOTE_COUNT}`);
+        log(`Key generation: ${Math.round(keyGenDurationMs / 1000)}s (concurrent with setup)`);
+        log(`Setup (sweep → prepare → L1 confirm → head open): ${Math.round(setupDurationMs / 1000)}s`);
         log(`Timestamp: ${new Date().toISOString()}`);
         log('');
 
@@ -491,6 +860,31 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
         const settleResult = results.find(r => r.operation === 'settle');
         if (settleResult) {
             log(`Settle (burn ${VOTER_COUNT} + finalize + close): ${settleResult.durationMs}ms`);
+        }
+
+        // --- Evidence package sizes ---
+        log('');
+        log('Evidence package sizes:');
+        try {
+            // Fetch audit bundle to measure total evidence payload
+            const { json: auditJson, durationMs: auditMs } = await api('GET', '/audit');
+            const auditSize = JSON.stringify(auditJson).length;
+            log(`  Audit bundle: ${(auditSize / 1024).toFixed(1)} KB (${auditMs}ms)`);
+
+            // Fetch single voter evidence to measure per-voter size
+            if (voters.length > 0) {
+                const { json: voterJson } = await api('GET', `/audit/vote/${voters[0].drepId}`);
+                const voterSize = JSON.stringify(voterJson).length;
+                log(`  Single voter evidence: ${(voterSize / 1024).toFixed(1)} KB`);
+                log(`  Estimated total evidence: ${(voterSize * VOTER_COUNT / 1024).toFixed(1)} KB (${VOTER_COUNT} voters)`);
+            }
+
+            // Fetch votes list to measure cache payload
+            const { json: votesJson } = await api('GET', '/votes');
+            const votesSize = JSON.stringify(votesJson).length;
+            log(`  Votes index: ${(votesSize / 1024).toFixed(1)} KB`);
+        } catch (e: any) {
+            log(`  (Evidence sizes unavailable — head may be closed: ${e.message?.slice(0, 60)})`);
         }
 
         const registrations = results.filter(r => r.operation === 'vote-and-register' && r.success);
@@ -520,7 +914,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
         // --- Write raw results as JSON ---
         const jsonPath = path.join(reportDir, `load-${VOTER_COUNT}v-${timestamp}.json`);
         await fs.writeFile(jsonPath, JSON.stringify({
-            config: { voters: VOTER_COUNT, badVotes: BAD_VOTE_COUNT, timestamp: new Date().toISOString() },
+            config: { voters: VOTER_COUNT, timestamp: new Date().toISOString() },
             summary: lines,
             results,
         }, null, 2));

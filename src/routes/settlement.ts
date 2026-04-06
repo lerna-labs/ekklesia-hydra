@@ -3,7 +3,7 @@ import { MeshTxBuilder } from '@meshsdk/core';
 import { createNativeScript, submitTx, Wrangler } from '@lerna-labs/hydra-sdk';
 import { blake2b256, bytesToHex, computePackage } from '@lerna-labs/hydra-proof';
 import type { FileLeaf } from '@lerna-labs/hydra-proof';
-import { initialize, voterIdToTokenName, TRP_URL, CLOSE_TOKEN, VERBOSE, ipfs, voteCache, success, error, debug, parseTrpSubmitResponse } from '../helpers.js';
+import { initialize, voterIdToTokenName, TRP_URL, CLOSE_TOKEN, VERBOSE, IPFS_STAGING_DIR, ipfs, voteCache, success, error, debug, parseTrpSubmitResponse } from '../helpers.js';
 import { getCachedBallot } from './lifecycle.js';
 import { BALLOT_INSTANCE_PREFIX, BALLOT_DEFINITION_PREFIX, BallotStatus } from '../types.js';
 import type {
@@ -376,12 +376,28 @@ router.post('/finalize', async (req, res) => {
             finalizedAt: new Date().toISOString(),
         };
 
-        // --- 5. Write per-voter proof files to disk ---
+        // --- 5. Write per-voter proof files + history to disk ---
         const fs = await import('node:fs/promises');
         const pathMod = await import('node:path');
         const evidenceDir = voteCache.getDocumentsDir();
         const proofsDir = pathMod.join(evidenceDir, 'proofs');
+        const historyDestDir = pathMod.join(evidenceDir, 'history');
         await fs.mkdir(proofsDir, { recursive: true });
+        await fs.mkdir(historyDestDir, { recursive: true });
+
+        // Copy vote history chains into evidence directory
+        const historySrcDir = pathMod.join(IPFS_STAGING_DIR, 'history');
+        try {
+            const historyFiles = await fs.readdir(historySrcDir);
+            for (const file of historyFiles) {
+                await fs.copyFile(
+                    pathMod.join(historySrcDir, file),
+                    pathMod.join(historyDestDir, file),
+                );
+            }
+        } catch {
+            // History dir may not exist if no votes were updated
+        }
 
         for (const file of proofPackage.files) {
             const voterProof = {
@@ -627,7 +643,26 @@ router.post('/settle', async (req, res) => {
         const pathMod = await import('node:path');
         const evidenceDir = voteCache.getDocumentsDir();
         const proofsDir = pathMod.join(evidenceDir, 'proofs');
+        const historyDestDir = pathMod.join(evidenceDir, 'history');
         await fs.mkdir(proofsDir, { recursive: true });
+        await fs.mkdir(historyDestDir, { recursive: true });
+
+        // Copy vote history chains into evidence directory so auditors
+        // can verify the full vote update trail (nonce progression,
+        // prevTxHash linkage) alongside the evidence files.
+        const historySrcDir = pathMod.join(IPFS_STAGING_DIR, 'history');
+        try {
+            const historyFiles = await fs.readdir(historySrcDir);
+            for (const file of historyFiles) {
+                await fs.copyFile(
+                    pathMod.join(historySrcDir, file),
+                    pathMod.join(historyDestDir, file),
+                );
+            }
+            debug(`[settle] Copied ${historyFiles.length} history files into evidence directory`);
+        } catch {
+            // History dir may not exist if no votes were updated
+        }
 
         for (const file of proofPackage.files) {
             const voterProof = {
@@ -677,7 +712,8 @@ router.post('/settle', async (req, res) => {
         await logHeadSnapshot('post-finalize', wrangler);
 
         // --- Step 4: Close head — fanout includes ballot token with finalized datum ---
-        await wrangler.waitForHeadClose(180000);
+        // 600s timeout: L1 close observation can be slow after many in-head snapshots
+        await wrangler.waitForHeadClose(600000);
 
         steps.push({ step: 'close', status: 'SUCCESS' });
 

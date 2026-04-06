@@ -6,9 +6,12 @@
  * import from here without Adam's explicit permission.
  */
 
-import { execSync } from 'node:child_process';
+import { execSync, exec } from 'node:child_process';
+import { promisify } from 'node:util';
 import { blake2b256, bytesToHex } from '@lerna-labs/hydra-proof';
 import type { SignedVotePayload } from '../src/types.js';
+
+const execAsync = promisify(exec);
 
 // ---------------------------------------------------------------------------
 // Config — read from environment, shared across all test files
@@ -52,6 +55,29 @@ export function generateDRepKeys(): DRepKeys {
     const raw = execSync('cardano-signer keygen --path drep --json-extended', { encoding: 'utf-8' });
     const json = JSON.parse(raw);
     return { secretKey: json.secretKey, publicKey: json.publicKey, drepId: json.drepIdBech };
+}
+
+/**
+ * Generate multiple DRep key pairs concurrently.
+ * Spawns up to `concurrency` processes at a time to avoid overwhelming the OS.
+ * Much faster than sequential execSync for large voter counts.
+ */
+export async function generateDRepKeysBatch(count: number, concurrency = 50): Promise<DRepKeys[]> {
+    const results: DRepKeys[] = [];
+    for (let i = 0; i < count; i += concurrency) {
+        const batchSize = Math.min(concurrency, count - i);
+        const batch = await Promise.all(
+            Array.from({ length: batchSize }, () =>
+                execAsync('cardano-signer keygen --path drep --json-extended')
+                    .then(({ stdout }) => {
+                        const json = JSON.parse(stdout);
+                        return { secretKey: json.secretKey, publicKey: json.publicKey, drepId: json.drepIdBech } as DRepKeys;
+                    })
+            ),
+        );
+        results.push(...batch);
+    }
+    return results;
 }
 
 /** Sign a merkle root with CIP-8 using cardano-signer. */
