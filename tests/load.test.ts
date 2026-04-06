@@ -315,6 +315,92 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
         printStats('cast_vote', updateResults);
     }, VOTER_COUNT * 30_000);
 
+    // ===== Phase 2b: Concurrent vote burst =====
+    //
+    // Fire a percentage of voters simultaneously to test Express + TRP
+    // under concurrent load. Some will succeed, some will fail due to
+    // UTxO contention — we measure both to understand the failure mode.
+
+    it('should handle concurrent vote updates', async () => {
+        const concurrentCount = Math.max(5, Math.floor(VOTER_COUNT * 0.1)); // 10% of voters
+        console.log(`  Firing ${concurrentCount} concurrent vote updates (nonce=3)…`);
+
+        const concurrentVoters = voters.slice(0, concurrentCount);
+        const startTime = performance.now();
+
+        const promises = concurrentVoters.map(async (voter, i) => {
+            const votes = [{ questionId: 'q1', selection: [2] }]; // Abstain
+            const payload: SignedVotePayload = { ballotId: prepareTxHash, nonce: 3, votes };
+            const merkleRoot = computeMerkleRoot(payload);
+            const signature = signMerkleRoot(merkleRoot, voter.secretKey, voter.drepId);
+
+            const { status, json, durationMs } = await api('POST', '/vote', {
+                voterId: voter.drepId,
+                nonce: 3,
+                ballotId: prepareTxHash,
+                votes,
+                signature,
+            });
+
+            return { index: i, status, durationMs, message: json.message?.slice(0, 80), code: json.code };
+        });
+
+        const concurrentResults = await Promise.all(promises);
+        const elapsed = Math.round(performance.now() - startTime);
+
+        const succeeded = concurrentResults.filter(r => r.status === 200);
+        const failed = concurrentResults.filter(r => r.status !== 200);
+
+        console.log(`  Concurrent burst completed in ${elapsed}ms`);
+        console.log(`  Succeeded: ${succeeded.length}/${concurrentCount}`);
+        console.log(`  Failed: ${failed.length}/${concurrentCount}`);
+
+        if (failed.length > 0) {
+            // Group failures by status code
+            const byStatus = new Map<number, number>();
+            for (const r of failed) {
+                byStatus.set(r.status, (byStatus.get(r.status) ?? 0) + 1);
+            }
+            for (const [status, count] of byStatus) {
+                const example = failed.find(r => r.status === status);
+                console.log(`    ${status}: ${count} (e.g. ${example?.code ?? ''} — ${example?.message ?? ''})`);
+            }
+        }
+
+        // At least one should succeed (the first to hit TRP)
+        expect(succeeded.length).toBeGreaterThan(0);
+
+        // None should crash the server (no 500s from uncaught exceptions)
+        const serverErrors = concurrentResults.filter(r => r.status >= 500);
+        if (serverErrors.length > 0) {
+            console.log(`  SERVER ERRORS (${serverErrors.length}):`);
+            for (const r of serverErrors) {
+                console.log(`    [${r.index}] ${r.status}: ${r.message}`);
+            }
+        }
+        expect(serverErrors.length).toBe(0);
+
+        // Now sequentially retry the failed ones so all voters are at nonce 3
+        // (needed for later phases to have consistent state)
+        if (failed.length > 0) {
+            console.log(`  Retrying ${failed.length} failed concurrent votes sequentially…`);
+            let retried = 0;
+            for (const r of failed) {
+                const voter = concurrentVoters[r.index];
+                const votes = [{ questionId: 'q1', selection: [2] }];
+                const payload: SignedVotePayload = { ballotId: prepareTxHash, nonce: 3, votes };
+                const merkleRoot = computeMerkleRoot(payload);
+                const signature = signMerkleRoot(merkleRoot, voter.secretKey, voter.drepId);
+
+                const { status } = await api('POST', '/vote', {
+                    voterId: voter.drepId, nonce: 3, ballotId: prepareTxHash, votes, signature,
+                });
+                if (status === 200) retried++;
+            }
+            console.log(`  Retried: ${retried}/${failed.length} succeeded`);
+        }
+    }, VOTER_COUNT * 30_000);
+
     // ===== Phase 3: Adversarial input testing =====
     //
     // Fixed test matrix — every case runs exactly once.
@@ -702,8 +788,9 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
                 name: 'register already-registered voter',
                 endpoint: '/register',
                 body: { voterId: voter.drepId },
-                // Should fail at TRP level (token already minted)
-                expectedStatus: 400,
+                // Caught by cache check before reaching TRP
+                expectedStatus: 409,
+                expectedCode: 'CONFLICT',
             },
         ];
 

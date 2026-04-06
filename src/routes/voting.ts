@@ -473,11 +473,21 @@ const router = Router();
 router.post('/register', async (req, res) => {
     const voterId = req.body.voterId;
 
+    if (!voterId) {
+        return error(res, 'MISSING_FIELDS', 'Missing required field: voterId', 400);
+    }
+
     let tokenName: string;
     try {
         tokenName = voterIdToTokenName(voterId);
     } catch (e: any) {
         return error(res, 'INVALID_VOTER_ID', `Invalid voter ID: ${e.message}`, 400);
+    }
+
+    // Prevent duplicate registration — voter token already exists in head
+    const existingVote = voteCache.get(voterId);
+    if (existingVote) {
+        return error(res, 'CONFLICT', 'Voter already registered. Use POST /vote to cast a vote.', 409);
     }
 
     try {
