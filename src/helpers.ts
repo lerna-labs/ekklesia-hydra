@@ -72,12 +72,23 @@ export function parseTrpSubmitResponse(responseText: string): { hash?: string } 
 }
 
 /**
- * Check if a TRP error is retryable (UTxO contention / stale snapshot).
+ * Check if a TRP error is retryable.
+ *
+ * Retryable conditions:
+ * - UTxO contention (BadInputsUTxO, stale snapshot)
+ * - Rate limiting (HTTP 429 from TRP/Dolos)
+ * - Failed to resolve (TRP behind head state)
+ *
  * Non-retryable errors (validation, script errors) should fail immediately.
  */
-export function isRetryableError(message: string): boolean {
-    const lower = message.toLowerCase();
+export function isRetryableError(err: { message?: string; statusCode?: number }): boolean {
+    // HTTP 429 — TRP rate limit
+    if (err.statusCode === 429) return true;
+
+    const lower = (err.message ?? '').toLowerCase();
     return (
+        lower.includes('429') ||
+        lower.includes('too many requests') ||
         lower.includes('badinputsutxo') ||
         lower.includes('bad inputs') ||
         lower.includes('utxo') && lower.includes('not found') ||
@@ -144,8 +155,8 @@ export async function submitWithRetry(
         } catch (err: any) {
             lastError = err;
 
-            // Don't retry non-contention errors
-            if (!isRetryableError(err.message ?? '')) {
+            // Don't retry non-retryable errors
+            if (!isRetryableError(err)) {
                 throw err;
             }
 

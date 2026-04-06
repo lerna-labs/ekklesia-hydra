@@ -87,7 +87,10 @@ let policyId: string;
 let instanceAssetName: string;
 let ballotIpfsCid: string;
 let votingOpenTime: number;
-let bail = false;
+// Hard bail: head setup or registration failed — nothing else can run.
+// Soft bail: voting/adversarial phase failed — settlement must still run.
+let hardBail = false;
+let softFailures: string[] = [];
 let setupStartTime: number;
 let setupDurationMs: number;
 let keyGenDurationMs: number;
@@ -119,15 +122,40 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
         });
     });
 
+    // Tests that must always run regardless of earlier failures.
+    const alwaysRun = new Set([
+        'should settle: burn → finalize → close',
+        'should fanout to L1',
+        'should be Idle after fanout',
+        'should write performance report',
+    ]);
+
+    // Tests where failure is "soft" — logged but doesn't block settlement.
+    const softPhases = new Set([
+        'should update all votes',
+        'should handle concurrent vote updates',
+        'should handle concurrent vote updates without contention',
+        'should reject all adversarial inputs',
+        'should measure query performance',
+    ]);
+
     beforeEach(({ task }) => {
-        if (bail && task.name !== 'should write performance report') {
+        if (alwaysRun.has(task.name)) return; // never skip these
+        if (hardBail) {
             console.log(`  SKIPPED: ${task.name}`);
-            throw new Error('Skipped — a prior phase failed');
+            throw new Error('Skipped — head setup or registration failed');
         }
     });
 
     afterEach(({ task }) => {
-        if (task.result?.state === 'fail') bail = true;
+        if (task.result?.state === 'fail') {
+            if (softPhases.has(task.name)) {
+                softFailures.push(task.name);
+                console.log(`  SOFT FAILURE: ${task.name} (settlement will still run)`);
+            } else if (!alwaysRun.has(task.name)) {
+                hardBail = true;
+            }
+        }
     });
 
     // ===== Phase 0: Preconditions (matches E2E baseline) =====
@@ -1110,6 +1138,19 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
             }
         }
 
+        if (softFailures.length > 0) {
+            log('');
+            log('Soft failures (did not block settlement):');
+            for (const name of softFailures) {
+                log(`  - ${name}`);
+            }
+        }
+
+        if (hardBail) {
+            log('');
+            log('HARD BAIL: Head setup or registration failed — settlement was skipped');
+        }
+
         log('');
         log('==========================================');
 
@@ -1118,6 +1159,8 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
         await fs.writeFile(jsonPath, JSON.stringify({
             config: { voters: VOTER_COUNT, timestamp: new Date().toISOString() },
             summary: lines,
+            softFailures,
+            hardBail,
             results,
         }, null, 2));
 

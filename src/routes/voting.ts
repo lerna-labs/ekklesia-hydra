@@ -1,5 +1,5 @@
 import {Router} from 'express';
-import {createNativeScript, submitTx, verifySignature} from '@lerna-labs/hydra-sdk';
+import {createNativeScript, verifySignature} from '@lerna-labs/hydra-sdk';
 import {resolveNativeScriptHash} from '@meshsdk/core';
 import {blake2b256, bytesToHex} from '@lerna-labs/hydra-proof';
 import {bech32} from 'bech32';
@@ -10,12 +10,10 @@ import {
     initialize,
     ipfs,
     success,
-    TRP_URL,
     voteCache,
     voterIdHrp,
     voterIdToTokenName,
     debug,
-    parseTrpSubmitResponse,
     submitWithRetry,
 } from '../helpers.js';
 import {getCachedBallot, getCachedBallotIdentity} from './lifecycle.js';
@@ -708,29 +706,26 @@ router.post('/vote', async (req, res) => {
             voterId, tokenName, credentialHrp, nonce, ballotId, votes, signature, responderRole,
         });
 
-        // --- Submit slim params to TRP ---
-        const trp_response = await client.castVoteTx({
-            votingAuthority: admin_payment_address,
-            tokenPolicy: Buffer.from(TOKEN_POLICY as string, 'hex'),
-            userId: Buffer.from(tokenName, 'hex'),
-            version: nonce,
-            merkleRoot: Buffer.from(merkleRoot, 'hex'),
-            voteHash: Buffer.from(voteHash, 'hex'),
-            ipfsCid: Buffer.from(ipfsCid),
-        });
-
-        debug(`[vote] unsigned tx (${trp_response.tx?.length ?? 0} chars):`, trp_response.tx);
-        const signedTx = await admin_wallet.signTx(trp_response.tx);
-        debug(`[vote] signed tx (${signedTx?.length ?? 0} chars):`, signedTx);
-        const submit_response = await submitTx(TRP_URL, signedTx, `0:${tokenName}`);
-        const submit_text = await submit_response.text();
-        debug(`[vote] submitTx response (${submit_response.status}):`, submit_text);
-        const { hash: txHash } = parseTrpSubmitResponse(submit_text);
+        // --- Submit slim params to TRP (with retry for rate limiting) ---
+        const { hash: txHash, attempts } = await submitWithRetry(
+            () => client.castVoteTx({
+                votingAuthority: admin_payment_address,
+                tokenPolicy: Buffer.from(TOKEN_POLICY as string, 'hex'),
+                userId: Buffer.from(tokenName, 'hex'),
+                version: nonce,
+                merkleRoot: Buffer.from(merkleRoot, 'hex'),
+                voteHash: Buffer.from(voteHash, 'hex'),
+                ipfsCid: Buffer.from(ipfsCid),
+            }),
+            (tx) => admin_wallet.signTx(tx),
+            `0:${tokenName}`,
+        );
+        if (attempts > 1) debug(`[vote] Succeeded after ${attempts} attempts`);
 
         // --- Cache + history ---
-        await voteCacheAndHistory(voterId, credentialHrp, tokenName, nonce, voteHash, ipfsCid, txHash ?? '', evidence, existingVote?.txHash);
+        await voteCacheAndHistory(voterId, credentialHrp, tokenName, nonce, voteHash, ipfsCid, txHash, evidence, existingVote?.txHash);
 
-        return success(res, { txHash, voteHash, ipfsCid, version: nonce, tokenName });
+        return success(res, { txHash, voteHash, ipfsCid, version: nonce, tokenName, attempts });
     } catch (err: any) {
         console.error('[vote] FULL ERROR:', err);
         if (err.code && err.statusCode) {
