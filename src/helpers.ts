@@ -1,4 +1,4 @@
-import { getAdmin, createIpfsClient, createDiskCache } from '@lerna-labs/hydra-sdk';
+import { getAdmin, createIpfsClient, createDiskCache, submitTx } from '@lerna-labs/hydra-sdk';
 import type { IpfsClient, DiskCache } from '@lerna-labs/hydra-sdk';
 import { MeshWallet } from '@meshsdk/core';
 import { TRPClientLogged as Client } from './trp-client.js';
@@ -54,6 +54,107 @@ export function parseTrpSubmitResponse(responseText: string): { hash?: string } 
         throw new Error(`TRP submit rejected: ${parsed.error.message} — ${detail}`);
     }
     return { hash: parsed.result?.hash ?? parsed.hash };
+}
+
+/**
+ * Check if a TRP error is retryable (UTxO contention / stale snapshot).
+ * Non-retryable errors (validation, script errors) should fail immediately.
+ */
+export function isRetryableError(message: string): boolean {
+    const lower = message.toLowerCase();
+    return (
+        lower.includes('badinputsutxo') ||
+        lower.includes('bad inputs') ||
+        lower.includes('utxo') && lower.includes('not found') ||
+        lower.includes('failed to resolve')
+    );
+}
+
+export interface RetryOptions {
+    maxAttempts?: number;    // default: 5
+    baseDelayMs?: number;   // default: 150
+    maxDelayMs?: number;    // default: 2000
+    timeoutMs?: number;     // default: 60000 (60s total budget)
+}
+
+/**
+ * Resolve, sign, and submit a transaction with automatic retry on UTxO contention.
+ *
+ * When the Hydra head snapshot updates between resolve and submit (or TRP is
+ * behind the head), the transaction references a stale UTxO. This function
+ * re-resolves against the latest snapshot and retries.
+ *
+ * Only retries on contention errors (BadInputsUTxO, Failed to resolve).
+ * Validation errors, script errors, etc. fail immediately.
+ */
+export async function submitWithRetry(
+    resolveFn: () => Promise<{ tx: string }>,
+    signFn: (tx: string) => Promise<string>,
+    submitId: string,
+    options?: RetryOptions,
+): Promise<{ hash: string; attempts: number }> {
+    const maxAttempts = options?.maxAttempts ?? 5;
+    const baseDelayMs = options?.baseDelayMs ?? 150;
+    const maxDelayMs = options?.maxDelayMs ?? 2000;
+    const timeoutMs = options?.timeoutMs ?? 60_000;
+
+    const startTime = Date.now();
+    let lastError: Error | null = null;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        // Check total time budget
+        if (Date.now() - startTime > timeoutMs) {
+            throw lastError ?? new Error(`submitWithRetry timed out after ${timeoutMs}ms`);
+        }
+
+        try {
+            // 1. Resolve against latest snapshot
+            const { tx } = await resolveFn();
+
+            // 2. Sign locally
+            const signedTx = await signFn(tx);
+
+            // 3. Submit to TRP
+            const submitResponse = await submitTx(TRP_URL, signedTx, submitId);
+            const submitText = await submitResponse.text();
+
+            // 4. Parse — throws on error
+            const { hash } = parseTrpSubmitResponse(submitText);
+
+            if (attempt > 1) {
+                debug(`[submitWithRetry] Succeeded on attempt ${attempt} for ${submitId}`);
+            }
+
+            return { hash: hash ?? '', attempts: attempt };
+        } catch (err: any) {
+            lastError = err;
+
+            // Don't retry non-contention errors
+            if (!isRetryableError(err.message ?? '')) {
+                throw err;
+            }
+
+            // Don't retry if we've exhausted attempts
+            if (attempt >= maxAttempts) {
+                throw err;
+            }
+
+            // Don't retry if we've exceeded the time budget
+            const elapsed = Date.now() - startTime;
+            if (elapsed > timeoutMs) {
+                throw err;
+            }
+
+            // Exponential backoff with jitter
+            const delay = Math.min(baseDelayMs * Math.pow(2, attempt - 1), maxDelayMs);
+            const jitter = Math.floor(Math.random() * delay * 0.3);
+            debug(`[submitWithRetry] Attempt ${attempt} failed for ${submitId} (${err.message?.slice(0, 60)}), retrying in ${delay + jitter}ms`);
+            await new Promise(r => setTimeout(r, delay + jitter));
+        }
+    }
+
+    // Should never reach here, but just in case
+    throw lastError ?? new Error('submitWithRetry exhausted all attempts');
 }
 
 /** Recursively convert BigInt values to strings for JSON serialization. */
@@ -122,8 +223,14 @@ export type InitializePayload = {
     client?: Client;
 };
 
-/** Set up admin wallet and TRP client. Returns empty object on failure. */
+// Singleton cache for admin wallet + TRP client.
+// Avoids re-deriving the wallet key and re-constructing the client on every request.
+let _cachedPayload: InitializePayload | null = null;
+
+/** Set up admin wallet and TRP client. Cached after first successful call. */
 export async function initialize(): Promise<InitializePayload> {
+    if (_cachedPayload) return _cachedPayload;
+
     let admin_wallet: MeshWallet;
     try {
         admin_wallet = await getAdmin();
@@ -136,7 +243,8 @@ export async function initialize(): Promise<InitializePayload> {
         endpoint: TRP_URL as string,
     });
 
-    return { admin_wallet, client };
+    _cachedPayload = { admin_wallet, client };
+    return _cachedPayload;
 }
 
 // ---------------------------------------------------------------------------

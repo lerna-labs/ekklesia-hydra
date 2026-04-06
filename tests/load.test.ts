@@ -46,6 +46,7 @@ interface TimedResult {
     durationMs: number;
     status: number;
     success: boolean;
+    attempts?: number;
     error?: string;
 }
 
@@ -67,6 +68,14 @@ function printStats(label: string, results: TimedResult[]) {
     const min = times[0];
     const max = times[times.length - 1];
     console.log(`  [${label}] ${successful.length} ok, ${failed.length} fail | avg=${avg}ms p50=${p50}ms p95=${p95}ms min=${min}ms max=${max}ms`);
+
+    // Retry stats (if any results have attempts > 1)
+    const withRetries = successful.filter(r => r.attempts && r.attempts > 1);
+    if (withRetries.length > 0) {
+        const totalRetries = withRetries.reduce((s, r) => s + ((r.attempts ?? 1) - 1), 0);
+        const maxAttempts = Math.max(...withRetries.map(r => r.attempts ?? 1));
+        console.log(`  [${label}] Retries: ${withRetries.length}/${successful.length} needed retry, ${totalRetries} total retries, max ${maxAttempts} attempts`);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -258,6 +267,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
                 durationMs,
                 status,
                 success: status === 200,
+                attempts: json.data?.attempts,
                 error: status !== 200 ? json.message : undefined,
             });
 
@@ -323,20 +333,28 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
 
     it('should handle concurrent vote updates', async () => {
         const concurrentCount = Math.max(5, Math.floor(VOTER_COUNT * 0.1)); // 10% of voters
-        console.log(`  Firing ${concurrentCount} concurrent vote updates (nonce=3)…`);
-
         const concurrentVoters = voters.slice(0, concurrentCount);
+
+        // Query each voter's current version so we use the correct next nonce
+        const voterVersions = new Map<string, number>();
+        for (const voter of concurrentVoters) {
+            const { json } = await api('GET', `/voter/${voter.drepId}`);
+            voterVersions.set(voter.drepId, json.data?.version ?? 2);
+        }
+        console.log(`  Firing ${concurrentCount} concurrent vote updates (each at current nonce + 1)…`);
+
         const startTime = performance.now();
 
         const promises = concurrentVoters.map(async (voter, i) => {
+            const nextNonce = (voterVersions.get(voter.drepId) ?? 2) + 1;
             const votes = [{ questionId: 'q1', selection: [2] }]; // Abstain
-            const payload: SignedVotePayload = { ballotId: prepareTxHash, nonce: 3, votes };
+            const payload: SignedVotePayload = { ballotId: prepareTxHash, nonce: nextNonce, votes };
             const merkleRoot = computeMerkleRoot(payload);
             const signature = signMerkleRoot(merkleRoot, voter.secretKey, voter.drepId);
 
             const { status, json, durationMs } = await api('POST', '/vote', {
                 voterId: voter.drepId,
-                nonce: 3,
+                nonce: nextNonce,
                 ballotId: prepareTxHash,
                 votes,
                 signature,
@@ -380,25 +398,105 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
         }
         expect(serverErrors.length).toBe(0);
 
-        // Now sequentially retry the failed ones so all voters are at nonce 3
-        // (needed for later phases to have consistent state)
+        // Sequentially retry the failed ones so all voters advance
         if (failed.length > 0) {
             console.log(`  Retrying ${failed.length} failed concurrent votes sequentially…`);
             let retried = 0;
             for (const r of failed) {
                 const voter = concurrentVoters[r.index];
+                // Re-query current version in case it changed
+                const { json: voterState } = await api('GET', `/voter/${voter.drepId}`);
+                const retryNonce = (voterState.data?.version ?? 2) + 1;
                 const votes = [{ questionId: 'q1', selection: [2] }];
-                const payload: SignedVotePayload = { ballotId: prepareTxHash, nonce: 3, votes };
+                const payload: SignedVotePayload = { ballotId: prepareTxHash, nonce: retryNonce, votes };
                 const merkleRoot = computeMerkleRoot(payload);
                 const signature = signMerkleRoot(merkleRoot, voter.secretKey, voter.drepId);
 
                 const { status } = await api('POST', '/vote', {
-                    voterId: voter.drepId, nonce: 3, ballotId: prepareTxHash, votes, signature,
+                    voterId: voter.drepId, nonce: retryNonce, ballotId: prepareTxHash, votes, signature,
                 });
                 if (status === 200) retried++;
             }
             console.log(`  Retried: ${retried}/${failed.length} succeeded`);
         }
+    }, VOTER_COUNT * 30_000);
+
+    // ===== Phase 2c: Concurrent vote update burst (voter-owned UTxOs) =====
+    //
+    // Each voter's cast_vote spends their OWN UTxO, not the shared ballot token.
+    // Hydra should batch non-contending transactions into the next snapshot.
+    // This tests that theory — 50%+ of voters updating simultaneously.
+
+    it('should handle concurrent vote updates without contention', async () => {
+        const concurrentCount = Math.max(5, Math.floor(VOTER_COUNT * 0.5)); // 50% of voters
+        // Use voters from the second half to avoid overlap with Phase 2b
+        const phase2bCount = Math.max(5, Math.floor(VOTER_COUNT * 0.1));
+        const startIdx = phase2bCount;
+        const concurrentVoters = voters.slice(startIdx, startIdx + concurrentCount);
+
+        // Query each voter's current version for correct nonce
+        const voterVersions = new Map<string, number>();
+        for (const voter of concurrentVoters) {
+            const { json } = await api('GET', `/voter/${voter.drepId}`);
+            voterVersions.set(voter.drepId, json.data?.version ?? 2);
+        }
+        console.log(`  Firing ${concurrentCount} concurrent vote updates (voters ${startIdx}-${startIdx + concurrentCount - 1}, each at current nonce + 1)…`);
+
+        const startTime = performance.now();
+
+        const promises = concurrentVoters.map(async (voter, i) => {
+            const nextNonce = (voterVersions.get(voter.drepId) ?? 2) + 1;
+            const votes = [{ questionId: 'q1', selection: [1] }]; // Back to Yes
+            const payload: SignedVotePayload = { ballotId: prepareTxHash, nonce: nextNonce, votes };
+            const merkleRoot = computeMerkleRoot(payload);
+            const signature = signMerkleRoot(merkleRoot, voter.secretKey, voter.drepId);
+
+            const { status, json, durationMs } = await api('POST', '/vote', {
+                voterId: voter.drepId,
+                nonce: nextNonce,
+                ballotId: prepareTxHash,
+                votes,
+                signature,
+            });
+
+            return { index: i, status, durationMs, message: json.message?.slice(0, 80), code: json.code };
+        });
+
+        const concurrentResults = await Promise.all(promises);
+        const elapsed = Math.round(performance.now() - startTime);
+
+        const succeeded = concurrentResults.filter(r => r.status === 200);
+        const failed = concurrentResults.filter(r => r.status !== 200);
+        const serverErrors = concurrentResults.filter(r => r.status >= 500);
+        const times = succeeded.map(r => r.durationMs).sort((a, b) => a - b);
+
+        console.log(`  Concurrent vote update burst completed in ${elapsed}ms`);
+        console.log(`  Succeeded: ${succeeded.length}/${concurrentCount} (${Math.round(succeeded.length / concurrentCount * 100)}%)`);
+        if (times.length > 0) {
+            const avg = Math.round(times.reduce((s, t) => s + t, 0) / times.length);
+            const p50 = times[Math.floor(times.length * 0.5)];
+            const p95 = times[Math.floor(times.length * 0.95)];
+            console.log(`  Response times: avg=${avg}ms p50=${p50}ms p95=${p95}ms min=${times[0]}ms max=${times[times.length - 1]}ms`);
+        }
+
+        if (failed.length > 0) {
+            console.log(`  Failed: ${failed.length}/${concurrentCount}`);
+            const byStatus = new Map<number, number>();
+            for (const r of failed) byStatus.set(r.status, (byStatus.get(r.status) ?? 0) + 1);
+            for (const [status, count] of byStatus) {
+                const example = failed.find(r => r.status === status);
+                console.log(`    ${status}: ${count} (e.g. ${example?.code ?? ''} — ${example?.message ?? ''})`);
+            }
+        }
+
+        // No server crashes
+        expect(serverErrors.length).toBe(0);
+
+        // With voter-owned UTxOs, we expect high success rate
+        // (relaxed threshold — even 50% would indicate something is wrong)
+        const successRate = succeeded.length / concurrentCount;
+        console.log(`  Success rate: ${Math.round(successRate * 100)}%`);
+        expect(successRate).toBeGreaterThan(0.5);
     }, VOTER_COUNT * 30_000);
 
     // ===== Phase 3: Adversarial input testing =====
@@ -411,9 +509,14 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
         const voter = voters[0];
         const otherVoter = voters[1 % VOTER_COUNT];
 
+        // Query actual current version so nonces are correct after earlier phases
+        const { json: voterState } = await api('GET', `/voter/${voter.drepId}`);
+        const currentVersion = voterState.data?.version ?? 2;
+        const nextNonce = currentVersion + 1; // valid nonce for deeper validation tests
+
         // Valid signature helper — produces a real sig so we can test deeper validation layers
         const validVotes = [{ questionId: 'q1', selection: [1] }];
-        const validPayload: SignedVotePayload = { ballotId: prepareTxHash, nonce: 3, votes: validVotes };
+        const validPayload: SignedVotePayload = { ballotId: prepareTxHash, nonce: nextNonce, votes: validVotes };
         const validMerkleRoot = computeMerkleRoot(validPayload);
         const validSig = signMerkleRoot(validMerkleRoot, voter.secretKey, voter.drepId);
 
@@ -456,21 +559,21 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
             {
                 name: 'missing signature',
                 endpoint: '/vote',
-                body: { voterId: voter.drepId, nonce: 3, ballotId: prepareTxHash, votes: validVotes },
+                body: { voterId: voter.drepId, nonce: nextNonce, ballotId: prepareTxHash, votes: validVotes },
                 expectedStatus: 400,
                 expectedCode: 'MISSING_FIELDS',
             },
             {
                 name: 'missing votes array',
                 endpoint: '/vote',
-                body: { voterId: voter.drepId, nonce: 3, ballotId: prepareTxHash, signature: validSig },
+                body: { voterId: voter.drepId, nonce: nextNonce, ballotId: prepareTxHash, signature: validSig },
                 expectedStatus: 400,
                 expectedCode: 'MISSING_FIELDS',
             },
             {
                 name: 'empty string voterId',
                 endpoint: '/vote',
-                body: { voterId: '', nonce: 3, ballotId: prepareTxHash, votes: validVotes, signature: validSig },
+                body: { voterId: '', nonce: nextNonce, ballotId: prepareTxHash, votes: validVotes, signature: validSig },
                 expectedStatus: 400,
                 expectedCode: 'MISSING_FIELDS',
             },
@@ -510,7 +613,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
                 endpoint: '/vote',
                 body: {
                     voterId: 'not-a-bech32-string-at-all!!!',
-                    nonce: 3, ballotId: prepareTxHash, votes: validVotes,
+                    nonce: nextNonce, ballotId: prepareTxHash, votes: validVotes,
                     signature: { coseSign1Hex: 'dead', coseKeyHex: 'beef', key: '', signature: '' },
                 },
                 expectedStatus: 400,
@@ -521,7 +624,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
                 endpoint: '/vote',
                 body: {
                     voterId: 'addr_test1qz2fxv2umyhttkxyxp8x0dlpdt3k6cwng5pxj3jhsydzer3jcu5d8ps7zex2k2xt3uqxgjqnnj83ws8lhrn648jjxtwq2ytjqp',
-                    nonce: 3, ballotId: prepareTxHash, votes: validVotes,
+                    nonce: nextNonce, ballotId: prepareTxHash, votes: validVotes,
                     signature: { coseSign1Hex: 'dead', coseKeyHex: 'beef', key: '', signature: '' },
                 },
                 expectedStatus: 400,
@@ -530,7 +633,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
 
             // --- Replay / nonce attacks ---
             {
-                name: 'stale nonce (nonce=1, current version=2)',
+                name: `stale nonce (nonce=1, current version=${currentVersion})`,
                 endpoint: '/vote',
                 body: {
                     voterId: voter.drepId, nonce: 1, ballotId: prepareTxHash,
@@ -540,10 +643,10 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
                 expectedCode: 'CONFLICT',
             },
             {
-                name: 'same nonce as current (nonce=2, current=2)',
+                name: `same nonce as current (nonce=${currentVersion}, current=${currentVersion})`,
                 endpoint: '/vote',
                 body: {
-                    voterId: voter.drepId, nonce: 2, ballotId: prepareTxHash,
+                    voterId: voter.drepId, nonce: currentVersion, ballotId: prepareTxHash,
                     votes: validVotes, signature: validSig,
                 },
                 expectedStatus: 409,
@@ -587,7 +690,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
                 name: 'option value not in ballot (99)',
                 endpoint: '/vote',
                 body: {
-                    voterId: voter.drepId, nonce: 3, ballotId: prepareTxHash,
+                    voterId: voter.drepId, nonce: nextNonce, ballotId: prepareTxHash,
                     votes: [{ questionId: 'q1', selection: [99] }],
                     signature: validSig,
                 },
@@ -598,7 +701,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
                 name: 'unknown questionId',
                 endpoint: '/vote',
                 body: {
-                    voterId: voter.drepId, nonce: 3, ballotId: prepareTxHash,
+                    voterId: voter.drepId, nonce: nextNonce, ballotId: prepareTxHash,
                     votes: [{ questionId: 'nonexistent_question', selection: [1] }],
                     signature: validSig,
                 },
@@ -609,7 +712,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
                 name: 'empty votes array',
                 endpoint: '/vote',
                 body: {
-                    voterId: voter.drepId, nonce: 3, ballotId: prepareTxHash,
+                    voterId: voter.drepId, nonce: nextNonce, ballotId: prepareTxHash,
                     votes: [],
                     signature: validSig,
                 },
@@ -623,7 +726,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
                 name: 'multiple selections on binary question',
                 endpoint: '/vote',
                 body: {
-                    voterId: voter.drepId, nonce: 3, ballotId: prepareTxHash,
+                    voterId: voter.drepId, nonce: nextNonce, ballotId: prepareTxHash,
                     votes: [{ questionId: 'q1', selection: [1, 0] }],
                     signature: validSig,
                 },
@@ -634,7 +737,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
                 name: 'no selection on binary question',
                 endpoint: '/vote',
                 body: {
-                    voterId: voter.drepId, nonce: 3, ballotId: prepareTxHash,
+                    voterId: voter.drepId, nonce: nextNonce, ballotId: prepareTxHash,
                     votes: [{ questionId: 'q1', selection: [] }],
                     signature: validSig,
                 },
@@ -645,7 +748,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
                 name: 'missing selection field entirely',
                 endpoint: '/vote',
                 body: {
-                    voterId: voter.drepId, nonce: 3, ballotId: prepareTxHash,
+                    voterId: voter.drepId, nonce: nextNonce, ballotId: prepareTxHash,
                     votes: [{ questionId: 'q1' }],
                     signature: validSig,
                 },
@@ -658,7 +761,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
                 name: 'garbage signature bytes',
                 endpoint: '/vote',
                 body: {
-                    voterId: voter.drepId, nonce: 3, ballotId: prepareTxHash,
+                    voterId: voter.drepId, nonce: nextNonce, ballotId: prepareTxHash,
                     votes: validVotes,
                     signature: { coseSign1Hex: 'deadbeef', coseKeyHex: 'cafebabe', key: 'bad', signature: 'bad' },
                 },
@@ -669,7 +772,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
                 name: 'empty signature fields',
                 endpoint: '/vote',
                 body: {
-                    voterId: voter.drepId, nonce: 3, ballotId: prepareTxHash,
+                    voterId: voter.drepId, nonce: nextNonce, ballotId: prepareTxHash,
                     votes: validVotes,
                     signature: { coseSign1Hex: '', coseKeyHex: '', key: '', signature: '' },
                 },
@@ -681,7 +784,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
                 name: 'valid signature but wrong content (signed different payload)',
                 endpoint: '/vote',
                 body: {
-                    voterId: voter.drepId, nonce: 3, ballotId: prepareTxHash,
+                    voterId: voter.drepId, nonce: nextNonce, ballotId: prepareTxHash,
                     votes: validVotes,
                     signature: wrongContentSig,
                 },
@@ -692,7 +795,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
                 name: 'cross-voter: voter A signature submitted as voter B',
                 endpoint: '/vote',
                 body: {
-                    voterId: otherVoter.drepId, nonce: 3, ballotId: prepareTxHash,
+                    voterId: otherVoter.drepId, nonce: nextNonce, ballotId: prepareTxHash,
                     votes: validVotes,
                     signature: crossSig, // signed by voter A
                 },
@@ -705,7 +808,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
                 name: 'nonce as string instead of number',
                 endpoint: '/vote',
                 body: {
-                    voterId: voter.drepId, nonce: '3', ballotId: prepareTxHash,
+                    voterId: voter.drepId, nonce: String(nextNonce), ballotId: prepareTxHash,
                     votes: validVotes, signature: validSig,
                 },
                 // String '3' is truthy → passes !nonce. JS coerces '3' to 3 for <= check
@@ -718,7 +821,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
                 name: 'selection as string instead of number',
                 endpoint: '/vote',
                 body: {
-                    voterId: voter.drepId, nonce: 3, ballotId: prepareTxHash,
+                    voterId: voter.drepId, nonce: nextNonce, ballotId: prepareTxHash,
                     votes: [{ questionId: 'q1', selection: ['1'] }],
                     signature: validSig,
                 },
@@ -729,7 +832,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
                 name: 'votes as object instead of array',
                 endpoint: '/vote',
                 body: {
-                    voterId: voter.drepId, nonce: 3, ballotId: prepareTxHash,
+                    voterId: voter.drepId, nonce: nextNonce, ballotId: prepareTxHash,
                     votes: { questionId: 'q1', selection: [1] },
                     signature: validSig,
                 },
@@ -742,7 +845,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
                 endpoint: '/vote',
                 body: {
                     voterId: 'drep1' + 'q'.repeat(10000),
-                    nonce: 3, ballotId: prepareTxHash, votes: validVotes,
+                    nonce: nextNonce, ballotId: prepareTxHash, votes: validVotes,
                     signature: validSig,
                 },
                 expectedStatus: 400,
@@ -752,7 +855,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
                 name: 'SQL injection in ballotId',
                 endpoint: '/vote',
                 body: {
-                    voterId: voter.drepId, nonce: 3,
+                    voterId: voter.drepId, nonce: nextNonce,
                     ballotId: "'; DROP TABLE votes; --",
                     votes: validVotes, signature: validSig,
                 },
@@ -764,7 +867,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
                 name: 'XSS in questionId',
                 endpoint: '/vote',
                 body: {
-                    voterId: voter.drepId, nonce: 3, ballotId: prepareTxHash,
+                    voterId: voter.drepId, nonce: nextNonce, ballotId: prepareTxHash,
                     votes: [{ questionId: '<script>alert(1)</script>', selection: [1] }],
                     signature: validSig,
                 },
@@ -775,7 +878,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
                 name: 'enormous payload (1000 vote entries)',
                 endpoint: '/vote',
                 body: {
-                    voterId: voter.drepId, nonce: 3, ballotId: prepareTxHash,
+                    voterId: voter.drepId, nonce: nextNonce, ballotId: prepareTxHash,
                     votes: Array.from({ length: 1000 }, (_, i) => ({ questionId: `q${i}`, selection: [1] })),
                     signature: validSig,
                 },
@@ -947,6 +1050,18 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
         const settleResult = results.find(r => r.operation === 'settle');
         if (settleResult) {
             log(`Settle (burn ${VOTER_COUNT} + finalize + close): ${settleResult.durationMs}ms`);
+        }
+
+        // --- Retry stats ---
+        log('');
+        log('Retry stats (submitWithRetry):');
+        for (const op of ['vote-and-register', 'cast_vote'] as const) {
+            const subset = results.filter(r => r.operation === op && r.success && r.attempts);
+            if (subset.length === 0) continue;
+            const withRetries = subset.filter(r => (r.attempts ?? 1) > 1);
+            const totalRetries = withRetries.reduce((s, r) => s + ((r.attempts ?? 1) - 1), 0);
+            const maxAttempts = subset.length > 0 ? Math.max(...subset.map(r => r.attempts ?? 1)) : 1;
+            log(`  ${op}: ${withRetries.length}/${subset.length} needed retry, ${totalRetries} total retries, max ${maxAttempts} attempts`);
         }
 
         // --- Evidence package sizes ---

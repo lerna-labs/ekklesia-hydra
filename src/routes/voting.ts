@@ -16,6 +16,7 @@ import {
     voterIdToTokenName,
     debug,
     parseTrpSubmitResponse,
+    submitWithRetry,
 } from '../helpers.js';
 import {getCachedBallot, getCachedBallotIdentity} from './lifecycle.js';
 import type {
@@ -512,20 +513,21 @@ router.post('/register', async (req, res) => {
             return error(res, 'CLIENT_INIT_FAILED', 'Ballot identity not cached. Was /start called with ballotPolicy and ballotToken?', 503);
         }
 
-        const trp_response = await client.registerVoterTx({
-            votingAuthority: admin_payment_address,
-            mintingScript: Buffer.from(TOKEN_SCRIPT as string, 'hex'),
-            tokenPolicy: Buffer.from(TOKEN_POLICY as string, 'hex'),
-            userId: Buffer.from(tokenName, 'hex'),
-            ballotPolicy: Buffer.from(ballotIdentity.ballotPolicy, 'hex'),
-            ballotToken: Buffer.from(ballotIdentity.ballotToken, 'hex'),
-        });
+        const { hash: txHash, attempts } = await submitWithRetry(
+            () => client.registerVoterTx({
+                votingAuthority: admin_payment_address,
+                mintingScript: Buffer.from(TOKEN_SCRIPT as string, 'hex'),
+                tokenPolicy: Buffer.from(TOKEN_POLICY as string, 'hex'),
+                userId: Buffer.from(tokenName, 'hex'),
+                ballotPolicy: Buffer.from(ballotIdentity.ballotPolicy, 'hex'),
+                ballotToken: Buffer.from(ballotIdentity.ballotToken, 'hex'),
+            }),
+            (tx) => admin_wallet.signTx(tx),
+            `0:${tokenName}`,
+        );
+        if (attempts > 1) debug(`[register] Succeeded after ${attempts} attempts`);
 
-        const signedTx = await admin_wallet.signTx(trp_response.tx);
-        const submit_response = await submitTx(TRP_URL, signedTx, `0:${tokenName}`);
-        const { hash: txHash } = parseTrpSubmitResponse(await submit_response.text());
-
-        return success(res, { txHash, tokenName });
+        return success(res, { txHash, tokenName, attempts });
     } catch (err: any) {
         return error(res, 'INTERNAL_ERROR', err.message || 'Failed to register voter', 400);
     }
@@ -601,30 +603,27 @@ router.post('/vote-and-register', async (req, res) => {
             return error(res, 'CLIENT_INIT_FAILED', 'Ballot identity not cached. Was /start called with ballotPolicy and ballotToken?', 503);
         }
 
-        const trp_response = await client.voteAndRegisterTx({
-            votingAuthority: admin_payment_address,
-            mintingScript: Buffer.from(TOKEN_SCRIPT as string, 'hex'),
-            tokenPolicy: Buffer.from(TOKEN_POLICY as string, 'hex'),
-            userId: Buffer.from(tokenName, 'hex'),
-            merkleRoot: Buffer.from(merkleRoot, 'hex'),
-            voteHash: Buffer.from(voteHash, 'hex'),
-            ipfsCid: Buffer.from(ipfsCid),
-            ballotPolicy: Buffer.from(ballotIdentity.ballotPolicy, 'hex'),
-            ballotToken: Buffer.from(ballotIdentity.ballotToken, 'hex'),
-        });
-
-        debug(`[vote-and-register] unsigned tx (${trp_response.tx?.length ?? 0} chars):`, trp_response.tx);
-        const signedTx = await admin_wallet.signTx(trp_response.tx);
-        debug(`[vote-and-register] signed tx (${signedTx?.length ?? 0} chars):`, signedTx);
-        const submit_response = await submitTx(TRP_URL, signedTx, `0:${tokenName}`);
-        const submit_text = await submit_response.text();
-        debug(`[vote-and-register] submitTx response (${submit_response.status}):`, submit_text);
-        const { hash: txHash } = parseTrpSubmitResponse(submit_text);
+        const { hash: txHash, attempts } = await submitWithRetry(
+            () => client.voteAndRegisterTx({
+                votingAuthority: admin_payment_address,
+                mintingScript: Buffer.from(TOKEN_SCRIPT as string, 'hex'),
+                tokenPolicy: Buffer.from(TOKEN_POLICY as string, 'hex'),
+                userId: Buffer.from(tokenName, 'hex'),
+                merkleRoot: Buffer.from(merkleRoot, 'hex'),
+                voteHash: Buffer.from(voteHash, 'hex'),
+                ipfsCid: Buffer.from(ipfsCid),
+                ballotPolicy: Buffer.from(ballotIdentity.ballotPolicy, 'hex'),
+                ballotToken: Buffer.from(ballotIdentity.ballotToken, 'hex'),
+            }),
+            (tx) => admin_wallet.signTx(tx),
+            `0:${tokenName}`,
+        );
+        if (attempts > 1) debug(`[vote-and-register] Succeeded after ${attempts} attempts`);
 
         // --- Cache + history ---
-        await voteCacheAndHistory(voterId, credentialHrp, tokenName, nonce, voteHash, ipfsCid, txHash ?? '', evidence);
+        await voteCacheAndHistory(voterId, credentialHrp, tokenName, nonce, voteHash, ipfsCid, txHash, evidence);
 
-        return success(res, { txHash, voteHash, ipfsCid, version: nonce, tokenName, registered: true });
+        return success(res, { txHash, voteHash, ipfsCid, version: nonce, tokenName, registered: true, attempts });
     } catch (err: any) {
         console.error('[vote-and-register] FULL ERROR:', err);
         if (err.code && err.statusCode) {
