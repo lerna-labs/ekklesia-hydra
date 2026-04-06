@@ -10,17 +10,22 @@ router.get('/', (_, res) => {
 });
 
 router.post('/ledger', async (req, res) => {
-    const { admin_wallet } = await initialize();
+    try {
+        const { admin_wallet } = await initialize();
 
-    if (!admin_wallet) {
-        return error(res, 'WALLET_INIT_FAILED', 'Could not initialize admin wallet', 503);
+        if (!admin_wallet) {
+            return error(res, 'WALLET_INIT_FAILED', 'Could not initialize admin wallet', 503);
+        }
+
+        const utxo_set = await getUtxoSet();
+        return success(res, {
+            utxos: utxo_set,
+            admin_wallet: admin_wallet.addresses.enterpriseAddressBech32,
+        });
+    } catch (err: any) {
+        console.error('Failed to fetch ledger:', err);
+        return error(res, 'INTERNAL_ERROR', err.message || 'Failed to fetch ledger', 500);
     }
-
-    const utxo_set = await getUtxoSet();
-    return success(res, {
-        utxos: utxo_set,
-        admin_wallet: admin_wallet.addresses.enterpriseAddressBech32,
-    });
 });
 
 /**

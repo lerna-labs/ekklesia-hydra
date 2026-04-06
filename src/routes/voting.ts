@@ -351,11 +351,134 @@ function verifyVoteSignatures(
     return { error: 'No valid signature data provided', witnesses: [] };
 }
 
+// ---------------------------------------------------------------------------
+// Shared vote pipeline: validate → hash → verify sig → IPFS → cache → history
+// ---------------------------------------------------------------------------
+
+interface VotePipelineInput {
+    voterId: string;
+    tokenName: string;
+    credentialHrp: string;
+    nonce: number;
+    ballotId: string;
+    votes: VoteSelection[];
+    signature: VoteSignatureData;
+    responderRole?: string;
+    prevTxHash?: string;
+}
+
+interface VotePipelineResult {
+    merkleRoot: string;
+    voteHash: string;
+    ipfsCid: string;
+    evidence: VoteEvidence;
+}
+
+/**
+ * Shared pipeline for /vote and /vote-and-register:
+ * validate selections → build payload → compute hashes → verify signature →
+ * build evidence → pin to IPFS.
+ *
+ * Returns the computed hashes and evidence, or throws with a descriptive
+ * error message prefixed with the HTTP status code for the caller to use.
+ */
+async function voteValidateAndPin(input: VotePipelineInput): Promise<VotePipelineResult> {
+    const { voterId, tokenName, credentialHrp, nonce, ballotId, votes, signature, responderRole } = input;
+
+    // Validate votes against ballot
+    const ballot = getCachedBallot();
+    if (ballot) {
+        const selError = validateSelections(votes, ballot);
+        if (selError) {
+            throw Object.assign(new Error(selError), { statusCode: 400, code: 'INVALID_INPUT' as const });
+        }
+    }
+
+    // Build signed payload + compute hashes
+    const signedPayload: SignedVotePayload = { ballotId, nonce, votes };
+    const merkleRoot = bytesToHex(blake2b256(JSON.stringify(signedPayload)));
+
+    // Verify signature(s)
+    const { error: sigError, witnesses } = verifyVoteSignatures(merkleRoot, voterId, signature);
+    if (sigError) {
+        throw Object.assign(new Error(sigError), { statusCode: 401, code: 'SIGNATURE_INVALID' as const });
+    }
+
+    // Build evidence
+    const evidence: VoteEvidence = {
+        specVersion: '0.3.0',
+        surveyTxId: ballotId,
+        responderRole: responderRole ?? 'DRep',
+        answers: votes,
+        ekklesia: {
+            voterId,
+            credentialHrp,
+            nonce,
+            signedPayload,
+            witnesses,
+            nativeScript: signature.nativeScript,
+            merkleProof: { root: '', steps: [] },
+        },
+    };
+
+    const voteHash = bytesToHex(blake2b256(JSON.stringify(evidence)));
+
+    // Pin to IPFS
+    const { cid: ipfsCid } = await ipfs.pinJson(
+        `vote-${tokenName}-v${nonce}.json`,
+        evidence,
+    );
+
+    return { merkleRoot, voteHash, ipfsCid, evidence };
+}
+
+/**
+ * Write vote to disk cache and append history entry.
+ */
+async function voteCacheAndHistory(
+    voterId: string,
+    credentialHrp: string,
+    tokenName: string,
+    nonce: number,
+    voteHash: string,
+    ipfsCid: string,
+    txHash: string,
+    evidence: VoteEvidence,
+    prevTxHash?: string,
+): Promise<void> {
+    const cacheEntry: VoteCacheEntry = {
+        voterId,
+        credentialHrp,
+        voteHash,
+        ipfsCid,
+        txHash,
+        version: nonce,
+        timestamp: Date.now(),
+    };
+
+    await voteCache.put(cacheEntry, `vote-${tokenName}-v${nonce}.json`, evidence);
+
+    await appendVoteHistory(voterId, {
+        version: nonce,
+        voteHash,
+        ipfsCid,
+        txHash: txHash ?? '',
+        prevTxHash,
+        timestamp: Date.now(),
+    });
+}
+
 const router = Router();
 
 router.post('/register', async (req, res) => {
     const voterId = req.body.voterId;
-    const tokenName = voterIdToTokenName(voterId);
+
+    let tokenName: string;
+    try {
+        tokenName = voterIdToTokenName(voterId);
+    } catch (e: any) {
+        return error(res, 'INVALID_VOTER_ID', `Invalid voter ID: ${e.message}`, 400);
+    }
 
     try {
         const { admin_wallet, client } = await initialize();
@@ -427,8 +550,15 @@ router.post('/vote-and-register', async (req, res) => {
     }
 
     const nonce = 1;
-    const tokenName = voterIdToTokenName(voterId);
-    const credentialHrp = voterIdHrp(voterId);
+
+    let tokenName: string;
+    let credentialHrp: string;
+    try {
+        tokenName = voterIdToTokenName(voterId);
+        credentialHrp = voterIdHrp(voterId);
+    } catch (e: any) {
+        return error(res, 'INVALID_VOTER_ID', `Invalid voter ID: ${e.message}`, 400);
+    }
 
     const existingVote = voteCache.get(voterId);
     if (existingVote) {
@@ -450,59 +580,12 @@ router.post('/vote-and-register', async (req, res) => {
             scriptHash: TOKEN_POLICY,
         } = createNativeScript(admin_payment_address);
 
-        // --- 0. Validate votes against ballot ---
-        const ballot = getCachedBallot();
-        if (ballot) {
-            const selError = validateSelections(votes, ballot);
-            if (selError) {
-                return error(res, 'INVALID_INPUT', selError, 400);
-            }
-        }
+        // --- Shared pipeline: validate → hash → verify sig → IPFS ---
+        const { merkleRoot, voteHash, ipfsCid, evidence } = await voteValidateAndPin({
+            voterId, tokenName, credentialHrp, nonce, ballotId, votes, signature, responderRole,
+        });
 
-        // --- 1. Build signed payload (timestamp excluded — nonce provides replay protection) ---
-        const timestamp = new Date().toISOString();
-
-        const signedPayload: SignedVotePayload = {
-            ballotId,
-            nonce,
-            votes,
-        };
-
-        // --- 2. Compute hashes ---
-        const merkleRoot = bytesToHex(blake2b256(JSON.stringify(signedPayload)));
-
-        // --- 2a. Verify signature(s) ---
-        const { error: sigError, witnesses } = verifyVoteSignatures(merkleRoot, voterId, signature);
-        if (sigError) {
-            return error(res, 'SIGNATURE_INVALID', sigError, 401);
-        }
-
-        const evidence: VoteEvidence = {
-            specVersion: '0.3.0',
-            surveyTxId: ballotId,
-            responderRole: responderRole ?? 'DRep',
-            answers: votes,
-            ekklesia: {
-                voterId,
-                credentialHrp,
-                nonce,
-                signedPayload,
-                witnesses,
-                nativeScript: signature.nativeScript,
-                merkleProof: { root: '', steps: [] },
-            },
-        };
-
-        const evidenceJson = JSON.stringify(evidence);
-        const voteHash = bytesToHex(blake2b256(evidenceJson));
-
-        // --- 3. Pin to IPFS ---
-        const { cid: ipfsCid } = await ipfs.pinJson(
-            `vote-${tokenName}-v${nonce}.json`,
-            evidence,
-        );
-
-        // --- 4. Submit combined register+vote via TRP ---
+        // --- Submit combined register+vote via TRP ---
         const ballotIdentity = getCachedBallotIdentity();
         if (!ballotIdentity) {
             return error(res, 'CLIENT_INIT_FAILED', 'Ballot identity not cached. Was /start called with ballotPolicy and ballotToken?', 503);
@@ -528,43 +611,15 @@ router.post('/vote-and-register', async (req, res) => {
         debug(`[vote-and-register] submitTx response (${submit_response.status}):`, submit_text);
         const { hash: txHash } = parseTrpSubmitResponse(submit_text);
 
-        // --- 5. Cache ---
-        const cacheEntry: VoteCacheEntry = {
-            voterId,
-            credentialHrp,
-            voteHash,
-            ipfsCid,
-            txHash: txHash,
-            version: nonce,
-            timestamp: Date.now(),
-        };
+        // --- Cache + history ---
+        await voteCacheAndHistory(voterId, credentialHrp, tokenName, nonce, voteHash, ipfsCid, txHash ?? '', evidence);
 
-        await voteCache.put(
-            cacheEntry,
-            `vote-${tokenName}-v${nonce}.json`,
-            evidence,
-        );
-
-        // --- 5a. Append vote history ---
-        await appendVoteHistory(voterId, {
-            version: nonce,
-            voteHash,
-            ipfsCid,
-            txHash: txHash ?? '',
-            timestamp: Date.now(),
-        });
-
-        // --- 6. Receipt ---
-        return success(res, {
-            txHash: txHash,
-            voteHash,
-            ipfsCid,
-            version: nonce,
-            tokenName,
-            registered: true,
-        });
+        return success(res, { txHash, voteHash, ipfsCid, version: nonce, tokenName, registered: true });
     } catch (err: any) {
         console.error('[vote-and-register] FULL ERROR:', err);
+        if (err.code && err.statusCode) {
+            return error(res, err.code, err.message, err.statusCode);
+        }
         if (err.message?.includes('IPFS') || err.message?.includes('fetch')) {
             return error(res, 'IPFS_UNAVAILABLE', `IPFS pin failed — retryable: ${err.message}`, 503);
         }
@@ -618,8 +673,14 @@ router.post('/vote', async (req, res) => {
         return error(res, 'CONFLICT', `Nonce ${nonce} must exceed current version ${existingVote.version}`, 409);
     }
 
-    const tokenName = voterIdToTokenName(voterId);
-    const credentialHrp = voterIdHrp(voterId);
+    let tokenName: string;
+    let credentialHrp: string;
+    try {
+        tokenName = voterIdToTokenName(voterId);
+        credentialHrp = voterIdHrp(voterId);
+    } catch (e: any) {
+        return error(res, 'INVALID_VOTER_ID', `Invalid voter ID: ${e.message}`, 400);
+    }
 
     try {
         const { admin_wallet, client } = await initialize();
@@ -633,58 +694,12 @@ router.post('/vote', async (req, res) => {
         const admin_payment_address = admin_wallet.addresses.enterpriseAddressBech32 as string;
         const { scriptHash: TOKEN_POLICY } = createNativeScript(admin_payment_address);
 
-        // --- 0. Validate votes against ballot ---
-        const ballot = getCachedBallot();
-        if (ballot) {
-            const selError = validateSelections(votes, ballot);
-            if (selError) {
-                return error(res, 'INVALID_INPUT', selError, 400);
-            }
-        }
+        // --- Shared pipeline: validate → hash → verify sig → IPFS ---
+        const { merkleRoot, voteHash, ipfsCid, evidence } = await voteValidateAndPin({
+            voterId, tokenName, credentialHrp, nonce, ballotId, votes, signature, responderRole,
+        });
 
-        // --- 1. Build signed payload (timestamp excluded — nonce provides replay protection) ---
-        const timestamp = new Date().toISOString();
-
-        const signedPayload: SignedVotePayload = {
-            ballotId,
-            nonce,
-            votes,
-        };
-
-        const merkleRoot = bytesToHex(blake2b256(JSON.stringify(signedPayload)));
-
-        // --- 2. Verify signature(s) ---
-        const { error: sigError, witnesses } = verifyVoteSignatures(merkleRoot, voterId, signature);
-        if (sigError) {
-            return error(res, 'SIGNATURE_INVALID', sigError, 401);
-        }
-
-        const evidence: VoteEvidence = {
-            specVersion: '0.3.0',
-            surveyTxId: ballotId,
-            responderRole: responderRole ?? 'DRep',
-            answers: votes,
-            ekklesia: {
-                voterId,
-                credentialHrp,
-                nonce,
-                signedPayload,
-                witnesses,
-                nativeScript: signature.nativeScript,
-                merkleProof: { root: '', steps: [] },
-            },
-        };
-
-        const evidenceJson = JSON.stringify(evidence);
-        const voteHash = bytesToHex(blake2b256(evidenceJson));
-
-        // --- 3. Pin evidence to IPFS ---
-        const { cid: ipfsCid } = await ipfs.pinJson(
-            `vote-${tokenName}-v${nonce}.json`,
-            evidence,
-        );
-
-        // --- 4. Submit slim params to TRP ---
+        // --- Submit slim params to TRP ---
         const trp_response = await client.castVoteTx({
             votingAuthority: admin_payment_address,
             tokenPolicy: Buffer.from(TOKEN_POLICY as string, 'hex'),
@@ -703,43 +718,15 @@ router.post('/vote', async (req, res) => {
         debug(`[vote] submitTx response (${submit_response.status}):`, submit_text);
         const { hash: txHash } = parseTrpSubmitResponse(submit_text);
 
-        // --- 5. Write to cache ---
-        const cacheEntry: VoteCacheEntry = {
-            voterId,
-            credentialHrp,
-            voteHash,
-            ipfsCid,
-            txHash: txHash,
-            version: nonce,
-            timestamp: Date.now(),
-        };
+        // --- Cache + history ---
+        await voteCacheAndHistory(voterId, credentialHrp, tokenName, nonce, voteHash, ipfsCid, txHash ?? '', evidence, existingVote?.txHash);
 
-        await voteCache.put(
-            cacheEntry,
-            `vote-${tokenName}-v${nonce}.json`,
-            evidence,
-        );
-
-        // --- 5a. Append vote history ---
-        await appendVoteHistory(voterId, {
-            version: nonce,
-            voteHash,
-            ipfsCid,
-            txHash: txHash ?? '',
-            prevTxHash: existingVote?.txHash,
-            timestamp: Date.now(),
-        });
-
-        // --- 6. Return receipt ---
-        return success(res, {
-            txHash: txHash,
-            voteHash,
-            ipfsCid,
-            version: nonce,
-            tokenName,
-        });
+        return success(res, { txHash, voteHash, ipfsCid, version: nonce, tokenName });
     } catch (err: any) {
         console.error('[vote] FULL ERROR:', err);
+        if (err.code && err.statusCode) {
+            return error(res, err.code, err.message, err.statusCode);
+        }
         if (err.message?.includes('IPFS') || err.message?.includes('fetch')) {
             return error(res, 'IPFS_UNAVAILABLE', `IPFS pin failed — retryable: ${err.message}`, 503);
         }

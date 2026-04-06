@@ -231,7 +231,11 @@ router.post('/prepare', async (req, res) => {
                 { unit: 'lovelace', quantity: gasLovelace },
                 { unit: POLICY_ID + instanceAssetName, quantity: '1' },
             ])
-            .txOutInlineDatumValue(instanceDatumPlutus);
+            .txOutInlineDatumValue(instanceDatumPlutus)
+            // Output: ADA-only collateral UTxO for Hydra node L1 transactions
+            .txOut(admin_address, [
+                { unit: 'lovelace', quantity: '5000000' },
+            ]);
 
         // Transaction validity must not exceed the timelocked script's invalidHereafter.
         // The voting window open time MUST be in the future to allow minting.

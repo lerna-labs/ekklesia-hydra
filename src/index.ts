@@ -15,11 +15,6 @@ const app = express();
 app.use(express.json());
 app.use(authHeaderMiddleware);
 
-app.use((err: any, _req: any, res: any, _next: any) => {
-    console.error('Unhandled error:', err);
-    res.status(500).json({ status: 'ERROR', message: 'Internal server error' });
-});
-
 // Mount route modules
 app.use(auditRoutes);
 app.use(ballotRoutes);
@@ -27,6 +22,22 @@ app.use(queryRoutes);
 app.use(lifecycleRoutes);
 app.use(votingRoutes);
 app.use(settlementRoutes);
+
+// Error handler MUST be after routes to catch their errors
+app.use((err: any, _req: any, res: any, _next: any) => {
+    console.error('Unhandled express error:', err);
+    if (!res.headersSent) {
+        res.status(500).json({ status: 'ERROR', code: 'INTERNAL_ERROR', message: 'Internal server error' });
+    }
+});
+
+// Safety net: log uncaught exceptions/rejections without crashing
+process.on('uncaughtException', (err) => {
+    console.error('UNCAUGHT EXCEPTION (process kept alive):', err);
+});
+process.on('unhandledRejection', (reason) => {
+    console.error('UNHANDLED REJECTION (process kept alive):', reason);
+});
 
 process.on('SIGTERM', () => {
     console.log('🔻 SIGTERM received, shutting down gracefully');
