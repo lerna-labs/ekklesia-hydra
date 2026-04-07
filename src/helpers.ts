@@ -123,6 +123,8 @@ export async function submitDirect(
         await ws.waitForGreetings();
     }
 
+    debug(`[submitDirect] WS state: ${ws.connectionState}, monitor connected: ${hydraMonitor.connected}`);
+
     return new Promise((resolve, reject) => {
         let settled = false;
         const settle = (fn: Function, value: any) => {
@@ -139,13 +141,13 @@ export async function submitDirect(
         );
 
         const onMsg = (msg: any) => {
-            if (msg.tag === 'TxValid' && msg.transaction) {
-                const txId = msg.transaction.txId;
-                if (txId) {
-                    settle(resolve, { hash: txId });
-                }
+            if (msg.tag === 'TxValid') {
+                const txId = msg.transaction?.txId ?? msg.headId ?? '';
+                debug(`[submitDirect] TxValid received, txId: ${txId || '(none)'}`);
+                settle(resolve, { hash: txId });
             } else if (msg.tag === 'TxInvalid') {
                 const reason = msg.validationError?.reason ?? JSON.stringify(msg);
+                debug(`[submitDirect] TxInvalid: ${reason.slice(0, 200)}`);
                 settle(reject, new Error(`TxInvalid: ${reason}`));
             }
         };

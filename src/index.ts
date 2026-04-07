@@ -14,7 +14,7 @@ setGlobalDispatcher(new Agent({
 
 import express from 'express';
 import { authHeaderMiddleware } from './middleware.js';
-import { HYDRA_NETWORK, voteCache, hydraMonitor } from './helpers.js';
+import { HYDRA_NETWORK, VERBOSE, voteCache, hydraMonitor } from './helpers.js';
 
 import auditRoutes from './routes/audit.js';
 import ballotRoutes from './routes/ballot.js';
@@ -69,13 +69,45 @@ async function start() {
     const cacheCount = await voteCache.rehydrate();
     console.log(`Vote cache rehydrated: ${cacheCount} entries loaded from disk`);
 
-    // Start persistent Hydra head monitor (auto-reconnects)
-    try {
-        await hydraMonitor.start();
-        const info = hydraMonitor.headInfo;
-        console.log(`HydraMonitor connected — status: ${info?.headStatus ?? 'unknown'}, headId: ${info?.headId ?? 'n/a'}, node: ${info?.nodeVersion ?? 'n/a'}`);
-    } catch (err: any) {
-        console.warn(`HydraMonitor failed to connect (will auto-reconnect): ${err.message}`);
+    // Log every raw Hydra WebSocket message for diagnostics.
+    // Attached before monitor.start() so we capture Greetings and everything after.
+    if (VERBOSE) {
+        hydraMonitor.ws.on('message', (msg: any) => {
+            const tag = msg.tag ?? 'unknown';
+            const summary: Record<string, any> = { tag };
+            if (msg.headStatus) summary.headStatus = msg.headStatus;
+            if (msg.hydraHeadId) summary.hydraHeadId = msg.hydraHeadId;
+            if (msg.transaction?.txId) summary.txId = msg.transaction.txId;
+            if (msg.transaction?.type) summary.txType = msg.transaction.type;
+            if (msg.validationError) summary.validationError = msg.validationError.reason?.slice(0, 200);
+            if (msg.party) summary.party = msg.party;
+            if (msg.headId) summary.headId = msg.headId;
+            console.log(`[hydra-ws] ${JSON.stringify(summary)}`);
+        });
+    }
+
+    // Wait for Hydra node to be ready before starting Express.
+    // The node takes 30-60s after container start to accept WebSocket connections.
+    const maxWaitMs = 120_000;
+    const retryMs = 5_000;
+    const waitStart = Date.now();
+    let connected = false;
+    console.log('Waiting for Hydra node to accept connections…');
+    while (Date.now() - waitStart < maxWaitMs) {
+        try {
+            await hydraMonitor.start();
+            connected = true;
+            const info = hydraMonitor.headInfo;
+            console.log(`HydraMonitor connected — status: ${info?.headStatus ?? 'unknown'}, headId: ${info?.headId ?? 'n/a'}, node: ${info?.nodeVersion ?? 'n/a'}`);
+            break;
+        } catch {
+            const elapsed = Math.round((Date.now() - waitStart) / 1000);
+            console.log(`  Hydra not ready (${elapsed}s elapsed), retrying in ${retryMs / 1000}s…`);
+            await new Promise(r => setTimeout(r, retryMs));
+        }
+    }
+    if (!connected) {
+        console.warn(`HydraMonitor failed to connect after ${maxWaitMs / 1000}s — starting anyway (will auto-reconnect)`);
     }
 
     app.listen(port, () => {
