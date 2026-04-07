@@ -80,8 +80,16 @@ async function start() {
             if (msg.transactionId) summary.transactionId = msg.transactionId;
             if (msg.transaction?.txId) summary.txId = msg.transaction.txId;
             if (msg.validationError) summary.validationError = msg.validationError.reason?.slice(0, 200);
-            if (msg.snapshot?.utxo) summary.utxoCount = Object.keys(msg.snapshot.utxo).length;
-            if (msg.snapshot?.snapshotNumber !== undefined) summary.snapshotNumber = msg.snapshot.snapshotNumber;
+            if (msg.snapshot) {
+                if (msg.snapshot.utxo) summary.utxoCount = Object.keys(msg.snapshot.utxo).length;
+                if (msg.snapshot.snapshotNumber !== undefined) summary.snapshotNumber = msg.snapshot.snapshotNumber;
+                if (msg.snapshot.confirmedTransactions) summary.confirmedTxs = msg.snapshot.confirmedTransactions;
+                if (msg.snapshot.confirmed) summary.confirmed = msg.snapshot.confirmed;
+                // Log all snapshot keys (except utxo which is huge) to discover the structure
+                const snapshotKeys = Object.keys(msg.snapshot).filter(k => k !== 'utxo');
+                summary.snapshotKeys = snapshotKeys;
+            }
+            if (msg.seq !== undefined) summary.seq = msg.seq;
             if (msg.party) summary.party = msg.party;
             if (msg.headId) summary.headId = msg.headId;
             console.log(`[hydra-ws] ${JSON.stringify(summary)}`);
