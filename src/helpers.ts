@@ -112,6 +112,13 @@ export async function submitDirect(
     signedCborHex: string,
     timeoutMs = 30_000,
 ): Promise<{ hash: string }> {
+    // Ensure monitor is connected — if Wrangler reconnected the WebSocket
+    // during head open, the monitor's event handlers may not be attached.
+    if (!hydraMonitor.connected) {
+        debug('[submitDirect] Monitor not connected, reconnecting…');
+        await hydraMonitor.start();
+    }
+
     return new Promise((resolve, reject) => {
         let settled = false;
         const settle = (fn: Function, value: any) => {
