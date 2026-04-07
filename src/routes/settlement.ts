@@ -642,6 +642,54 @@ router.post('/settle', async (req, res) => {
             }
         }
 
+        // Verify all voter tokens are burned — re-query snapshot and retry any remaining
+        if (burnFailed > 0) {
+            debug(`[settle/burn] ${burnFailed} burns failed, checking head for remaining voter tokens…`);
+            const retryVoters = await getVotersFromHead(wrangler, TOKEN_POLICY as string);
+            if (retryVoters.length > 0) {
+                debug(`[settle/burn] ${retryVoters.length} voter tokens still in head, retrying…`);
+                for (const voter of retryVoters) {
+                    try {
+                        if (TX_MODE === 'direct') {
+                            const unsignedTx = buildCountVoteTx({
+                                adminAddress: admin_payment_address,
+                                tokenPolicy: TOKEN_POLICY as string,
+                                tokenScript: TOKEN_SCRIPT as string,
+                                userId: voter.tokenName,
+                                inputRef: voter.ref,
+                                inputValue: voter.value,
+                            });
+                            const signedTx = await admin_wallet.signTx(unsignedTx);
+                            await submitDirect(signedTx, unsignedTx);
+                        } else {
+                            await submitWithRetry(
+                                () => client.countVoteTx({
+                                    votingAuthority: admin_payment_address,
+                                    mintingScript: Buffer.from(TOKEN_SCRIPT as string, 'hex'),
+                                    tokenPolicy: Buffer.from(TOKEN_POLICY as string, 'hex'),
+                                    userId: Buffer.from(voter.tokenName, 'hex'),
+                                }),
+                                (tx) => admin_wallet.signTx(tx),
+                                `0:${voter.tokenName}`,
+                            );
+                        }
+                        burned++;
+                        burnFailed--;
+                        debug(`[settle/burn] Retry burn succeeded for ${voter.tokenName}`);
+                    } catch (retryErr: any) {
+                        console.error(`[settle/burn] Retry burn FAILED for ${voter.tokenName}:`, retryErr.message);
+                    }
+                }
+            }
+        }
+
+        // Final check: head must have only the ballot token before proceeding
+        const postBurnVoters = await getVotersFromHead(wrangler, TOKEN_POLICY as string);
+        if (postBurnVoters.length > 0) {
+            const remaining = postBurnVoters.map(v => v.tokenName.slice(0, 16)).join(', ');
+            return error(res, 'INTERNAL_ERROR', `Cannot finalize: ${postBurnVoters.length} voter token(s) still in head (${remaining}…). All tokens must be burned before close.`, 500);
+        }
+
         const burnRetries = burnTotalAttempts - burned;
         steps.push({
             step: 'burn',
