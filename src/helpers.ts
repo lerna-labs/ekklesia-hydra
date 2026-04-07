@@ -16,6 +16,7 @@ export const CLOSE_TOKEN = process.env.CLOSE_TOKEN || 'shutitdown';
 export const IPFS_API_URL = process.env.IPFS_API_URL || 'http://localhost:5001';
 export const IPFS_STAGING_DIR = process.env.IPFS_STAGING_DIR || '/ipfs-staging';
 export const VERBOSE = process.env.VERBOSE === '1' || process.env.VERBOSE === 'true';
+export const TX_MODE = (process.env.TX_MODE || 'trp') as 'trp' | 'direct';
 
 /** Log only when VERBOSE mode is enabled. Errors always log regardless. */
 export function debug(...args: unknown[]): void {
@@ -35,6 +36,120 @@ export const hydraMonitor = new HydraMonitor({
 /** Get the on-chain Hydra head ID from the monitor's Greetings. */
 export function getHeadId(): string | null {
     return hydraMonitor.headInfo?.headId ?? null;
+}
+
+// ---------------------------------------------------------------------------
+// UTxO Reference Cache (for direct tx pipeline)
+// ---------------------------------------------------------------------------
+
+import type { UtxoRef, Amount } from './tx-builder.js';
+import { hydraValueToAmounts } from './tx-builder.js';
+
+export interface CachedUtxo {
+    ref: UtxoRef;
+    value: Amount[];
+    datum?: any;
+    address: string;
+}
+
+/** Ballot token UTxO — shared gas input for register/finalize. */
+let _ballotUtxo: CachedUtxo | null = null;
+
+/** Per-voter token UTxOs — keyed by userId (hex asset name). */
+const _voterUtxos = new Map<string, CachedUtxo>();
+
+export function getBallotUtxo(): CachedUtxo | null { return _ballotUtxo; }
+export function setBallotUtxo(u: CachedUtxo): void { _ballotUtxo = u; }
+export function getVoterUtxo(userId: string): CachedUtxo | undefined { return _voterUtxos.get(userId); }
+export function setVoterUtxo(userId: string, u: CachedUtxo): void { _voterUtxos.set(userId, u); }
+export function deleteVoterUtxo(userId: string): void { _voterUtxos.delete(userId); }
+export function clearUtxoCache(): void { _ballotUtxo = null; _voterUtxos.clear(); }
+
+/**
+ * Seed the ballot UTxO cache from the head snapshot.
+ * Called once after head opens and on reconnect.
+ */
+export async function seedBallotUtxoFromSnapshot(
+    snapshotUtxos: Record<string, any>,
+    ballotInstancePrefix: string,
+): Promise<CachedUtxo | null> {
+    for (const [ref, utxo] of Object.entries(snapshotUtxos)) {
+        const u = utxo as any;
+        for (const [pid, assets] of Object.entries(u.value)) {
+            if (pid === 'lovelace' || typeof assets !== 'object') continue;
+            for (const name of Object.keys(assets as Record<string, number>)) {
+                if (name.startsWith(ballotInstancePrefix)) {
+                    const [txHash, idx] = ref.split('#');
+                    const cached: CachedUtxo = {
+                        ref: { txHash, outputIndex: parseInt(idx) },
+                        value: hydraValueToAmounts(u.value),
+                        datum: u.inlineDatum,
+                        address: u.address,
+                    };
+                    _ballotUtxo = cached;
+                    debug(`[utxo-cache] Ballot UTxO seeded: ${ref}`);
+                    return cached;
+                }
+            }
+        }
+    }
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// Direct WebSocket submission (bypass TRP)
+// ---------------------------------------------------------------------------
+
+/**
+ * Submit a signed transaction directly to the Hydra head via WebSocket.
+ *
+ * Sends `NewTx` on the monitor's existing WebSocket connection and waits
+ * for `TxValid` (success) or `TxInvalid` (failure).
+ *
+ * No HTTP overhead, no TRP rate limiting.
+ */
+export async function submitDirect(
+    signedCborHex: string,
+    timeoutMs = 30_000,
+): Promise<{ hash: string }> {
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        const settle = (fn: Function, value: any) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            hydraMonitor.removeListener('message', onMsg);
+            fn(value);
+        };
+
+        const timer = setTimeout(
+            () => settle(reject, new Error('submitDirect timed out waiting for TxValid/TxInvalid')),
+            timeoutMs,
+        );
+
+        const onMsg = (msg: any) => {
+            if (msg.tag === 'TxValid' && msg.transaction) {
+                const txId = msg.transaction.txId;
+                if (txId) {
+                    settle(resolve, { hash: txId });
+                }
+            } else if (msg.tag === 'TxInvalid') {
+                const reason = msg.validationError?.reason ?? JSON.stringify(msg);
+                settle(reject, new Error(`TxInvalid: ${reason}`));
+            }
+        };
+
+        hydraMonitor.on('message', onMsg);
+
+        hydraMonitor.ws.send({
+            tag: 'NewTx',
+            transaction: {
+                type: 'Witnessed Tx ConwayEra' as const,
+                description: '',
+                cborHex: signedCborHex,
+            },
+        });
+    });
 }
 
 // ---------------------------------------------------------------------------

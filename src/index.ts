@@ -6,7 +6,7 @@ import './load.js';
 // fetch() calls.
 import { Agent, setGlobalDispatcher } from 'undici';
 setGlobalDispatcher(new Agent({
-    connections: 256,       // max connections per origin
+    connections: 1024,      // max connections per origin (must exceed TRP max_connections)
     pipelining: 1,          // HTTP/1.1 pipelining (1 = disabled, safe default)
     keepAliveTimeout: 30_000,
     keepAliveMaxTimeout: 60_000,

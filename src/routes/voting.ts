@@ -15,7 +15,15 @@ import {
     voterIdToTokenName,
     debug,
     submitWithRetry,
+    TX_MODE,
+    getVoterUtxo,
+    setVoterUtxo,
+    getBallotUtxo,
+    setBallotUtxo,
+    submitDirect,
 } from '../helpers.js';
+import type { CachedUtxo } from '../helpers.js';
+import { buildCastVoteTx, buildRegisterVoterTx, buildVoteAndRegisterTx } from '../tx-builder.js';
 import {getCachedBallot, getCachedBallotIdentity} from './lifecycle.js';
 import type {
     BallotDefinition,
@@ -511,19 +519,61 @@ router.post('/register', async (req, res) => {
             return error(res, 'CLIENT_INIT_FAILED', 'Ballot identity not cached. Was /start called with ballotPolicy and ballotToken?', 503);
         }
 
-        const { hash: txHash, attempts } = await submitWithRetry(
-            () => client.registerVoterTx({
-                votingAuthority: admin_payment_address,
-                mintingScript: Buffer.from(TOKEN_SCRIPT as string, 'hex'),
-                tokenPolicy: Buffer.from(TOKEN_POLICY as string, 'hex'),
-                userId: Buffer.from(tokenName, 'hex'),
-                ballotPolicy: Buffer.from(ballotIdentity.ballotPolicy, 'hex'),
-                ballotToken: Buffer.from(ballotIdentity.ballotToken, 'hex'),
-            }),
-            (tx) => admin_wallet.signTx(tx),
-            `0:${tokenName}`,
-        );
-        if (attempts > 1) debug(`[register] Succeeded after ${attempts} attempts`);
+        let txHash: string;
+        let attempts = 1;
+
+        if (TX_MODE === 'direct') {
+            const ballotUtxo = getBallotUtxo();
+            if (!ballotUtxo) {
+                return error(res, 'INTERNAL_ERROR', 'Ballot UTxO not found in cache. Was the head opened with TX_MODE=direct?', 500);
+            }
+
+            const unsignedTx = buildRegisterVoterTx({
+                adminAddress: admin_payment_address,
+                tokenPolicy: TOKEN_POLICY as string,
+                tokenScript: TOKEN_SCRIPT as string,
+                userId: tokenName,
+                inputRef: ballotUtxo.ref,
+                inputValue: ballotUtxo.value,
+                inputDatum: ballotUtxo.datum,
+            });
+
+            const signedTx = await admin_wallet.signTx(unsignedTx);
+            const result = await submitDirect(signedTx);
+            txHash = result.hash;
+
+            // Update caches: output 0 = voter token, output 1 = gas return (ballot)
+            setVoterUtxo(tokenName, {
+                ref: { txHash, outputIndex: 0 },
+                value: [
+                    { unit: 'lovelace', quantity: '0' },
+                    { unit: (TOKEN_POLICY as string) + tokenName, quantity: '1' },
+                ],
+                address: ballotUtxo.address,
+            });
+            setBallotUtxo({
+                ref: { txHash, outputIndex: 1 },
+                value: ballotUtxo.value,
+                datum: ballotUtxo.datum,
+                address: ballotUtxo.address,
+            });
+        } else {
+            const result = await submitWithRetry(
+                () => client!.registerVoterTx({
+                    votingAuthority: admin_payment_address,
+                    mintingScript: Buffer.from(TOKEN_SCRIPT as string, 'hex'),
+                    tokenPolicy: Buffer.from(TOKEN_POLICY as string, 'hex'),
+                    userId: Buffer.from(tokenName, 'hex'),
+                    ballotPolicy: Buffer.from(ballotIdentity.ballotPolicy, 'hex'),
+                    ballotToken: Buffer.from(ballotIdentity.ballotToken, 'hex'),
+                }),
+                (tx) => admin_wallet.signTx(tx),
+                `0:${tokenName}`,
+            );
+            txHash = result.hash;
+            attempts = result.attempts;
+            if (attempts > 1) debug(`[register] Succeeded after ${attempts} attempts`);
+        }
 
         return success(res, { txHash, tokenName, attempts });
     } catch (err: any) {
@@ -601,22 +651,67 @@ router.post('/vote-and-register', async (req, res) => {
             return error(res, 'CLIENT_INIT_FAILED', 'Ballot identity not cached. Was /start called with ballotPolicy and ballotToken?', 503);
         }
 
-        const { hash: txHash, attempts } = await submitWithRetry(
-            () => client.voteAndRegisterTx({
-                votingAuthority: admin_payment_address,
-                mintingScript: Buffer.from(TOKEN_SCRIPT as string, 'hex'),
-                tokenPolicy: Buffer.from(TOKEN_POLICY as string, 'hex'),
-                userId: Buffer.from(tokenName, 'hex'),
-                merkleRoot: Buffer.from(merkleRoot, 'hex'),
-                voteHash: Buffer.from(voteHash, 'hex'),
-                ipfsCid: Buffer.from(ipfsCid),
-                ballotPolicy: Buffer.from(ballotIdentity.ballotPolicy, 'hex'),
-                ballotToken: Buffer.from(ballotIdentity.ballotToken, 'hex'),
-            }),
-            (tx) => admin_wallet.signTx(tx),
-            `0:${tokenName}`,
-        );
-        if (attempts > 1) debug(`[vote-and-register] Succeeded after ${attempts} attempts`);
+        let txHash: string;
+        let attempts = 1;
+
+        if (TX_MODE === 'direct') {
+            const ballotUtxo = getBallotUtxo();
+            if (!ballotUtxo) {
+                return error(res, 'INTERNAL_ERROR', 'Ballot UTxO not found in cache. Was the head opened with TX_MODE=direct?', 500);
+            }
+
+            const unsignedTx = buildVoteAndRegisterTx({
+                adminAddress: admin_payment_address,
+                tokenPolicy: TOKEN_POLICY as string,
+                tokenScript: TOKEN_SCRIPT as string,
+                userId: tokenName,
+                merkleRoot,
+                voteHash,
+                ipfsCid,
+                inputRef: ballotUtxo.ref,
+                inputValue: ballotUtxo.value,
+                inputDatum: ballotUtxo.datum,
+            });
+
+            const signedTx = await admin_wallet.signTx(unsignedTx);
+            const result = await submitDirect(signedTx);
+            txHash = result.hash;
+
+            // Update caches: output 0 = voter token, output 1 = gas return (ballot)
+            setVoterUtxo(tokenName, {
+                ref: { txHash, outputIndex: 0 },
+                value: [
+                    { unit: 'lovelace', quantity: '0' },
+                    { unit: (TOKEN_POLICY as string) + tokenName, quantity: '1' },
+                ],
+                address: ballotUtxo.address,
+            });
+            setBallotUtxo({
+                ref: { txHash, outputIndex: 1 },
+                value: ballotUtxo.value,
+                datum: ballotUtxo.datum,
+                address: ballotUtxo.address,
+            });
+        } else {
+            const result = await submitWithRetry(
+                () => client!.voteAndRegisterTx({
+                    votingAuthority: admin_payment_address,
+                    mintingScript: Buffer.from(TOKEN_SCRIPT as string, 'hex'),
+                    tokenPolicy: Buffer.from(TOKEN_POLICY as string, 'hex'),
+                    userId: Buffer.from(tokenName, 'hex'),
+                    merkleRoot: Buffer.from(merkleRoot, 'hex'),
+                    voteHash: Buffer.from(voteHash, 'hex'),
+                    ipfsCid: Buffer.from(ipfsCid),
+                    ballotPolicy: Buffer.from(ballotIdentity!.ballotPolicy, 'hex'),
+                    ballotToken: Buffer.from(ballotIdentity!.ballotToken, 'hex'),
+                }),
+                (tx) => admin_wallet.signTx(tx),
+                `0:${tokenName}`,
+            );
+            txHash = result.hash;
+            attempts = result.attempts;
+            if (attempts > 1) debug(`[vote-and-register] Succeeded after ${attempts} attempts`);
+        }
 
         // --- Cache + history ---
         await voteCacheAndHistory(voterId, credentialHrp, tokenName, nonce, voteHash, ipfsCid, txHash, evidence);
@@ -706,21 +801,58 @@ router.post('/vote', async (req, res) => {
             voterId, tokenName, credentialHrp, nonce, ballotId, votes, signature, responderRole,
         });
 
-        // --- Submit slim params to TRP (with retry for rate limiting) ---
-        const { hash: txHash, attempts } = await submitWithRetry(
-            () => client.castVoteTx({
-                votingAuthority: admin_payment_address,
-                tokenPolicy: Buffer.from(TOKEN_POLICY as string, 'hex'),
-                userId: Buffer.from(tokenName, 'hex'),
+        // --- Submit to Hydra head ---
+        let txHash: string;
+        let attempts = 1;
+
+        if (TX_MODE === 'direct') {
+            // Direct pipeline: build tx locally, submit via WebSocket
+            const voterUtxo = getVoterUtxo(tokenName);
+            if (!voterUtxo) {
+                return error(res, 'INTERNAL_ERROR', 'Voter UTxO not found in cache. Is TX_MODE=direct supported for this voter?', 500);
+            }
+
+            const unsignedTx = buildCastVoteTx({
+                adminAddress: admin_payment_address,
+                tokenPolicy: TOKEN_POLICY as string,
+                userId: tokenName,
                 version: nonce,
-                merkleRoot: Buffer.from(merkleRoot, 'hex'),
-                voteHash: Buffer.from(voteHash, 'hex'),
-                ipfsCid: Buffer.from(ipfsCid),
-            }),
-            (tx) => admin_wallet.signTx(tx),
-            `0:${tokenName}`,
-        );
-        if (attempts > 1) debug(`[vote] Succeeded after ${attempts} attempts`);
+                merkleRoot,
+                voteHash,
+                ipfsCid,
+                inputRef: voterUtxo.ref,
+                inputValue: voterUtxo.value,
+            });
+
+            const signedTx = await admin_wallet.signTx(unsignedTx);
+            const result = await submitDirect(signedTx);
+            txHash = result.hash;
+
+            // Update UTxO ref cache — cast_vote has a single output at index 0
+            setVoterUtxo(tokenName, {
+                ref: { txHash, outputIndex: 0 },
+                value: voterUtxo.value,
+                address: voterUtxo.address,
+            });
+        } else {
+            // TRP pipeline: resolve via TRP, submit with retry
+            const result = await submitWithRetry(
+                () => client!.castVoteTx({
+                    votingAuthority: admin_payment_address,
+                    tokenPolicy: Buffer.from(TOKEN_POLICY as string, 'hex'),
+                    userId: Buffer.from(tokenName, 'hex'),
+                    version: nonce,
+                    merkleRoot: Buffer.from(merkleRoot, 'hex'),
+                    voteHash: Buffer.from(voteHash, 'hex'),
+                    ipfsCid: Buffer.from(ipfsCid),
+                }),
+                (tx) => admin_wallet.signTx(tx),
+                `0:${tokenName}`,
+            );
+            txHash = result.hash;
+            attempts = result.attempts;
+            if (attempts > 1) debug(`[vote] Succeeded after ${attempts} attempts`);
+        }
 
         // --- Cache + history ---
         await voteCacheAndHistory(voterId, credentialHrp, tokenName, nonce, voteHash, ipfsCid, txHash, evidence, existingVote?.txHash);

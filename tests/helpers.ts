@@ -8,8 +8,21 @@
 
 import { execSync, exec } from 'node:child_process';
 import { promisify } from 'node:util';
+import { Agent, setGlobalDispatcher } from 'undici';
 import { blake2b256, bytesToHex } from '@lerna-labs/hydra-proof';
 import type { SignedVotePayload } from '../src/types.js';
+
+// Raise test client connection limits to match middleware's capacity.
+// Without this, 500 concurrent fetch() calls from the test process
+// exhaust the default ~10 connections per origin and get EPIPE/socket errors.
+setGlobalDispatcher(new Agent({
+    connections: 1024,
+    pipelining: 1,
+    keepAliveTimeout: 30_000,
+    keepAliveMaxTimeout: 60_000,
+    headersTimeout: 660_000,     // settle can take 10+ min with 1000 voters
+    bodyTimeout: 660_000,
+}));
 
 const execAsync = promisify(exec);
 

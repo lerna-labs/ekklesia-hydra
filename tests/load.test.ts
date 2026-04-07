@@ -380,15 +380,18 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
             const merkleRoot = computeMerkleRoot(payload);
             const signature = signMerkleRoot(merkleRoot, voter.secretKey, voter.drepId);
 
-            const { status, json, durationMs } = await api('POST', '/vote', {
-                voterId: voter.drepId,
-                nonce: nextNonce,
-                ballotId: prepareTxHash,
-                votes,
-                signature,
-            });
-
-            return { index: i, status, durationMs, message: json.message?.slice(0, 80), code: json.code };
+            try {
+                const { status, json, durationMs } = await api('POST', '/vote', {
+                    voterId: voter.drepId,
+                    nonce: nextNonce,
+                    ballotId: prepareTxHash,
+                    votes,
+                    signature,
+                });
+                return { index: i, status, durationMs, message: json.message?.slice(0, 80), code: json.code };
+            } catch (err: any) {
+                return { index: i, status: -1, durationMs: 0, message: err.message?.slice(0, 80) ?? 'fetch error', code: 'FETCH_ERROR' };
+            }
         });
 
         const concurrentResults = await Promise.all(promises);
@@ -396,10 +399,11 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
 
         const succeeded = concurrentResults.filter(r => r.status === 200);
         const failed = concurrentResults.filter(r => r.status !== 200);
+        const fetchErrors = concurrentResults.filter(r => r.status === -1);
 
         console.log(`  Concurrent burst completed in ${elapsed}ms`);
         console.log(`  Succeeded: ${succeeded.length}/${concurrentCount}`);
-        console.log(`  Failed: ${failed.length}/${concurrentCount}`);
+        console.log(`  Failed: ${failed.length}/${concurrentCount}${fetchErrors.length ? ` (${fetchErrors.length} fetch errors)` : ''}`);
 
         if (failed.length > 0) {
             // Group failures by status code
@@ -479,15 +483,18 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
             const merkleRoot = computeMerkleRoot(payload);
             const signature = signMerkleRoot(merkleRoot, voter.secretKey, voter.drepId);
 
-            const { status, json, durationMs } = await api('POST', '/vote', {
-                voterId: voter.drepId,
-                nonce: nextNonce,
-                ballotId: prepareTxHash,
-                votes,
-                signature,
-            });
-
-            return { index: i, status, durationMs, message: json.message?.slice(0, 80), code: json.code };
+            try {
+                const { status, json, durationMs } = await api('POST', '/vote', {
+                    voterId: voter.drepId,
+                    nonce: nextNonce,
+                    ballotId: prepareTxHash,
+                    votes,
+                    signature,
+                });
+                return { index: i, status, durationMs, message: json.message?.slice(0, 80), code: json.code };
+            } catch (err: any) {
+                return { index: i, status: -1, durationMs: 0, message: err.message?.slice(0, 80) ?? 'fetch error', code: 'FETCH_ERROR' };
+            }
         });
 
         const concurrentResults = await Promise.all(promises);
@@ -1122,12 +1129,14 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
             log('');
             log('Response time by UTxO count:');
             const brackets = [
-                { label: '  1-5', filter: (r: TimedResult) => r.utxoCount <= 5 },
-                { label: '  6-10', filter: (r: TimedResult) => r.utxoCount > 5 && r.utxoCount <= 10 },
-                { label: '  11-20', filter: (r: TimedResult) => r.utxoCount > 10 && r.utxoCount <= 20 },
-                { label: '  21-50', filter: (r: TimedResult) => r.utxoCount > 20 && r.utxoCount <= 50 },
+                { label: '  1-10', filter: (r: TimedResult) => r.utxoCount <= 10 },
+                { label: '  11-50', filter: (r: TimedResult) => r.utxoCount > 10 && r.utxoCount <= 50 },
                 { label: '  51-100', filter: (r: TimedResult) => r.utxoCount > 50 && r.utxoCount <= 100 },
-                { label: '  100+', filter: (r: TimedResult) => r.utxoCount > 100 },
+                { label: '  101-250', filter: (r: TimedResult) => r.utxoCount > 100 && r.utxoCount <= 250 },
+                { label: '  251-500', filter: (r: TimedResult) => r.utxoCount > 250 && r.utxoCount <= 500 },
+                { label: '  501-750', filter: (r: TimedResult) => r.utxoCount > 500 && r.utxoCount <= 750 },
+                { label: '  751-1000', filter: (r: TimedResult) => r.utxoCount > 750 && r.utxoCount <= 1000 },
+                { label: '  1001+', filter: (r: TimedResult) => r.utxoCount > 1000 },
             ];
             for (const b of brackets) {
                 const subset = registrations.filter(b.filter);

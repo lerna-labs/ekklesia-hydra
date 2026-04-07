@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { Wrangler } from '@lerna-labs/hydra-sdk';
-import { CLOSE_TOKEN, ipfs, voteCache, IPFS_STAGING_DIR, success, error, hydraMonitor } from '../helpers.js';
+import { CLOSE_TOKEN, ipfs, voteCache, IPFS_STAGING_DIR, success, error, hydraMonitor, TX_MODE, seedBallotUtxoFromSnapshot, clearUtxoCache, debug } from '../helpers.js';
+import { BALLOT_INSTANCE_PREFIX } from '../types.js';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import type { BallotDefinition } from '../types.js';
@@ -98,6 +99,7 @@ router.post('/start', async (req, res) => {
             try { await fs.rm(dir, { recursive: true, force: true }); } catch { /* ignore */ }
         }
         await voteCache.rehydrate(); // rebuilds in-memory map from now-empty latest/
+        clearUtxoCache(); // clear direct-pipeline UTxO ref cache
         console.log('Vote cache, history, and ballot cache cleared for new head session.');
 
         // Simple commit — single UTxO (ballot token + gas ADA).
@@ -122,7 +124,22 @@ router.post('/start', async (req, res) => {
             console.log(`Ballot identity cached: policy=${ballotPolicy.slice(0, 16)}… token=${ballotToken.slice(0, 16)}…`);
         }
 
-        return success(res, { ballotCached: cachedBallot !== null });
+        // Seed direct-pipeline UTxO ref cache from head snapshot
+        if (TX_MODE === 'direct') {
+            try {
+                const snapshot = await wrangler.http.getSnapshotUtxo();
+                const seeded = await seedBallotUtxoFromSnapshot(snapshot, BALLOT_INSTANCE_PREFIX);
+                if (seeded) {
+                    debug(`[start] Ballot UTxO cached for direct pipeline: ${seeded.ref.txHash}#${seeded.ref.outputIndex}`);
+                } else {
+                    console.warn('[start] Could not find ballot UTxO in head snapshot for direct pipeline');
+                }
+            } catch (err: any) {
+                console.warn('[start] Failed to seed UTxO cache:', err.message);
+            }
+        }
+
+        return success(res, { ballotCached: cachedBallot !== null, txMode: TX_MODE });
     } catch (err: any) {
         console.error('Failed to start head:', err);
         return error(res, 'INTERNAL_ERROR', err.message || 'Failed to start head', 500);
