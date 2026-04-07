@@ -232,6 +232,8 @@ export interface FullResults {
     evidenceIpfsCid: string;
     headId: string;
     finalizedAt: string;
+    /** Voters excluded from results — on-chain token existed but evidence could not be verified. */
+    excludedVoters?: Array<{ tokenName: string; reason: string }>;
 }
 
 // ---------------------------------------------------------------------------

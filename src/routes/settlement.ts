@@ -61,6 +61,12 @@ interface HeadVoterInfo {
     version: number;
     voteHash: string;
     ipfsCid: string;
+    /** UTxO reference (txHash#outputIndex). */
+    ref: { txHash: string; outputIndex: number };
+    /** UTxO value in Amount[] format for MeshTxBuilder. */
+    value: Array<{ unit: string; quantity: string }>;
+    /** UTxO address. */
+    address: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -178,7 +184,7 @@ async function getVotersFromHead(
     const snapshotUtxos = await wrangler.http.getSnapshotUtxo();
     const voters: HeadVoterInfo[] = [];
 
-    for (const [, utxo] of Object.entries(snapshotUtxos)) {
+    for (const [utxoRef, utxo] of Object.entries(snapshotUtxos)) {
         const policyAssets = utxo.value[tokenPolicy];
         if (!policyAssets || typeof policyAssets !== 'object') continue;
 
@@ -194,11 +200,15 @@ async function getVotersFromHead(
                 continue;
             }
 
+            const [txHash, idx] = utxoRef.split('#');
             voters.push({
                 tokenName: assetName,
                 version: datum.fields[1].int,
                 voteHash: datum.fields[3].bytes,
                 ipfsCid: Buffer.from(datum.fields[4].bytes, 'hex').toString('utf-8'),
+                ref: { txHash, outputIndex: parseInt(idx) },
+                value: hydraValueToAmounts(utxo.value),
+                address: utxo.address,
             });
         }
     }
@@ -589,6 +599,8 @@ router.post('/settle', async (req, res) => {
         const headVoters = await getVotersFromHead(wrangler, TOKEN_POLICY as string);
 
         // --- Step 1: Burn all voter tokens ---
+        // Burns use the UTxO refs captured in the single snapshot from Step 0.
+        // All voters are burned regardless of evidence verification status.
         let burned = 0;
         let burnFailed = 0;
         let burnTotalAttempts = 0;
@@ -596,35 +608,13 @@ router.post('/settle', async (req, res) => {
         for (const voter of headVoters) {
             try {
                 if (TX_MODE === 'direct') {
-                    // Look up voter UTxO from cache, or build from head snapshot
-                    let voterInputValue: Array<{ unit: string; quantity: string }>;
-                    let voterRef = getVoterUtxo(voter.tokenName);
-                    if (!voterRef) {
-                        // Fallback: find in snapshot (head was queried above)
-                        const snapshotUtxos = await wrangler.http.getSnapshotUtxo();
-                        for (const [ref, utxo] of Object.entries(snapshotUtxos)) {
-                            const u = utxo as any;
-                            const policyAssets = u.value[TOKEN_POLICY as string];
-                            if (policyAssets && policyAssets[voter.tokenName]) {
-                                const [txH, idx] = ref.split('#');
-                                voterRef = {
-                                    ref: { txHash: txH, outputIndex: parseInt(idx) },
-                                    value: hydraValueToAmounts(u.value),
-                                    address: u.address,
-                                };
-                                break;
-                            }
-                        }
-                    }
-                    if (!voterRef) throw new Error(`Voter UTxO not found for ${voter.tokenName}`);
-
                     const unsignedTx = buildCountVoteTx({
                         adminAddress: admin_payment_address,
                         tokenPolicy: TOKEN_POLICY as string,
                         tokenScript: TOKEN_SCRIPT as string,
                         userId: voter.tokenName,
-                        inputRef: voterRef.ref,
-                        inputValue: voterRef.value,
+                        inputRef: voter.ref,
+                        inputValue: voter.value,
                     });
                     const signedTx = await admin_wallet.signTx(unsignedTx);
                     await submitDirect(signedTx);
@@ -652,40 +642,97 @@ router.post('/settle', async (req, res) => {
             }
         }
 
-        const burnRetries = burnTotalAttempts - burned; // total extra attempts beyond first
+        const burnRetries = burnTotalAttempts - burned;
         steps.push({
             step: 'burn',
             status: burnFailed === 0 ? 'SUCCESS' : 'PARTIAL',
             data: { burned, failed: burnFailed, total: headVoters.length, retries: burnRetries, maxAttempts: burnMaxAttempts },
         });
 
-        // --- Step 2: Tally + IPFS evidence ---
-        const fileLeaves: FileLeaf[] = headVoters.map((v) => ({
+        // --- Step 2: Verify evidence against on-chain state ---
+        // The head's UTxO set is the source of truth. Only voters whose
+        // on-chain voteHash can be matched to a local evidence file are
+        // included in the results. This ensures the evidence package
+        // reflects strictly the final Hydra ledger state.
+        const fs = await import('node:fs/promises');
+        const pathMod = await import('node:path');
+        const evidenceDir = voteCache.getDocumentsDir();
+
+        const allCached = voteCache.getAll();
+        const cacheByTokenName = new Map(allCached.map(v => {
+            try { return [voterIdToTokenName(v.voterId), v] as const; }
+            catch { return ['', v] as const; }
+        }));
+
+        const verifiedVoters: HeadVoterInfo[] = [];
+        const excludedVoters: Array<{ tokenName: string; reason: string }> = [];
+
+        for (const voter of headVoters) {
+            const cached = cacheByTokenName.get(voter.tokenName);
+
+            // Case 1: cache matches on-chain
+            if (cached && cached.voteHash === voter.voteHash) {
+                verifiedVoters.push(voter);
+                continue;
+            }
+
+            // Case 2: cache mismatch or missing — look for evidence file on disk for on-chain version
+            const evidenceFile = `vote-${voter.tokenName}-v${voter.version}.json`;
+            const evidencePath = pathMod.join(evidenceDir, evidenceFile);
+            try {
+                const raw = await fs.readFile(evidencePath, 'utf-8');
+                const evidence = JSON.parse(raw);
+                const fileHash = bytesToHex(blake2b256(JSON.stringify(evidence)));
+                if (fileHash === voter.voteHash) {
+                    verifiedVoters.push(voter);
+                    debug(`[settle] Recovered evidence for ${voter.tokenName} v${voter.version} from disk`);
+                    continue;
+                }
+            } catch { /* file not found */ }
+
+            // Case 3: no matching evidence anywhere — exclude
+            const reason = cached
+                ? `cache has v${cached.version} (hash=${cached.voteHash.slice(0, 16)}…) but on-chain is v${voter.version} (hash=${voter.voteHash.slice(0, 16)}…)`
+                : 'not in local cache and no evidence file on disk';
+            console.warn(`[settle] Excluding ${voter.tokenName}: ${reason}`);
+            excludedVoters.push({ tokenName: voter.tokenName, reason });
+        }
+
+        debug(`[settle] Verified: ${verifiedVoters.length}, excluded: ${excludedVoters.length}`);
+
+        // --- Step 3: Tally + IPFS evidence (verified voters only) ---
+        const fileLeaves: FileLeaf[] = verifiedVoters.map((v) => ({
             name: v.tokenName,
             contentHashHex: v.voteHash,
         }));
         const proofPackage = computePackage(fileLeaves, 'content+path');
         const evidenceMerkleRoot = proofPackage.rootHex;
-        const tallies = await tallyVotes(ballot, headVoters, voteCache.getDocumentsDir());
+        const tallies = await tallyVotes(ballot, verifiedVoters, evidenceDir);
 
         const fullResults: FullResults = {
             specVersion: '0.3.0',
             ballotId,
             status: 'finalized',
             tallies,
-            totalVoters: headVoters.length,
+            totalVoters: verifiedVoters.length,
             evidenceIpfsCid: '',
             headId: getHeadId() ?? '',
             finalizedAt: new Date().toISOString(),
+            excludedVoters: excludedVoters.length > 0 ? excludedVoters : undefined,
         };
 
-        const fs = await import('node:fs/promises');
-        const pathMod = await import('node:path');
-        const evidenceDir = voteCache.getDocumentsDir();
         const proofsDir = pathMod.join(evidenceDir, 'proofs');
         const historyDestDir = pathMod.join(evidenceDir, 'history');
         await fs.mkdir(proofsDir, { recursive: true });
         await fs.mkdir(historyDestDir, { recursive: true });
+
+        // Write exclusions manifest if any voters were excluded
+        if (excludedVoters.length > 0) {
+            await fs.writeFile(
+                pathMod.join(evidenceDir, 'exclusions.json'),
+                JSON.stringify(excludedVoters, null, 2),
+            );
+        }
 
         // Copy vote history chains into evidence directory so auditors
         // can verify the full vote update trail (nonce progression,

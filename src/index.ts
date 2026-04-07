@@ -80,6 +80,8 @@ async function start() {
             if (msg.transactionId) summary.transactionId = msg.transactionId;
             if (msg.transaction?.txId) summary.txId = msg.transaction.txId;
             if (msg.validationError) summary.validationError = msg.validationError.reason?.slice(0, 200);
+            if (msg.snapshot?.utxo) summary.utxoCount = Object.keys(msg.snapshot.utxo).length;
+            if (msg.snapshot?.snapshotNumber !== undefined) summary.snapshotNumber = msg.snapshot.snapshotNumber;
             if (msg.party) summary.party = msg.party;
             if (msg.headId) summary.headId = msg.headId;
             console.log(`[hydra-ws] ${JSON.stringify(summary)}`);
