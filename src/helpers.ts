@@ -137,6 +137,8 @@ export async function submitDirect(
 
     return new Promise((resolve, reject) => {
         let settled = false;
+        let txAccepted = false;
+
         const settle = (fn: Function, value: any) => {
             if (settled) return;
             settled = true;
@@ -152,15 +154,23 @@ export async function submitDirect(
 
         const onMsg = (msg: any) => {
             if (msg.tag === 'TxValid' && msg.transactionId === expectedTxId) {
-                debug(`[submitDirect] TxValid confirmed: ${expectedTxId.slice(0, 16)}…`);
-                settle(resolve, { hash: expectedTxId });
+                debug(`[submitDirect] TxValid accepted: ${expectedTxId.slice(0, 16)}…`);
+                txAccepted = true;
+                // Don't resolve yet — wait for SnapshotConfirmed
             } else if (msg.tag === 'TxInvalid') {
-                // TxInvalid includes the submitted tx hash as transaction.txId or txId
                 const invalidTxId = msg.transaction?.txId ?? msg.txId ?? '';
                 if (invalidTxId === expectedTxId) {
                     const reason = msg.validationError?.reason ?? JSON.stringify(msg);
                     debug(`[submitDirect] TxInvalid for ${expectedTxId.slice(0, 16)}…: ${reason.slice(0, 200)}`);
                     settle(reject, new Error(`TxInvalid: ${reason}`));
+                }
+            } else if (msg.tag === 'SnapshotConfirmed' && txAccepted) {
+                // Check if our tx is in the confirmed list
+                const confirmed: any[] = msg.snapshot?.confirmed ?? msg.confirmed ?? [];
+                const found = confirmed.some((tx: any) => tx.txId === expectedTxId);
+                if (found) {
+                    debug(`[submitDirect] SnapshotConfirmed for ${expectedTxId.slice(0, 16)}…`);
+                    settle(resolve, { hash: expectedTxId });
                 }
             }
         };
