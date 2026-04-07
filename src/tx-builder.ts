@@ -48,14 +48,33 @@ function voteDatum(
     };
 }
 
-/** Build a BallotResult datum (passthrough — preserves existing datum). */
+/**
+ * Convert a Hydra snapshot datum field to MeshTxBuilder format.
+ * Snapshot uses { bytes: "hex" } and { int: N } wrappers.
+ * MeshTxBuilder expects raw strings and numbers.
+ */
+function unwrapDatumField(field: any): any {
+    if (field === null || field === undefined) return '';
+    if (typeof field === 'string' || typeof field === 'number') return field;
+    if ('bytes' in field) return field.bytes;
+    if ('int' in field) return field.int;
+    if (Array.isArray(field)) return field.map(unwrapDatumField);
+    if ('list' in field) return field.list.map(unwrapDatumField);
+    if ('fields' in field) return { alternative: field.constructor ?? 0, fields: field.fields.map(unwrapDatumField) };
+    return field;
+}
+
+/**
+ * Build a BallotResult datum (passthrough — preserves existing datum).
+ * Converts from Hydra snapshot format to MeshTxBuilder format.
+ */
 function ballotResultDatum(existing: any) {
-    // The existing datum from the snapshot uses { constructor: 0, fields: [...] }
-    // MeshTxBuilder expects { alternative: 0, fields: [...] }
-    return {
-        alternative: 0,
-        fields: existing.fields ?? existing,
-    };
+    if (!existing) {
+        // Fallback: empty BallotResult
+        return { alternative: 0, fields: [['', '', '', ''], 0] };
+    }
+    const fields = (existing.fields ?? []).map(unwrapDatumField);
+    return { alternative: 0, fields };
 }
 
 // ---------------------------------------------------------------------------

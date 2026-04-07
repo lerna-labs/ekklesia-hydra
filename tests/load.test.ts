@@ -96,6 +96,7 @@ let setupDurationMs: number;
 let keyGenDurationMs: number;
 const voters: DRepKeys[] = [];
 const results: TimedResult[] = [];
+let adversarialResults: Array<{ name: string; status: number; expected: number; code?: string; pass: boolean; durationMs: number }> = [];
 
 // Key generation runs concurrently with setup phases.
 // Started in beforeAll, awaited before voting begins.
@@ -955,6 +956,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
             }
         }
 
+        adversarialResults = badResults;
         console.log(`\n  Adversarial results: ${passed}/${cases.length} passed, ${failed} failed`);
 
         // Every bad request must be rejected (status >= 400)
@@ -1099,6 +1101,21 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
             log(`  ${op}: ${withRetries.length}/${subset.length} needed retry, ${totalRetries} total retries, max ${maxAttempts} attempts`);
         }
 
+        // --- Adversarial test results ---
+        if (adversarialResults.length > 0) {
+            const advPassed = adversarialResults.filter(r => r.pass).length;
+            const advFailed = adversarialResults.filter(r => !r.pass).length;
+            log('');
+            log(`Adversarial inputs: ${advPassed}/${adversarialResults.length} passed, ${advFailed} failed`);
+            for (const r of adversarialResults) {
+                const mark = r.pass ? 'PASS' : 'FAIL';
+                const detail = r.pass
+                    ? `${r.status} ${r.code ?? ''}`
+                    : `got ${r.status} ${r.code ?? ''}, expected ${r.expected}`;
+                log(`  [${mark}] ${r.name} — ${detail} (${r.durationMs}ms)`);
+            }
+        }
+
         // --- Evidence package sizes ---
         log('');
         log('Evidence package sizes:');
@@ -1170,6 +1187,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
             summary: lines,
             softFailures,
             hardBail,
+            adversarialResults,
             results,
         }, null, 2));
 
