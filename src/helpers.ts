@@ -142,8 +142,9 @@ export async function submitDirect(
 
         const onMsg = (msg: any) => {
             if (msg.tag === 'TxValid') {
-                const txId = msg.transaction?.txId ?? msg.headId ?? '';
-                debug(`[submitDirect] TxValid received, txId: ${txId || '(none)'}`);
+                // Hydra API: TxValid has transactionId (not transaction.txId)
+                const txId = msg.transactionId ?? '';
+                debug(`[submitDirect] TxValid received, transactionId: ${txId || '(none)'}`);
                 settle(resolve, { hash: txId });
             } else if (msg.tag === 'TxInvalid') {
                 const reason = msg.validationError?.reason ?? JSON.stringify(msg);

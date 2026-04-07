@@ -77,8 +77,8 @@ async function start() {
             const summary: Record<string, any> = { tag };
             if (msg.headStatus) summary.headStatus = msg.headStatus;
             if (msg.hydraHeadId) summary.hydraHeadId = msg.hydraHeadId;
+            if (msg.transactionId) summary.transactionId = msg.transactionId;
             if (msg.transaction?.txId) summary.txId = msg.transaction.txId;
-            if (msg.transaction?.type) summary.txType = msg.transaction.type;
             if (msg.validationError) summary.validationError = msg.validationError.reason?.slice(0, 200);
             if (msg.party) summary.party = msg.party;
             if (msg.headId) summary.headId = msg.headId;
