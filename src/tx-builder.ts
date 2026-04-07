@@ -118,7 +118,7 @@ export function buildCastVoteTx(params: {
 
     const ipfsCidHex = Buffer.from(ipfsCid).toString('hex');
 
-    const txBuilder = new MeshTxBuilder();
+    const txBuilder = new MeshTxBuilder({ isHydra: true });
     txBuilder
         .txIn(inputRef.txHash, inputRef.outputIndex, inputValue, adminAddress)
         .txOut(adminAddress, inputValue)
@@ -156,7 +156,7 @@ export function buildRegisterVoterTx(params: {
     // Gas return: same value as input (no ADA leaves the ballot token)
     const gasReturnAmount = inputValue;
 
-    const txBuilder = new MeshTxBuilder();
+    const txBuilder = new MeshTxBuilder({ isHydra: true });
     txBuilder
         .txIn(inputRef.txHash, inputRef.outputIndex, inputValue, adminAddress)
         .mint('1', tokenPolicy, userId)
@@ -204,7 +204,7 @@ export function buildVoteAndRegisterTx(params: {
 
     const gasReturnAmount = inputValue;
 
-    const txBuilder = new MeshTxBuilder();
+    const txBuilder = new MeshTxBuilder({ isHydra: true });
     txBuilder
         .txIn(inputRef.txHash, inputRef.outputIndex, inputValue, adminAddress)
         .mint('1', tokenPolicy, userId)
@@ -238,7 +238,7 @@ export function buildCountVoteTx(params: {
         inputRef, inputValue,
     } = params;
 
-    const txBuilder = new MeshTxBuilder();
+    const txBuilder = new MeshTxBuilder({ isHydra: true });
     txBuilder
         .txIn(inputRef.txHash, inputRef.outputIndex, inputValue, adminAddress)
         .mint('-1', tokenPolicy, userId)
@@ -282,7 +282,7 @@ export function buildFinalizeBallotTx(params: {
         ],
     };
 
-    const txBuilder = new MeshTxBuilder();
+    const txBuilder = new MeshTxBuilder({ isHydra: true });
     txBuilder
         .txIn(inputRef.txHash, inputRef.outputIndex, inputValue, adminAddress)
         .txOut(adminAddress, inputValue)

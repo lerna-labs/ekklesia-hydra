@@ -660,6 +660,10 @@ router.post('/vote-and-register', async (req, res) => {
                 return error(res, 'INTERNAL_ERROR', 'Ballot UTxO not found in cache. Was the head opened with TX_MODE=direct?', 500);
             }
 
+            debug('[vote-and-register/direct] Ballot UTxO ref:', JSON.stringify(ballotUtxo.ref));
+            debug('[vote-and-register/direct] Ballot UTxO value:', JSON.stringify(ballotUtxo.value));
+            debug('[vote-and-register/direct] Ballot UTxO datum:', JSON.stringify(ballotUtxo.datum));
+
             const unsignedTx = buildVoteAndRegisterTx({
                 adminAddress: admin_payment_address,
                 tokenPolicy: TOKEN_POLICY as string,
@@ -673,6 +677,7 @@ router.post('/vote-and-register', async (req, res) => {
                 inputDatum: ballotUtxo.datum,
             });
 
+            debug('[vote-and-register/direct] Unsigned tx length:', unsignedTx.length);
             const signedTx = await admin_wallet.signTx(unsignedTx);
             const result = await submitDirect(signedTx);
             txHash = result.hash;
