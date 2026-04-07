@@ -97,6 +97,7 @@ let keyGenDurationMs: number;
 const voters: DRepKeys[] = [];
 const results: TimedResult[] = [];
 let adversarialResults: Array<{ name: string; status: number; expected: number; code?: string; pass: boolean; durationMs: number }> = [];
+let burstResults: Array<{ phase: string; total: number; succeeded: number; failed: number; fetchErrors: number; elapsedMs: number; times?: number[] }> = [];
 
 // Key generation runs concurrently with setup phases.
 // Started in beforeAll, awaited before voting begins.
@@ -402,6 +403,17 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
         const failed = concurrentResults.filter(r => r.status !== 200);
         const fetchErrors = concurrentResults.filter(r => r.status === -1);
 
+        const successTimes = succeeded.map(r => r.durationMs).sort((a, b) => a - b);
+        burstResults.push({
+            phase: '2b (10% concurrent votes)',
+            total: concurrentCount,
+            succeeded: succeeded.length,
+            failed: failed.length,
+            fetchErrors: fetchErrors.length,
+            elapsedMs: elapsed,
+            times: successTimes,
+        });
+
         console.log(`  Concurrent burst completed in ${elapsed}ms`);
         console.log(`  Succeeded: ${succeeded.length}/${concurrentCount}`);
         console.log(`  Failed: ${failed.length}/${concurrentCount}${fetchErrors.length ? ` (${fetchErrors.length} fetch errors)` : ''}`);
@@ -503,8 +515,19 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
 
         const succeeded = concurrentResults.filter(r => r.status === 200);
         const failed = concurrentResults.filter(r => r.status !== 200);
+        const fetchErrors = concurrentResults.filter(r => r.status === -1);
         const serverErrors = concurrentResults.filter(r => r.status >= 500);
         const times = succeeded.map(r => r.durationMs).sort((a, b) => a - b);
+
+        burstResults.push({
+            phase: '2c (50% concurrent votes)',
+            total: concurrentCount,
+            succeeded: succeeded.length,
+            failed: failed.length,
+            fetchErrors: fetchErrors.length,
+            elapsedMs: elapsed,
+            times,
+        });
 
         console.log(`  Concurrent vote update burst completed in ${elapsed}ms`);
         console.log(`  Succeeded: ${succeeded.length}/${concurrentCount} (${Math.round(succeeded.length / concurrentCount * 100)}%)`);
@@ -1101,6 +1124,22 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
             log(`  ${op}: ${withRetries.length}/${subset.length} needed retry, ${totalRetries} total retries, max ${maxAttempts} attempts`);
         }
 
+        // --- Concurrent burst results ---
+        if (burstResults.length > 0) {
+            log('');
+            log('Concurrent burst results:');
+            for (const b of burstResults) {
+                const successRate = b.total > 0 ? Math.round(b.succeeded / b.total * 100) : 0;
+                log(`  ${b.phase}: ${b.succeeded}/${b.total} succeeded (${successRate}%) in ${b.elapsedMs}ms${b.fetchErrors ? `, ${b.fetchErrors} fetch errors` : ''}`);
+                if (b.times && b.times.length > 0) {
+                    const avg = Math.round(b.times.reduce((s, t) => s + t, 0) / b.times.length);
+                    const p50 = b.times[Math.floor(b.times.length * 0.5)];
+                    const p95 = b.times[Math.floor(b.times.length * 0.95)];
+                    log(`    Response times: avg=${avg}ms p50=${p50}ms p95=${p95}ms min=${b.times[0]}ms max=${b.times[b.times.length - 1]}ms`);
+                }
+            }
+        }
+
         // --- Adversarial test results ---
         if (adversarialResults.length > 0) {
             const advPassed = adversarialResults.filter(r => r.pass).length;
@@ -1187,6 +1226,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
             summary: lines,
             softFailures,
             hardBail,
+            burstResults,
             adversarialResults,
             results,
         }, null, 2));

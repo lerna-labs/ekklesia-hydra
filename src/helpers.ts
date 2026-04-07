@@ -59,7 +59,7 @@ let _ballotUtxo: CachedUtxo | null = null;
 const _voterUtxos = new Map<string, CachedUtxo>();
 
 export function getBallotUtxo(): CachedUtxo | null { return _ballotUtxo; }
-export function setBallotUtxo(u: CachedUtxo): void { _ballotUtxo = u; }
+export function setBallotUtxo(u: CachedUtxo | null): void { _ballotUtxo = u; }
 export function getVoterUtxo(userId: string): CachedUtxo | undefined { return _voterUtxos.get(userId); }
 export function setVoterUtxo(userId: string, u: CachedUtxo): void { _voterUtxos.set(userId, u); }
 export function deleteVoterUtxo(userId: string): void { _voterUtxos.delete(userId); }
@@ -108,22 +108,32 @@ export async function seedBallotUtxoFromSnapshot(
  *
  * No HTTP overhead, no TRP rate limiting.
  */
+import { deserializeTx } from '@meshsdk/core-cst';
+
+/**
+ * Compute the Cardano transaction hash from unsigned or signed CBOR.
+ * The tx hash is blake2b-256 of the tx body, which doesn't change after signing.
+ */
+function computeTxHash(cborHex: string): string {
+    return deserializeTx(cborHex).body().hash();
+}
+
 export async function submitDirect(
     signedCborHex: string,
+    unsignedCborHex?: string,
     timeoutMs = 30_000,
 ): Promise<{ hash: string }> {
-    // Listen directly on the WebSocket, not the monitor's EventEmitter.
-    // The monitor's event handlers may not be attached if the Wrangler
-    // reconnected the shared WebSocket after a failed initial connection.
     const ws = hydraMonitor.ws;
 
-    // If the WebSocket isn't connected, reconnect it
     if (ws.connectionState !== 'CONNECTED') {
         debug('[submitDirect] WebSocket not connected, reconnecting…');
         await ws.waitForGreetings();
     }
 
-    debug(`[submitDirect] WS state: ${ws.connectionState}, monitor connected: ${hydraMonitor.connected}`);
+    // Compute expected tx hash for message correlation.
+    // Use unsigned CBOR if provided (avoids re-parsing), otherwise use signed.
+    const expectedTxId = computeTxHash(unsignedCborHex ?? signedCborHex);
+    debug(`[submitDirect] Submitting tx ${expectedTxId.slice(0, 16)}…`);
 
     return new Promise((resolve, reject) => {
         let settled = false;
@@ -136,20 +146,22 @@ export async function submitDirect(
         };
 
         const timer = setTimeout(
-            () => settle(reject, new Error('submitDirect timed out waiting for TxValid/TxInvalid')),
+            () => settle(reject, new Error(`submitDirect timed out for tx ${expectedTxId.slice(0, 16)}…`)),
             timeoutMs,
         );
 
         const onMsg = (msg: any) => {
-            if (msg.tag === 'TxValid') {
-                // Hydra API: TxValid has transactionId (not transaction.txId)
-                const txId = msg.transactionId ?? '';
-                debug(`[submitDirect] TxValid received, transactionId: ${txId || '(none)'}`);
-                settle(resolve, { hash: txId });
+            if (msg.tag === 'TxValid' && msg.transactionId === expectedTxId) {
+                debug(`[submitDirect] TxValid confirmed: ${expectedTxId.slice(0, 16)}…`);
+                settle(resolve, { hash: expectedTxId });
             } else if (msg.tag === 'TxInvalid') {
-                const reason = msg.validationError?.reason ?? JSON.stringify(msg);
-                debug(`[submitDirect] TxInvalid: ${reason.slice(0, 200)}`);
-                settle(reject, new Error(`TxInvalid: ${reason}`));
+                // TxInvalid includes the submitted tx hash as transaction.txId or txId
+                const invalidTxId = msg.transaction?.txId ?? msg.txId ?? '';
+                if (invalidTxId === expectedTxId) {
+                    const reason = msg.validationError?.reason ?? JSON.stringify(msg);
+                    debug(`[submitDirect] TxInvalid for ${expectedTxId.slice(0, 16)}…: ${reason.slice(0, 200)}`);
+                    settle(reject, new Error(`TxInvalid: ${reason}`));
+                }
             }
         };
 
@@ -164,6 +176,16 @@ export async function submitDirect(
             },
         });
     });
+}
+
+/**
+ * Check if a TxInvalid error is retryable (stale UTxO ref).
+ * When this returns true, the caller should rehydrate the UTxO cache
+ * from the head snapshot and rebuild the transaction.
+ */
+export function isDirectRetryable(message: string): boolean {
+    const lower = message.toLowerCase();
+    return lower.includes('badinputsutxo') || lower.includes('bad inputs');
 }
 
 // ---------------------------------------------------------------------------

@@ -21,9 +21,15 @@ import {
     getBallotUtxo,
     setBallotUtxo,
     submitDirect,
+    isDirectRetryable,
+    hydraMonitor,
+    deleteVoterUtxo,
+    seedBallotUtxoFromSnapshot,
 } from '../helpers.js';
 import type { CachedUtxo } from '../helpers.js';
-import { buildCastVoteTx, buildRegisterVoterTx, buildVoteAndRegisterTx } from '../tx-builder.js';
+import { Wrangler } from '@lerna-labs/hydra-sdk';
+import { buildCastVoteTx, buildRegisterVoterTx, buildVoteAndRegisterTx, hydraValueToAmounts } from '../tx-builder.js';
+import { BALLOT_INSTANCE_PREFIX } from '../types.js';
 import {getCachedBallot, getCachedBallotIdentity} from './lifecycle.js';
 import type {
     BallotDefinition,
@@ -519,44 +525,61 @@ router.post('/register', async (req, res) => {
             return error(res, 'CLIENT_INIT_FAILED', 'Ballot identity not cached. Was /start called with ballotPolicy and ballotToken?', 503);
         }
 
-        let txHash: string;
+        let txHash = '';
         let attempts = 1;
 
         if (TX_MODE === 'direct') {
-            const ballotUtxo = getBallotUtxo();
-            if (!ballotUtxo) {
-                return error(res, 'INTERNAL_ERROR', 'Ballot UTxO not found in cache. Was the head opened with TX_MODE=direct?', 500);
+            for (let directAttempt = 0; directAttempt < 2; directAttempt++) {
+                let ballotUtxo = getBallotUtxo();
+                if (!ballotUtxo) {
+                    const wrangler = new Wrangler(process.env.HYDRA_API_URL, undefined, hydraMonitor);
+                    const snap = await wrangler.http.getSnapshotUtxo();
+                    await seedBallotUtxoFromSnapshot(snap, BALLOT_INSTANCE_PREFIX);
+                    ballotUtxo = getBallotUtxo();
+                }
+                if (!ballotUtxo) {
+                    return error(res, 'INTERNAL_ERROR', 'Ballot UTxO not found in head', 500);
+                }
+
+                const unsignedTx = buildRegisterVoterTx({
+                    adminAddress: admin_payment_address,
+                    tokenPolicy: TOKEN_POLICY as string,
+                    tokenScript: TOKEN_SCRIPT as string,
+                    userId: tokenName,
+                    inputRef: ballotUtxo.ref,
+                    inputValue: ballotUtxo.value,
+                    inputDatum: ballotUtxo.datum,
+                });
+
+                try {
+                    const signedTx = await admin_wallet.signTx(unsignedTx);
+                    const result = await submitDirect(signedTx, unsignedTx);
+                    txHash = result.hash;
+
+                    setVoterUtxo(tokenName, {
+                        ref: { txHash, outputIndex: 0 },
+                        value: [
+                            { unit: 'lovelace', quantity: '0' },
+                            { unit: (TOKEN_POLICY as string) + tokenName, quantity: '1' },
+                        ],
+                        address: ballotUtxo.address,
+                    });
+                    setBallotUtxo({
+                        ref: { txHash, outputIndex: 1 },
+                        value: ballotUtxo.value,
+                        datum: ballotUtxo.datum,
+                        address: ballotUtxo.address,
+                    });
+                    break;
+                } catch (directErr: any) {
+                    if (directAttempt === 0 && isDirectRetryable(directErr.message ?? '')) {
+                        debug(`[register/direct] BadInputsUTxO, rehydrating ballot cache and retrying…`);
+                        setBallotUtxo(null);
+                        continue;
+                    }
+                    throw directErr;
+                }
             }
-
-            const unsignedTx = buildRegisterVoterTx({
-                adminAddress: admin_payment_address,
-                tokenPolicy: TOKEN_POLICY as string,
-                tokenScript: TOKEN_SCRIPT as string,
-                userId: tokenName,
-                inputRef: ballotUtxo.ref,
-                inputValue: ballotUtxo.value,
-                inputDatum: ballotUtxo.datum,
-            });
-
-            const signedTx = await admin_wallet.signTx(unsignedTx);
-            const result = await submitDirect(signedTx);
-            txHash = result.hash;
-
-            // Update caches: output 0 = voter token, output 1 = gas return (ballot)
-            setVoterUtxo(tokenName, {
-                ref: { txHash, outputIndex: 0 },
-                value: [
-                    { unit: 'lovelace', quantity: '0' },
-                    { unit: (TOKEN_POLICY as string) + tokenName, quantity: '1' },
-                ],
-                address: ballotUtxo.address,
-            });
-            setBallotUtxo({
-                ref: { txHash, outputIndex: 1 },
-                value: ballotUtxo.value,
-                datum: ballotUtxo.datum,
-                address: ballotUtxo.address,
-            });
         } else {
             const result = await submitWithRetry(
                 () => client!.registerVoterTx({
@@ -651,52 +674,66 @@ router.post('/vote-and-register', async (req, res) => {
             return error(res, 'CLIENT_INIT_FAILED', 'Ballot identity not cached. Was /start called with ballotPolicy and ballotToken?', 503);
         }
 
-        let txHash: string;
+        let txHash = '';
         let attempts = 1;
 
         if (TX_MODE === 'direct') {
-            const ballotUtxo = getBallotUtxo();
-            if (!ballotUtxo) {
-                return error(res, 'INTERNAL_ERROR', 'Ballot UTxO not found in cache. Was the head opened with TX_MODE=direct?', 500);
+            for (let directAttempt = 0; directAttempt < 2; directAttempt++) {
+                let ballotUtxo = getBallotUtxo();
+                if (!ballotUtxo) {
+                    // Rehydrate from snapshot
+                    const wrangler = new Wrangler(process.env.HYDRA_API_URL, undefined, hydraMonitor);
+                    const snap = await wrangler.http.getSnapshotUtxo();
+                    await seedBallotUtxoFromSnapshot(snap, BALLOT_INSTANCE_PREFIX);
+                    ballotUtxo = getBallotUtxo();
+                }
+                if (!ballotUtxo) {
+                    return error(res, 'INTERNAL_ERROR', 'Ballot UTxO not found in head', 500);
+                }
+
+                const unsignedTx = buildVoteAndRegisterTx({
+                    adminAddress: admin_payment_address,
+                    tokenPolicy: TOKEN_POLICY as string,
+                    tokenScript: TOKEN_SCRIPT as string,
+                    userId: tokenName,
+                    merkleRoot,
+                    voteHash,
+                    ipfsCid,
+                    inputRef: ballotUtxo.ref,
+                    inputValue: ballotUtxo.value,
+                    inputDatum: ballotUtxo.datum,
+                });
+
+                try {
+                    const signedTx = await admin_wallet.signTx(unsignedTx);
+                    const result = await submitDirect(signedTx, unsignedTx);
+                    txHash = result.hash;
+
+                    // Update caches: output 0 = voter token, output 1 = gas return (ballot)
+                    setVoterUtxo(tokenName, {
+                        ref: { txHash, outputIndex: 0 },
+                        value: [
+                            { unit: 'lovelace', quantity: '0' },
+                            { unit: (TOKEN_POLICY as string) + tokenName, quantity: '1' },
+                        ],
+                        address: ballotUtxo.address,
+                    });
+                    setBallotUtxo({
+                        ref: { txHash, outputIndex: 1 },
+                        value: ballotUtxo.value,
+                        datum: ballotUtxo.datum,
+                        address: ballotUtxo.address,
+                    });
+                    break; // success
+                } catch (directErr: any) {
+                    if (directAttempt === 0 && isDirectRetryable(directErr.message ?? '')) {
+                        debug(`[vote-and-register/direct] BadInputsUTxO, rehydrating ballot cache and retrying…`);
+                        setBallotUtxo(null);
+                        continue;
+                    }
+                    throw directErr;
+                }
             }
-
-            debug('[vote-and-register/direct] Ballot UTxO ref:', JSON.stringify(ballotUtxo.ref));
-            debug('[vote-and-register/direct] Ballot UTxO value:', JSON.stringify(ballotUtxo.value));
-            debug('[vote-and-register/direct] Ballot UTxO datum:', JSON.stringify(ballotUtxo.datum));
-
-            const unsignedTx = buildVoteAndRegisterTx({
-                adminAddress: admin_payment_address,
-                tokenPolicy: TOKEN_POLICY as string,
-                tokenScript: TOKEN_SCRIPT as string,
-                userId: tokenName,
-                merkleRoot,
-                voteHash,
-                ipfsCid,
-                inputRef: ballotUtxo.ref,
-                inputValue: ballotUtxo.value,
-                inputDatum: ballotUtxo.datum,
-            });
-
-            debug('[vote-and-register/direct] Unsigned tx length:', unsignedTx.length);
-            const signedTx = await admin_wallet.signTx(unsignedTx);
-            const result = await submitDirect(signedTx);
-            txHash = result.hash;
-
-            // Update caches: output 0 = voter token, output 1 = gas return (ballot)
-            setVoterUtxo(tokenName, {
-                ref: { txHash, outputIndex: 0 },
-                value: [
-                    { unit: 'lovelace', quantity: '0' },
-                    { unit: (TOKEN_POLICY as string) + tokenName, quantity: '1' },
-                ],
-                address: ballotUtxo.address,
-            });
-            setBallotUtxo({
-                ref: { txHash, outputIndex: 1 },
-                value: ballotUtxo.value,
-                datum: ballotUtxo.datum,
-                address: ballotUtxo.address,
-            });
         } else {
             const result = await submitWithRetry(
                 () => client!.voteAndRegisterTx({
@@ -807,38 +844,72 @@ router.post('/vote', async (req, res) => {
         });
 
         // --- Submit to Hydra head ---
-        let txHash: string;
+        let txHash = '';
         let attempts = 1;
 
         if (TX_MODE === 'direct') {
             // Direct pipeline: build tx locally, submit via WebSocket
-            const voterUtxo = getVoterUtxo(tokenName);
-            if (!voterUtxo) {
-                return error(res, 'INTERNAL_ERROR', 'Voter UTxO not found in cache. Is TX_MODE=direct supported for this voter?', 500);
+            // Retry once on BadInputsUTxO by rehydrating the voter's UTxO from snapshot
+            for (let directAttempt = 0; directAttempt < 2; directAttempt++) {
+                const voterUtxo = getVoterUtxo(tokenName);
+                if (!voterUtxo) {
+                    // Rehydrate from snapshot
+                    const wrangler = new Wrangler(process.env.HYDRA_API_URL, undefined, hydraMonitor);
+                    const snap = await wrangler.http.getSnapshotUtxo();
+                    for (const [ref, utxo] of Object.entries(snap)) {
+                        const u = utxo as any;
+                        const pa = u.value[TOKEN_POLICY as string];
+                        if (pa && pa[tokenName]) {
+                            const [txH, idx] = ref.split('#');
+                            setVoterUtxo(tokenName, {
+                                ref: { txHash: txH, outputIndex: parseInt(idx) },
+                                value: hydraValueToAmounts(u.value),
+                                address: u.address,
+                            });
+                            break;
+                        }
+                    }
+                }
+
+                const currentUtxo = getVoterUtxo(tokenName);
+                if (!currentUtxo) {
+                    return error(res, 'INTERNAL_ERROR', 'Voter UTxO not found in head', 500);
+                }
+
+                const unsignedTx = buildCastVoteTx({
+                    adminAddress: admin_payment_address,
+                    tokenPolicy: TOKEN_POLICY as string,
+                    userId: tokenName,
+                    version: nonce,
+                    merkleRoot,
+                    voteHash,
+                    ipfsCid,
+                    inputRef: currentUtxo.ref,
+                    inputValue: currentUtxo.value,
+                });
+
+                try {
+                    const signedTx = await admin_wallet.signTx(unsignedTx);
+                    const result = await submitDirect(signedTx, unsignedTx);
+                    txHash = result.hash;
+
+                    // Update UTxO ref cache — cast_vote has a single output at index 0
+                    setVoterUtxo(tokenName, {
+                        ref: { txHash, outputIndex: 0 },
+                        value: currentUtxo.value,
+                        address: currentUtxo.address,
+                    });
+                    break; // success
+                } catch (directErr: any) {
+                    if (directAttempt === 0 && isDirectRetryable(directErr.message ?? '')) {
+                        debug(`[vote/direct] BadInputsUTxO for ${tokenName}, rehydrating cache and retrying…`);
+                        // Clear stale cache entry so next iteration rehydrates from snapshot
+                        deleteVoterUtxo(tokenName);
+                        continue;
+                    }
+                    throw directErr;
+                }
             }
-
-            const unsignedTx = buildCastVoteTx({
-                adminAddress: admin_payment_address,
-                tokenPolicy: TOKEN_POLICY as string,
-                userId: tokenName,
-                version: nonce,
-                merkleRoot,
-                voteHash,
-                ipfsCid,
-                inputRef: voterUtxo.ref,
-                inputValue: voterUtxo.value,
-            });
-
-            const signedTx = await admin_wallet.signTx(unsignedTx);
-            const result = await submitDirect(signedTx);
-            txHash = result.hash;
-
-            // Update UTxO ref cache — cast_vote has a single output at index 0
-            setVoterUtxo(tokenName, {
-                ref: { txHash, outputIndex: 0 },
-                value: voterUtxo.value,
-                address: voterUtxo.address,
-            });
         } else {
             // TRP pipeline: resolve via TRP, submit with retry
             const result = await submitWithRetry(

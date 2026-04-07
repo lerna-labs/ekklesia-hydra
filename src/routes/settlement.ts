@@ -617,7 +617,7 @@ router.post('/settle', async (req, res) => {
                         inputValue: voter.value,
                     });
                     const signedTx = await admin_wallet.signTx(unsignedTx);
-                    await submitDirect(signedTx);
+                    await submitDirect(signedTx, unsignedTx);
                     deleteVoterUtxo(voter.tokenName);
                     burnTotalAttempts += 1;
                 } else {
@@ -815,7 +815,7 @@ router.post('/settle', async (req, res) => {
                 inputValue: ballotUtxo.value,
             });
             const signedTx = await admin_wallet.signTx(unsignedTx);
-            const result = await submitDirect(signedTx);
+            const result = await submitDirect(signedTx, unsignedTx);
             finalizeTxHash = result.hash;
 
             setBallotUtxo({
