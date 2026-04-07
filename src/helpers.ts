@@ -112,11 +112,15 @@ export async function submitDirect(
     signedCborHex: string,
     timeoutMs = 30_000,
 ): Promise<{ hash: string }> {
-    // Ensure monitor is connected — if Wrangler reconnected the WebSocket
-    // during head open, the monitor's event handlers may not be attached.
-    if (!hydraMonitor.connected) {
-        debug('[submitDirect] Monitor not connected, reconnecting…');
-        await hydraMonitor.start();
+    // Listen directly on the WebSocket, not the monitor's EventEmitter.
+    // The monitor's event handlers may not be attached if the Wrangler
+    // reconnected the shared WebSocket after a failed initial connection.
+    const ws = hydraMonitor.ws;
+
+    // If the WebSocket isn't connected, reconnect it
+    if (ws.connectionState !== 'CONNECTED') {
+        debug('[submitDirect] WebSocket not connected, reconnecting…');
+        await ws.waitForGreetings();
     }
 
     return new Promise((resolve, reject) => {
@@ -125,7 +129,7 @@ export async function submitDirect(
             if (settled) return;
             settled = true;
             clearTimeout(timer);
-            hydraMonitor.removeListener('message', onMsg);
+            ws.removeListener('message', onMsg);
             fn(value);
         };
 
@@ -146,9 +150,9 @@ export async function submitDirect(
             }
         };
 
-        hydraMonitor.on('message', onMsg);
+        ws.on('message', onMsg);
 
-        hydraMonitor.ws.send({
+        ws.send({
             tag: 'NewTx',
             transaction: {
                 type: 'Witnessed Tx ConwayEra' as const,
