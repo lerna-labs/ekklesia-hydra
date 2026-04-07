@@ -212,7 +212,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
                 namespace: '', votingAuthority: '', context: 'hydra-head',
                 acceptedCredentials: ['0x22'], merkleRoot: '', ballotIpfsCid: '',
                 votingWindow: {
-                    open: new Date((votingOpenTime = Date.now() + 600_000)).toISOString(),
+                    open: new Date((votingOpenTime = Date.now() + 360_000)).toISOString(),
                     close: new Date(Date.now() + 86_400_000).toISOString(),
                 },
             },

@@ -29,8 +29,13 @@ export function getCachedBallotIdentity(): { ballotPolicy: string; ballotToken: 
 
 router.get('/health', async (_, res) => {
     try {
+        // If monitor isn't connected, try to connect with a short timeout
         if (!hydraMonitor.connected) {
-            return error(res, 'HYDRA_UNREACHABLE', 'Monitor not connected to Hydra node', 503);
+            try {
+                await hydraMonitor.start();
+            } catch {
+                return error(res, 'HYDRA_UNREACHABLE', 'Could not connect to Hydra node', 503);
+            }
         }
         const info = hydraMonitor.headInfo;
         return success(res, {

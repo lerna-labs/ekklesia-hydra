@@ -140,7 +140,6 @@ export function buildRegisterVoterTx(params: {
     const txBuilder = new MeshTxBuilder();
     txBuilder
         .txIn(inputRef.txHash, inputRef.outputIndex, inputValue, adminAddress)
-        .mintPlutusScriptV2()
         .mint('1', tokenPolicy, userId)
         .mintingScript(tokenScript)
         // Output 0: voter token with empty Vote datum
@@ -189,7 +188,6 @@ export function buildVoteAndRegisterTx(params: {
     const txBuilder = new MeshTxBuilder();
     txBuilder
         .txIn(inputRef.txHash, inputRef.outputIndex, inputValue, adminAddress)
-        .mintPlutusScriptV2()
         .mint('1', tokenPolicy, userId)
         .mintingScript(tokenScript)
         // Output 0: voter token with populated Vote datum (version 1)
@@ -224,7 +222,6 @@ export function buildCountVoteTx(params: {
     const txBuilder = new MeshTxBuilder();
     txBuilder
         .txIn(inputRef.txHash, inputRef.outputIndex, inputValue, adminAddress)
-        .mintPlutusScriptV2()
         .mint('-1', tokenPolicy, userId)
         .mintingScript(tokenScript)
         .setFee('0')
