@@ -389,7 +389,7 @@ export interface VoteCacheEntry {
     /** IPFS CID of full evidence bundle. */
     ipfsCid: string;
     /** Hydra head tx hash where this vote was recorded. */
-    txHash?: string;
+    txHash: string;
     /** Monotonic version / nonce. */
     version: number;
     timestamp: number;

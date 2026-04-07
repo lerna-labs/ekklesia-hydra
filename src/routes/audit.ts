@@ -1,7 +1,9 @@
 import { Router } from 'express';
-import { ipfs, voteCache, getVoteHistory, success, error } from '../helpers.js';
+import { ipfs, voteCache, getVoteHistory, success, error, IPFS_STAGING_DIR, voterIdToTokenName } from '../helpers.js';
 import { getCachedBallot } from './lifecycle.js';
 import type { VoteEvidence } from '../types.js';
+import { promises as fs } from 'node:fs';
+import path from 'node:path';
 
 const router = Router();
 
@@ -86,6 +88,82 @@ router.get('/audit/vote/:voterId', async (req, res) => {
                 'Verify nonces are strictly increasing across the history chain',
             ],
         },
+    });
+});
+
+/**
+ * GET /audit/full
+ *
+ * Complete audit package in a single response. Reads all evidence files
+ * and vote history chains from disk (no IPFS fetches). Suitable for
+ * post-settlement bulk audit without keeping the middleware alive for
+ * per-voter queries.
+ *
+ * Returns:
+ *   - Ballot definition
+ *   - Per-voter: cache entry + full evidence JSON + vote history chain
+ *   - Total voter count
+ *   - IPFS evidence directory CID (if available from finalization)
+ */
+router.get('/audit/full', async (_, res) => {
+    const ballot = getCachedBallot();
+    const allVotes = voteCache.getAll();
+    const evidenceDir = voteCache.getDocumentsDir();
+
+    const voters: Array<{
+        voterId: string;
+        credentialHrp: string;
+        voteHash: string;
+        ipfsCid: string;
+        version: number;
+        txHash: string;
+        evidence: VoteEvidence | null;
+        history: any[];
+        proof: any | null;
+    }> = [];
+
+    for (const v of allVotes) {
+        let tokenName: string;
+        try { tokenName = voterIdToTokenName(v.voterId); } catch { tokenName = ''; }
+
+        // Read evidence from disk: vote-{tokenName}-v{version}.json
+        let evidence: VoteEvidence | null = null;
+        if (tokenName) {
+            try {
+                const raw = await fs.readFile(path.join(evidenceDir, `vote-${tokenName}-v${v.version}.json`), 'utf-8');
+                evidence = JSON.parse(raw);
+            } catch { /* evidence file may not exist */ }
+        }
+
+        // Read vote history chain from disk
+        const history = await getVoteHistory(v.voterId);
+
+        // Read merkle proof: proofs/{tokenName}.json
+        let proof: any = null;
+        if (tokenName) {
+            try {
+                const raw = await fs.readFile(path.join(evidenceDir, 'proofs', `${tokenName}.json`), 'utf-8');
+                proof = JSON.parse(raw);
+            } catch { /* proof may not exist yet (pre-finalization) */ }
+        }
+
+        voters.push({
+            voterId: v.voterId,
+            credentialHrp: v.credentialHrp,
+            voteHash: v.voteHash,
+            ipfsCid: v.ipfsCid,
+            version: v.version,
+            txHash: v.txHash,
+            evidence,
+            history,
+            proof,
+        });
+    }
+
+    return success(res, {
+        ballot: ballot ?? null,
+        totalVoters: allVotes.length,
+        voters,
     });
 });
 

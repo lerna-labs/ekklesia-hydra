@@ -805,8 +805,42 @@ router.post('/settle', async (req, res) => {
         await logHeadSnapshot('post-finalize', wrangler);
 
         // --- Step 4: Close head — fanout includes ballot token with finalized datum ---
-        // 600s timeout: L1 close observation can be slow after many in-head snapshots
-        await wrangler.waitForHeadClose(600000);
+        // Use the monitor's status tracking to avoid missing events that fired
+        // before the listener was registered (race condition with shared WebSocket).
+        const currentStatus = hydraMonitor.headStatus;
+        debug(`[settle/close] Current monitor status: ${currentStatus}`);
+
+        if (currentStatus === 'FINAL') {
+            debug('[settle/close] Head already finalized');
+        } else if (currentStatus === 'FANOUT_POSSIBLE') {
+            debug('[settle/close] Fanout possible, sending Fanout…');
+            hydraMonitor.ws.send({ tag: 'Fanout' });
+            await hydraMonitor.waitForStatus('FINAL', 600_000);
+        } else if (currentStatus === 'CLOSED') {
+            debug('[settle/close] Head closed, waiting for fanout…');
+            await hydraMonitor.waitForStatus('FANOUT_POSSIBLE', 300_000);
+            hydraMonitor.ws.send({ tag: 'Fanout' });
+            await hydraMonitor.waitForStatus('FINAL', 600_000);
+        } else {
+            // Head is still Open — send Close and wait through the full lifecycle
+            debug('[settle/close] Closing head…');
+            hydraMonitor.ws.send({ tag: 'Close' });
+
+            // Listen for ReadyToFanout to send Fanout command
+            const onStatus = (status: string) => {
+                if (status === 'FANOUT_POSSIBLE') {
+                    debug('[settle/close] Fanout possible, sending Fanout…');
+                    hydraMonitor.ws.send({ tag: 'Fanout' });
+                }
+            };
+            hydraMonitor.on('status', onStatus);
+
+            try {
+                await hydraMonitor.waitForStatus('FINAL', 600_000);
+            } finally {
+                hydraMonitor.removeListener('status', onStatus);
+            }
+        }
 
         steps.push({ step: 'close', status: 'SUCCESS' });
 

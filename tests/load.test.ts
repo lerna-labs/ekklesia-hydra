@@ -301,7 +301,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
 
             if (status !== 200) {
                 console.log(`  [${i}] FAILED (${status}): ${json.message?.slice(0, 100)}`);
-            } else if (i % 5 === 0 || i === VOTER_COUNT - 1) {
+            } else if (i % Math.max(1, Math.floor(VOTER_COUNT / 10)) === 0 || i === VOTER_COUNT - 1) {
                 console.log(`  [${i}/${VOTER_COUNT}] ${durationMs}ms (${utxoCount} UTxOs)`);
             }
         }
@@ -345,7 +345,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
 
             if (status !== 200) {
                 console.log(`  [${i}] FAILED (${status}): ${json.message?.slice(0, 100)}`);
-            } else if (i % 5 === 0 || i === VOTER_COUNT - 1) {
+            } else if (i % Math.max(1, Math.floor(VOTER_COUNT / 10)) === 0 || i === VOTER_COUNT - 1) {
                 console.log(`  [${i}/${VOTER_COUNT}] ${durationMs}ms`);
             }
         }
@@ -997,7 +997,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
             ballotName: instanceAssetName,
             ballotPolicy: policyId,
             closeToken: CLOSE_TOKEN,
-        }, 660_000);
+        }, 1200_000); // 20 min — 1000 sequential burns + finalize + L1 close can exceed 11 min
 
         expect(status).toBe(200);
         console.log(`  Settle completed in ${durationMs}ms`);
@@ -1013,7 +1013,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
             status,
             success: status === 200,
         });
-    }, 720_000);
+    }, 1260_000); // 21 min vitest timeout (exceeds 20 min api timeout)
 
     // ===== Phase 6: Fanout =====
 
