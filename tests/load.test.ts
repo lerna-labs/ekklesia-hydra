@@ -1084,6 +1084,9 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
             closeToken: CLOSE_TOKEN,
         }, 1200_000); // 20 min — 1000 sequential burns + finalize + L1 close can exceed 11 min
 
+        if (status !== 200) {
+            console.log(`  Settle FAILED (${status}): ${JSON.stringify(json).slice(0, 500)}`);
+        }
         expect(status).toBe(200);
         console.log(`  Settle completed in ${durationMs}ms`);
         for (const step of json.data?.steps ?? []) {

@@ -1459,7 +1459,7 @@ router.post('/settle', async (req, res) => {
             totalVoters: headVoters.length,
         });
     } catch (err: any) {
-        console.error('Settlement failed:', err);
+        console.error('Settlement failed:', err?.message, err?.stack);
         return error(res, 'INTERNAL_ERROR', err.message || 'Settlement failed', 500);
     }
 });
