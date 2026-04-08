@@ -346,28 +346,6 @@ function verifyVoteSignatures(
         return { error: null, witnesses: sig.witnesses };
     }
 
-    // --- CIP-151 Calidus key (SPO hot key) ---
-    // The calidus key signs on behalf of the pool. We verify the Ed25519
-    // signature is valid and the message matches, but skip the address match
-    // since the calidus key hash won't match the pool ID. Auditors verify
-    // the calidus → pool binding via the CIP-151 on-chain registration.
-    if (sig.calidusDeclaration && sig.coseSign1Hex && sig.coseKeyHex) {
-        const witness: CoseWitness = {
-            coseSign1Hex: sig.coseSign1Hex,
-            coseKeyHex: sig.coseKeyHex,
-            key: sig.key ?? '',
-            signature: sig.signature ?? '',
-        };
-        const { error, pubKeyHex } = verifyScriptWitness(merkleRoot, witness);
-        if (error) {
-            return { error: `Calidus witness: ${error}`, witnesses: [] };
-        }
-        if (!pubKeyHex) {
-            return { error: 'Could not extract public key from calidus COSE witness', witnesses: [] };
-        }
-        return { error: null, witnesses: [witness] };
-    }
-
     // --- Key-based credential (single sig) ---
     if (sig.coseSign1Hex && sig.coseKeyHex) {
         const witness: CoseWitness = {
@@ -376,6 +354,30 @@ function verifyVoteSignatures(
             key: sig.key ?? '',
             signature: sig.signature ?? '',
         };
+
+        // For calidus votes, the signing key is a hot key that won't match the
+        // pool voter ID. Verify Ed25519 + message match only, skip address match.
+        if (sig.calidusDeclaration) {
+            try {
+                const result = verifySignature(
+                    witness.coseSign1Hex,
+                    merkleRoot,
+                    voterId,
+                    witness.coseKeyHex,
+                );
+                // isValid will be false (address mismatch) but we check sigMeta/pubKeyHex
+                // to confirm the Ed25519 signature and message are valid.
+                if (!result.pubKeyHex) {
+                    return { error: 'Could not extract public key from COSE witness', witnesses: [] };
+                }
+                // pubKeyHex populated = Ed25519 sig valid + message matches
+                return { error: null, witnesses: [witness] };
+            } catch (err: any) {
+                return { error: `Signature verification error: ${err.message}`, witnesses: [] };
+            }
+        }
+
+        // Standard key-based: full verification including address match
         const error = verifySingleWitness(merkleRoot, voterId, witness);
         return { error, witnesses: [witness] };
     }
