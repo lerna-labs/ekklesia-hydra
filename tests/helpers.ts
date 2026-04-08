@@ -152,10 +152,11 @@ export async function generateCalidusSPOKeysBatch(count: number, concurrency = 5
 
 /**
  * Generate Stakeholder (stake) key pairs concurrently.
- * Uses cardano-signer --path stake. Constructs testnet stake address from public key.
+ * Uses cardano-signer --path stake. Constructs testnet stake address from public key
+ * using blake2b-224 (via blakejs) for proper Cardano key hash derivation.
  */
 export async function generateStakeKeysBatch(count: number, concurrency = 50): Promise<DRepKeys[]> {
-    const { createHash } = await import('crypto');
+    const { blake2b } = await import('blakejs');
     const { bech32 } = await import('bech32');
     const results: DRepKeys[] = [];
     for (let i = 0; i < count; i += concurrency) {
@@ -165,10 +166,11 @@ export async function generateStakeKeysBatch(count: number, concurrency = 50): P
                 execAsync('cardano-signer keygen --path stake --json-extended')
                     .then(({ stdout }) => {
                         const json = JSON.parse(stdout);
-                        // Construct testnet stake address: 0xe0 header + blake2b_224(pubkey)
+                        // blake2b-224(pubkey) = proper Cardano key hash (28 bytes)
                         const pubKeyBytes = Buffer.from(json.publicKey, 'hex');
-                        const hash = createHash('blake2b512').update(pubKeyBytes).digest().slice(0, 28);
-                        const addrBytes = Buffer.concat([Buffer.from([0xe0]), hash]);
+                        const keyHash = blake2b(pubKeyBytes, undefined, 28);
+                        // Testnet stake address: 0xe0 header + 28-byte key hash
+                        const addrBytes = Buffer.concat([Buffer.from([0xe0]), Buffer.from(keyHash)]);
                         const words = bech32.toWords(addrBytes);
                         const stakeAddr = bech32.encode('stake_test', words);
                         return { secretKey: json.secretKey, publicKey: json.publicKey, drepId: stakeAddr, role: 'Stakeholder' } as DRepKeys;
@@ -185,8 +187,12 @@ export function signMerkleRoot(merkleRoot: string, secretKey: string, drepAddres
     // Testnet addresses (stake_test, addr_test) require --testnet-magic
     const isTestnet = drepAddress.includes('_test');
     const testnetFlag = isTestnet ? ' --testnet-magic 1' : '';
+    // pool/calidus addresses can't be validated against the key by cardano-signer
+    // when signing with a different key (e.g., calidus key for pool address)
+    const needsNoHashCheck = drepAddress.startsWith('pool') || drepAddress.startsWith('calidus');
+    const noHashCheckFlag = needsNoHashCheck ? ' --nohashcheck' : '';
     const raw = execSync(
-        `cardano-signer sign --cip8 --data "${merkleRoot}" --secret-key "${secretKey}" --address "${drepAddress}"${testnetFlag} --json-extended`,
+        `cardano-signer sign --cip8 --data "${merkleRoot}" --secret-key "${secretKey}" --address "${drepAddress}"${testnetFlag}${noHashCheckFlag} --json-extended`,
         { encoding: 'utf-8' },
     );
     const json = JSON.parse(raw);

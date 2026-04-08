@@ -4,6 +4,7 @@ import {resolveNativeScriptHash} from '@meshsdk/core';
 import {blake2b256, bytesToHex} from '@lerna-labs/hydra-proof';
 import {bech32} from 'bech32';
 import {createHash} from 'crypto';
+import {blake2b} from 'blakejs';
 import {
     appendVoteHistory,
     error,
@@ -327,12 +328,8 @@ function verifyVoteSignatures(
                     witnesses: [],
                 };
             }
-            // Native script keyHash = blake2b-224(pubKey).
-            // The SDK returns the raw Ed25519 pubKeyHex — hash it to get the keyHash.
-            const keyHash = createHash('blake2b512')
-                .update(Buffer.from(pubKeyHex, 'hex'))
-                .digest('hex')
-                .slice(0, 56); // 28 bytes = 56 hex chars
+            // Native script keyHash = blake2b-224(pubKey) — standard Cardano key hash
+            const keyHash = Buffer.from(blake2b(Buffer.from(pubKeyHex, 'hex'), undefined, 28)).toString('hex');
             providedKeyHashes.add(keyHash);
         }
 

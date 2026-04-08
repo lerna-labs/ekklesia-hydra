@@ -4,6 +4,7 @@ import { MeshWallet } from '@meshsdk/core';
 import { TRPClientLogged as Client } from './trp-client.js';
 import { bech32 } from 'bech32';
 import { createHash } from 'crypto';
+import { blake2b } from 'blakejs';
 import { CREDENTIAL_PREFIX } from './types.js';
 import type { VoteCacheEntry, VoteHistoryEntry } from './types.js';
 import { TxQueue } from './tx-queue.js';
@@ -493,11 +494,9 @@ export function voterIdToTokenName(voterId: string): string {
 
     const bytes = bech32.fromWords(decoded.words);
 
-    // blake2b-224: hash to 28 bytes via hex truncation
-    const fullHash = createHash('blake2b512')
-        .update(Buffer.from(bytes))
-        .digest('hex');
-    const hashHex = fullHash.substring(0, 56); // 28 bytes = 56 hex chars
+    // blake2b-224: proper 28-byte output (standard Cardano key hash derivation)
+    const hashBytes = blake2b(Buffer.from(bytes), undefined, 28);
+    const hashHex = Buffer.from(hashBytes).toString('hex');
 
     const prefixHex = prefixByte.toString(16).padStart(2, '0');
     return (prefixHex + hashHex).toLowerCase();
