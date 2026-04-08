@@ -1077,31 +1077,66 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
 
     it('should settle: burn → finalize → close', async () => {
         const settleStart = performance.now();
-        const { status, json, durationMs } = await api('POST', '/settle', {
+
+        // --- Step 1: Burn all voter tokens ---
+        // Call /settle/burn until remaining === 0 (retries handle partial failures)
+        let burnTotal = 0;
+        let burnAttempts = 0;
+        let lastRemaining = Infinity;
+        while (burnAttempts < 10) {
+            burnAttempts++;
+            const { status: burnStatus, json: burnJson } = await api('POST', '/settle/burn', {}, 600_000);
+            if (burnStatus !== 200) {
+                console.log(`  Burn FAILED (${burnStatus}): ${JSON.stringify(burnJson).slice(0, 300)}`);
+                break;
+            }
+            burnTotal += burnJson.data?.burned ?? 0;
+            const remaining = burnJson.data?.remaining ?? 0;
+            console.log(`  Burn pass ${burnAttempts}: burned=${burnJson.data?.burned}, failed=${burnJson.data?.failed}, remaining=${remaining}`);
+            if (remaining === 0) break;
+            // Safety: if remaining isn't decreasing, stop to avoid infinite loop
+            if (remaining >= lastRemaining) {
+                console.log(`  Burn stalled — remaining not decreasing (${remaining} >= ${lastRemaining})`);
+                break;
+            }
+            lastRemaining = remaining;
+        }
+
+        // --- Step 2: Finalize (tally + evidence + datum update) ---
+        const { status: finalizeStatus, json: finalizeJson, durationMs: finalizeDurationMs } = await api('POST', '/settle/finalize', {
             ballotId: prepareTxHash,
             ballotName: instanceAssetName,
             ballotPolicy: policyId,
-            closeToken: CLOSE_TOKEN,
-        }, 1200_000); // 20 min — 1000 sequential burns + finalize + L1 close can exceed 11 min
+        }, 300_000);
 
-        if (status !== 200) {
-            console.log(`  Settle FAILED (${status}): ${JSON.stringify(json).slice(0, 500)}`);
+        if (finalizeStatus !== 200) {
+            console.log(`  Finalize FAILED (${finalizeStatus}): ${JSON.stringify(finalizeJson).slice(0, 500)}`);
         }
-        expect(status).toBe(200);
-        console.log(`  Settle completed in ${durationMs}ms`);
-        for (const step of json.data?.steps ?? []) {
-            console.log(`    ${step.step}: ${step.status}`, step.data ? JSON.stringify(step.data).slice(0, 150) : '');
+        expect(finalizeStatus).toBe(200);
+        console.log(`  Finalized in ${finalizeDurationMs}ms: ${finalizeJson.data?.totalVoters} voters, ${finalizeJson.data?.excludedVoters?.length ?? 0} excluded`);
+
+        // --- Step 3: Close head ---
+        const { status: closeStatus, json: closeJson, durationMs: closeDurationMs } = await api('POST', '/settle/close', {
+            closeToken: CLOSE_TOKEN,
+        }, 660_000);
+
+        if (closeStatus !== 200) {
+            console.log(`  Close FAILED (${closeStatus}): ${JSON.stringify(closeJson).slice(0, 300)}`);
         }
+        expect(closeStatus).toBe(200);
+
+        const totalDurationMs = Math.round(performance.now() - settleStart);
+        console.log(`  Settle completed in ${totalDurationMs}ms (burn: ${burnAttempts} passes, finalize: ${finalizeDurationMs}ms, close: ${closeDurationMs}ms)`);
 
         results.push({
             operation: 'settle',
             voterIndex: -1,
             utxoCount: 1 + VOTER_COUNT,
-            durationMs,
-            status,
-            success: status === 200,
+            durationMs: totalDurationMs,
+            status: closeStatus,
+            success: closeStatus === 200,
         });
-    }, 1260_000); // 21 min vitest timeout (exceeds 20 min api timeout)
+    }, 1260_000); // 21 min vitest timeout
 
     // ===== Phase 6: Fanout =====
 
