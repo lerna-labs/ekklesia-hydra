@@ -14,7 +14,7 @@ setGlobalDispatcher(new Agent({
 
 import express from 'express';
 import { authHeaderMiddleware } from './middleware.js';
-import { HYDRA_NETWORK, VERBOSE, voteCache, hydraMonitor } from './helpers.js';
+import { HYDRA_NETWORK, VERBOSE, voteCache, hydraMonitor, txQueue } from './helpers.js';
 
 import auditRoutes from './routes/audit.js';
 import ballotRoutes from './routes/ballot.js';
@@ -68,6 +68,13 @@ async function start() {
     // Rehydrate vote cache from disk before accepting requests
     const cacheCount = await voteCache.rehydrate();
     console.log(`Vote cache rehydrated: ${cacheCount} entries loaded from disk`);
+
+    // Initialize transaction queue WAL
+    await txQueue.init();
+    const queueStatus = txQueue.status();
+    if (queueStatus.total > 0) {
+        console.log(`TX queue loaded: ${JSON.stringify(queueStatus)}`);
+    }
 
     // Log every raw Hydra WebSocket message for diagnostics.
     // Attached before monitor.start() so we capture Greetings and everything after.

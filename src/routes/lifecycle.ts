@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { Wrangler } from '@lerna-labs/hydra-sdk';
-import { CLOSE_TOKEN, ipfs, voteCache, IPFS_STAGING_DIR, success, error, hydraMonitor, TX_MODE, seedBallotUtxoFromSnapshot, clearUtxoCache, debug } from '../helpers.js';
+import { CLOSE_TOKEN, ipfs, voteCache, IPFS_STAGING_DIR, success, error, hydraMonitor, TX_MODE, seedBallotUtxoFromSnapshot, clearUtxoCache, debug, txQueue } from '../helpers.js';
 import { BALLOT_INSTANCE_PREFIX } from '../types.js';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
@@ -107,6 +107,7 @@ router.post('/start', async (req, res) => {
         try { await fs.rm(path.join(IPFS_STAGING_DIR, 'pre-burn-ledger.json'), { force: true }); } catch { /* ignore */ }
         await voteCache.rehydrate(); // rebuilds in-memory map from now-empty latest/
         clearUtxoCache(); // clear direct-pipeline UTxO ref cache
+        await txQueue.clear(); // clear stale queue entries from previous session
         console.log('Vote cache, history, and ballot cache cleared for new head session.');
 
         // Simple commit — single UTxO (ballot token + gas ADA).
@@ -168,6 +169,29 @@ router.post('/close', async (req, res) => {
     } catch (err: any) {
         console.error('Failed to close head?', err);
         return error(res, 'INTERNAL_ERROR', err.message || 'Failed to close head', 500);
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Transaction Queue endpoints
+// ---------------------------------------------------------------------------
+
+/** GET /queue/status — current queue state. */
+router.get('/queue/status', (_, res) => {
+    return success(res, txQueue.status());
+});
+
+/** POST /queue/drain — block until queue is empty. */
+router.post('/queue/drain', async (req, res) => {
+    const timeoutMs = (req.body?.timeoutMs as number) ?? 600_000;
+    try {
+        if (txQueue.isDrained()) {
+            return success(res, { drained: true, message: 'Queue already empty' });
+        }
+        await txQueue.drain(timeoutMs);
+        return success(res, { drained: true });
+    } catch (err: any) {
+        return error(res, 'INTERNAL_ERROR', err.message, 500);
     }
 });
 

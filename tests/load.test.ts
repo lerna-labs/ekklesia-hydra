@@ -22,6 +22,9 @@ import {
     CLOSE_TOKEN,
     DUMP_ADDRESS,
     generateDRepKeysBatch,
+    generateSPOKeysBatch,
+    generateCalidusSPOKeysBatch,
+    generateStakeKeysBatch,
     signMerkleRoot,
     computeMerkleRoot,
     api,
@@ -116,12 +119,34 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
 
         // Fire off key generation in the background — runs concurrently with
         // sweep, prepare, L1 confirmation, and head open. Awaited before voting.
+        // Mixed voter population: ~60% DRep, ~10% SPO (cold key), ~10% SPO (calidus), ~20% Stakeholder
+        const drepCount = Math.ceil(VOTER_COUNT * 0.6);
+        const spoColdCount = Math.floor(VOTER_COUNT * 0.1);
+        const spoCalidusCount = Math.floor(VOTER_COUNT * 0.1);
+        const stakeCount = VOTER_COUNT - drepCount - spoColdCount - spoCalidusCount;
         const genStart = performance.now();
-        console.log(`  Generating ${VOTER_COUNT} DRep key pairs (concurrent, background)…`);
-        keyGenPromise = generateDRepKeysBatch(VOTER_COUNT).then((keys) => {
+        console.log(`  Generating ${VOTER_COUNT} voter keys (${drepCount} DRep, ${spoColdCount} SPO-cold, ${spoCalidusCount} SPO-calidus, ${stakeCount} Stakeholder)…`);
+        keyGenPromise = Promise.all([
+            generateDRepKeysBatch(drepCount),
+            generateSPOKeysBatch(spoColdCount),
+            generateCalidusSPOKeysBatch(spoCalidusCount),
+            generateStakeKeysBatch(stakeCount),
+        ]).then(([dreps, sposCold, sposCalidus, stakes]) => {
+            const spos = [...sposCold, ...sposCalidus];
+            // Interleave voter types for realistic ordering
+            const all: DRepKeys[] = [];
+            const sources = [dreps, spos, stakes];
+            const indices = [0, 0, 0];
+            while (all.length < VOTER_COUNT) {
+                for (let s = 0; s < sources.length; s++) {
+                    if (indices[s] < sources[s].length) {
+                        all.push(sources[s][indices[s]++]);
+                    }
+                }
+            }
             keyGenDurationMs = Math.round(performance.now() - genStart);
             console.log(`  Keys generated in ${keyGenDurationMs}ms`);
-            return keys;
+            return all;
         });
     });
 
@@ -213,7 +238,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
             endEpoch: 999,
             ekklesia: {
                 namespace: '', votingAuthority: '', context: 'hydra-head',
-                acceptedCredentials: ['0x22'], merkleRoot: '', ballotIpfsCid: '',
+                acceptedCredentials: ['0x22', '0x06', '0xe0'], merkleRoot: '', ballotIpfsCid: '',
                 votingWindow: {
                     open: new Date((votingOpenTime = Date.now() + 360_000)).toISOString(),
                     close: new Date(Date.now() + 86_400_000).toISOString(),
@@ -282,13 +307,20 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
             const votes = [{ questionId: 'q1', selection: [1] }]; // Yes
             const payload: SignedVotePayload = { ballotId: prepareTxHash, nonce: 1, votes };
             const merkleRoot = computeMerkleRoot(payload);
-            const signature = signMerkleRoot(merkleRoot, voter.secretKey, voter.drepId);
+            // For calidus voters, sign with the calidus key but use pool ID as voter address
+            const signingAddress = voter.calidusId ?? voter.drepId;
+            const sig = signMerkleRoot(merkleRoot, voter.secretKey, signingAddress);
+            const signature: any = { ...sig };
+            if (voter.calidusId) {
+                signature.calidusDeclaration = { calidusId: voter.calidusId };
+            }
 
             const { status, json, durationMs } = await api('POST', '/vote-and-register', {
                 voterId: voter.drepId,
                 ballotId: prepareTxHash,
                 votes,
                 signature,
+                responderRole: voter.role,
             });
 
             const utxoCount = 1 + (i + 1); // ballot token + i voter tokens
@@ -324,7 +356,10 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
             const votes = [{ questionId: 'q1', selection: [0] }]; // Changed to No
             const payload: SignedVotePayload = { ballotId: prepareTxHash, nonce: 2, votes };
             const merkleRoot = computeMerkleRoot(payload);
-            const signature = signMerkleRoot(merkleRoot, voter.secretKey, voter.drepId);
+            const signingAddress = voter.calidusId ?? voter.drepId;
+            const sig = signMerkleRoot(merkleRoot, voter.secretKey, signingAddress);
+            const signature: any = { ...sig };
+            if (voter.calidusId) signature.calidusDeclaration = { calidusId: voter.calidusId };
 
             const { status, json, durationMs } = await api('POST', '/vote', {
                 voterId: voter.drepId,
@@ -332,6 +367,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
                 ballotId: prepareTxHash,
                 votes,
                 signature,
+                responderRole: voter.role,
             });
 
             const utxoCount = 1 + VOTER_COUNT; // stable count during updates
@@ -391,6 +427,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
                     ballotId: prepareTxHash,
                     votes,
                     signature,
+                    responderRole: voter.role,
                 });
                 return { index: i, status, durationMs, message: json.message?.slice(0, 80), code: json.code };
             } catch (err: any) {
@@ -505,6 +542,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
                     ballotId: prepareTxHash,
                     votes,
                     signature,
+                    responderRole: voter.role,
                 });
                 return { index: i, status, durationMs, message: json.message?.slice(0, 80), code: json.code };
             } catch (err: any) {

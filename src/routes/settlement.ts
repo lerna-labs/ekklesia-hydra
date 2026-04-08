@@ -3,10 +3,10 @@ import { MeshTxBuilder } from '@meshsdk/core';
 import { createNativeScript, submitTx, Wrangler } from '@lerna-labs/hydra-sdk';
 import { blake2b256, bytesToHex, computePackage } from '@lerna-labs/hydra-proof';
 import type { FileLeaf } from '@lerna-labs/hydra-proof';
-import { initialize, voterIdToTokenName, TRP_URL, CLOSE_TOKEN, VERBOSE, IPFS_STAGING_DIR, ipfs, voteCache, success, error, debug, parseTrpSubmitResponse, submitWithRetry, hydraMonitor, getHeadId, TX_MODE, getBallotUtxo, setBallotUtxo, getVoterUtxo, deleteVoterUtxo, submitDirect, submitDirectBatch } from '../helpers.js';
+import { initialize, voterIdToTokenName, TRP_URL, CLOSE_TOKEN, VERBOSE, IPFS_STAGING_DIR, ipfs, voteCache, success, error, debug, parseTrpSubmitResponse, submitWithRetry, hydraMonitor, getHeadId, TX_MODE, getBallotUtxo, setBallotUtxo, getVoterUtxo, deleteVoterUtxo, submitDirect, submitDirectBatch, txQueue } from '../helpers.js';
 import { buildCountVoteTx, buildFinalizeBallotTx, hydraValueToAmounts } from '../tx-builder.js';
 import { getCachedBallot } from './lifecycle.js';
-import { BALLOT_INSTANCE_PREFIX, BALLOT_DEFINITION_PREFIX, BallotStatus } from '../types.js';
+import { BALLOT_INSTANCE_PREFIX, BALLOT_DEFINITION_PREFIX, BallotStatus, HRP_TO_ROLE } from '../types.js';
 import type {
     FullResults,
     QuestionTally,
@@ -236,11 +236,16 @@ interface VoterRef {
  *
  * Evidence files are looked up by `vote-{tokenName}-v{version}.json`.
  */
+/**
+ * Tally results, return per-role breakdowns + raw aggregate.
+ *
+ * Also returns `votersByRole` counts for the FullResults.
+ */
 async function tallyVotes(
     ballot: BallotDefinition,
     voters: VoterRef[],
     evidenceDir: string,
-): Promise<QuestionTally[]> {
+): Promise<{ tallies: QuestionTally[]; votersByRole: Record<string, number> }> {
     const fs = await import('node:fs/promises');
     const path = await import('node:path');
 
@@ -255,54 +260,86 @@ async function tallyVotes(
         }
     }
 
-    return ballot.questions.map((q) => {
-        const counts = new Map<number, number>();
+    // Count voters per role
+    const votersByRole: Record<string, number> = {};
+    for (const evidence of evidenceList) {
+        const hrp = evidence.ekklesia?.credentialHrp ?? 'drep';
+        const role = HRP_TO_ROLE[hrp] ?? evidence.responderRole ?? 'Unknown';
+        votersByRole[role] = (votersByRole[role] ?? 0) + 1;
+    }
+
+    // Discover all roles present
+    const roles = new Set(Object.keys(votersByRole));
+
+    const tallies = ballot.questions.map((q) => {
+        // Per-role counts
+        const roleCounts = new Map<string, Map<number, number>>();
+        // Aggregate counts
+        const rawCounts = new Map<number, number>();
+
+        // Initialize all options to 0
         if (q.options) {
             for (const opt of q.options) {
-                counts.set(opt.value, 0);
+                rawCounts.set(opt.value, 0);
+                for (const role of roles) {
+                    if (!roleCounts.has(role)) roleCounts.set(role, new Map());
+                    roleCounts.get(role)!.set(opt.value, 0);
+                }
             }
         }
 
+        // Count votes grouped by role
         for (const evidence of evidenceList) {
+            const hrp = evidence.ekklesia?.credentialHrp ?? 'drep';
+            const role = HRP_TO_ROLE[hrp] ?? evidence.responderRole ?? 'Unknown';
+            if (!roleCounts.has(role)) roleCounts.set(role, new Map());
+            const rc = roleCounts.get(role)!;
+
             const answer = evidence.answers.find((a) => a.questionId === q.questionId);
             if (!answer) continue;
 
+            const addVote = (option: number, weight = 1) => {
+                rawCounts.set(option, (rawCounts.get(option) ?? 0) + weight);
+                rc.set(option, (rc.get(option) ?? 0) + weight);
+            };
+
             if (answer.selection) {
-                for (const v of answer.selection) {
-                    counts.set(v, (counts.get(v) ?? 0) + 1);
-                }
+                for (const v of answer.selection) addVote(v);
             }
             if (answer.ranking) {
                 const firstPref = answer.ranking[0];
-                if (firstPref !== undefined) {
-                    counts.set(firstPref, (counts.get(firstPref) ?? 0) + 1);
-                }
+                if (firstPref !== undefined) addVote(firstPref);
             }
             if (answer.weights) {
-                for (const w of answer.weights) {
-                    counts.set(w.option, (counts.get(w.option) ?? 0) + w.weight);
-                }
+                for (const w of answer.weights) addVote(w.option, w.weight);
             }
         }
 
-        const results: OptionTally[] = Array.from(counts.entries()).map(
-            ([option, count]) => ({
-                option,
-                count,
-                weight: '0',
-            }),
-        );
+        // Build roleResults
+        const roleResults: Record<string, { weightingMode: string; results: OptionTally[] }> = {};
 
-        return {
-            questionId: q.questionId,
-            roleResults: {
-                raw: {
-                    weightingMode: 'Unweighted',
-                    results,
-                },
-            },
+        // Per-role buckets
+        for (const [role, counts] of roleCounts) {
+            roleResults[role] = {
+                weightingMode: 'Unweighted',
+                results: Array.from(counts.entries()).map(([option, count]) => ({
+                    option, count, weight: '0',
+                })),
+            };
+        }
+
+        // Raw aggregate (all roles combined)
+        roleResults.raw = {
+            weightingMode: 'Unweighted',
+            results: Array.from(rawCounts.entries()).map(([option, count]) => ({
+                option, count, weight: '0',
+            })),
         };
+
+        return { questionId: q.questionId, roleResults };
     });
+
+    return { tallies, votersByRole };
 }
 
 /**
@@ -373,7 +410,7 @@ router.post('/finalize', async (req, res) => {
         const evidenceMerkleRoot = proofPackage.rootHex;
 
         // --- 3. Tally ---
-        const tallies = await tallyVotes(ballot, voterRefs, voteCache.getDocumentsDir());
+        const { tallies, votersByRole } = await tallyVotes(ballot, voterRefs, voteCache.getDocumentsDir());
 
         // --- 4. Build full results object ---
         const fullResults: FullResults = {
@@ -382,6 +419,7 @@ router.post('/finalize', async (req, res) => {
             status: 'finalized',
             tallies,
             totalVoters: allVotes.length,
+            votersByRole,
             evidenceIpfsCid: '', // filled after pinning
             headId: getHeadId() ?? '',
             finalizedAt: new Date().toISOString(),
@@ -555,6 +593,12 @@ router.post('/count', async (req, res) => {
  *   ballotPolicy?: string   — optional, derived from admin wallet if omitted
  */
 router.post('/settle/burn', async (req, res) => {
+    // Ensure vote queue is drained before settlement begins
+    if (!txQueue.isDrained()) {
+        const qs = txQueue.status();
+        return error(res, 'INVALID_INPUT', `Cannot settle: ${qs.built + qs.submitted + qs.accepted} vote(s) still in queue. Wait for queue to drain first.`, 400);
+    }
+
     try {
         const { admin_wallet, client } = await initialize();
         if (!admin_wallet || !client) {
@@ -784,7 +828,7 @@ router.post('/settle/finalize', async (req, res) => {
         }));
         const proofPackage = computePackage(fileLeaves, 'content+path');
         const evidenceMerkleRoot = proofPackage.rootHex;
-        const tallies = await tallyVotes(ballot, verifiedVoters, evidenceDir);
+        const { tallies, votersByRole } = await tallyVotes(ballot, verifiedVoters, evidenceDir);
 
         const fullResults: FullResults = {
             specVersion: '0.3.0',
@@ -792,6 +836,7 @@ router.post('/settle/finalize', async (req, res) => {
             status: 'finalized',
             tallies,
             totalVoters: verifiedVoters.length,
+            votersByRole,
             evidenceIpfsCid: '',
             headId: getHeadId() ?? '',
             finalizedAt: new Date().toISOString(),
@@ -1221,7 +1266,7 @@ router.post('/settle', async (req, res) => {
         }));
         const proofPackage = computePackage(fileLeaves, 'content+path');
         const evidenceMerkleRoot = proofPackage.rootHex;
-        const tallies = await tallyVotes(ballot, verifiedVoters, evidenceDir);
+        const { tallies, votersByRole } = await tallyVotes(ballot, verifiedVoters, evidenceDir);
 
         const fullResults: FullResults = {
             specVersion: '0.3.0',
@@ -1229,6 +1274,7 @@ router.post('/settle', async (req, res) => {
             status: 'finalized',
             tallies,
             totalVoters: verifiedVoters.length,
+            votersByRole,
             evidenceIpfsCid: '',
             headId: getHeadId() ?? '',
             finalizedAt: new Date().toISOString(),

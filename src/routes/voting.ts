@@ -349,6 +349,28 @@ function verifyVoteSignatures(
         return { error: null, witnesses: sig.witnesses };
     }
 
+    // --- CIP-151 Calidus key (SPO hot key) ---
+    // The calidus key signs on behalf of the pool. We verify the Ed25519
+    // signature is valid and the message matches, but skip the address match
+    // since the calidus key hash won't match the pool ID. Auditors verify
+    // the calidus → pool binding via the CIP-151 on-chain registration.
+    if (sig.calidusDeclaration && sig.coseSign1Hex && sig.coseKeyHex) {
+        const witness: CoseWitness = {
+            coseSign1Hex: sig.coseSign1Hex,
+            coseKeyHex: sig.coseKeyHex,
+            key: sig.key ?? '',
+            signature: sig.signature ?? '',
+        };
+        const { error, pubKeyHex } = verifyScriptWitness(merkleRoot, witness);
+        if (error) {
+            return { error: `Calidus witness: ${error}`, witnesses: [] };
+        }
+        if (!pubKeyHex) {
+            return { error: 'Could not extract public key from calidus COSE witness', witnesses: [] };
+        }
+        return { error: null, witnesses: [witness] };
+    }
+
     // --- Key-based credential (single sig) ---
     if (sig.coseSign1Hex && sig.coseKeyHex) {
         const witness: CoseWitness = {
@@ -430,6 +452,7 @@ async function voteValidateAndPin(input: VotePipelineInput): Promise<VotePipelin
             signedPayload,
             witnesses,
             nativeScript: signature.nativeScript,
+            calidusDeclaration: signature.calidusDeclaration,
             merkleProof: { root: '', steps: [] },
         },
     };

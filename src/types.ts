@@ -21,13 +21,26 @@ export const BALLOT_INSTANCE_PREFIX = '00259a20';
 export const CREDENTIAL_PREFIX: Record<string, number> = {
     drep: 0x22,
     stake: 0xe0,
+    stake_test: 0xe0,
     pool: 0x06,
+    calidus: 0x06,      // Calidus keys represent an SPO — use same prefix as pool
     addr: 0x60,
     addr_test: 0x60,
 };
 
 /** All recognized bech32 HRPs for voter identification. */
 export type VoterHrp = keyof typeof CREDENTIAL_PREFIX;
+
+/** Map bech32 HRP to human-readable voter role for tally grouping. */
+export const HRP_TO_ROLE: Record<string, string> = {
+    drep: 'DRep',
+    pool: 'SPO',
+    calidus: 'SPO',     // Calidus is an SPO hot key — counts as SPO vote
+    stake: 'Stakeholder',
+    stake_test: 'Stakeholder',
+    addr: 'Stakeholder',
+    addr_test: 'Stakeholder',
+};
 
 // ---------------------------------------------------------------------------
 // Ballot Definition — (600) token datum, immutable on L1
@@ -232,6 +245,8 @@ export interface FullResults {
     evidenceIpfsCid: string;
     headId: string;
     finalizedAt: string;
+    /** Per-role voter counts (e.g., { DRep: 800, SPO: 200 }). */
+    votersByRole?: Record<string, number>;
     /** Voters excluded from results — on-chain token existed but evidence could not be verified. */
     excludedVoters?: Array<{ tokenName: string; reason: string }>;
 }
@@ -317,11 +332,26 @@ export interface CoseWitness {
  *
  * The API accepts either shape — single-key is a convenience shorthand.
  */
+/**
+ * CIP-151 Calidus key declaration.
+ *
+ * When an SPO votes using a calidus hot key instead of their pool cold key,
+ * the voter ID is still the pool bech32 (pool1...). The calidus key is only
+ * the signing witness — included in the evidence package so auditors can
+ * verify the CIP-151 on-chain registration binding (calidus key → pool ID).
+ */
+export interface CalidusDeclaration {
+    /** bech32 calidus key ID (calidus1...) — the hot key that signed the vote. */
+    calidusId: string;
+}
+
 export interface VoteSignatureData extends Partial<CoseWitness> {
     /** For script-based DReps: the native script definition. */
     nativeScript?: NativeScriptDef;
     /** For script-based DReps: all witness signatures needed to satisfy the script. */
     witnesses?: CoseWitness[];
+    /** For CIP-151 calidus key votes: declares which pool this key represents. */
+    calidusDeclaration?: CalidusDeclaration;
 }
 
 /**
@@ -351,6 +381,8 @@ export interface EkklesiaVoteExtension {
     witnesses: CoseWitness[];
     /** For script-based credentials: the native script definition used for verification. */
     nativeScript?: NativeScriptDef;
+    /** For CIP-151 calidus key votes: identifies the hot key that signed on behalf of the pool. */
+    calidusDeclaration?: CalidusDeclaration;
     merkleProof: {
         root: string;
         steps: Array<{ siblingHex: string }>;

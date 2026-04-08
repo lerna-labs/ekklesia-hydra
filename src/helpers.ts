@@ -6,6 +6,7 @@ import { bech32 } from 'bech32';
 import { createHash } from 'crypto';
 import { CREDENTIAL_PREFIX } from './types.js';
 import type { VoteCacheEntry, VoteHistoryEntry } from './types.js';
+import { TxQueue } from './tx-queue.js';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import type { Response } from 'express';
@@ -318,6 +319,12 @@ export const voteCache: DiskCache<VoteCacheEntry> = createDiskCache<VoteCacheEnt
     },
     (entry) => entry.voterId,
 );
+
+// ---------------------------------------------------------------------------
+// Transaction Queue (singleton)
+// ---------------------------------------------------------------------------
+
+export const txQueue = new TxQueue(IPFS_STAGING_DIR);
 
 /**
  * Parse a TRP submitTx response. Throws on JSON-RPC errors so the caller

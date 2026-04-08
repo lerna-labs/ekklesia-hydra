@@ -43,7 +43,10 @@ export const DUMP_ADDRESS = process.env.E2E_DUMP_ADDRESS ?? '';
 export interface DRepKeys {
     secretKey: string;
     publicKey: string;
-    drepId: string;
+    drepId: string;         // bech32 voter ID (drep1..., pool1..., stake_test1...)
+    role: string;           // 'DRep' | 'SPO' | 'Stakeholder'
+    /** For CIP-151 calidus-based SPO votes: the calidus bech32 ID (calidus1...). */
+    calidusId?: string;
 }
 
 export interface CoseWitness {
@@ -67,7 +70,7 @@ export interface ApiResponse {
 export function generateDRepKeys(): DRepKeys {
     const raw = execSync('cardano-signer keygen --path drep --json-extended', { encoding: 'utf-8' });
     const json = JSON.parse(raw);
-    return { secretKey: json.secretKey, publicKey: json.publicKey, drepId: json.drepIdBech };
+    return { secretKey: json.secretKey, publicKey: json.publicKey, drepId: json.drepIdBech, role: 'DRep' };
 }
 
 /**
@@ -84,7 +87,91 @@ export async function generateDRepKeysBatch(count: number, concurrency = 50): Pr
                 execAsync('cardano-signer keygen --path drep --json-extended')
                     .then(({ stdout }) => {
                         const json = JSON.parse(stdout);
-                        return { secretKey: json.secretKey, publicKey: json.publicKey, drepId: json.drepIdBech } as DRepKeys;
+                        return { secretKey: json.secretKey, publicKey: json.publicKey, drepId: json.drepIdBech, role: 'DRep' } as DRepKeys;
+                    })
+            ),
+        );
+        results.push(...batch);
+    }
+    return results;
+}
+
+/**
+ * Generate SPO (pool) key pairs concurrently.
+ * Uses cardano-signer --path pool. The pool bech32 ID uses `pool` HRP.
+ */
+export async function generateSPOKeysBatch(count: number, concurrency = 50): Promise<DRepKeys[]> {
+    const results: DRepKeys[] = [];
+    for (let i = 0; i < count; i += concurrency) {
+        const batchSize = Math.min(concurrency, count - i);
+        const batch = await Promise.all(
+            Array.from({ length: batchSize }, () =>
+                execAsync('cardano-signer keygen --path pool --json-extended')
+                    .then(({ stdout }) => {
+                        const json = JSON.parse(stdout);
+                        return { secretKey: json.secretKey, publicKey: json.publicKey, drepId: json.poolIdBech, role: 'SPO' } as DRepKeys;
+                    })
+            ),
+        );
+        results.push(...batch);
+    }
+    return results;
+}
+
+/**
+ * Generate Calidus-based SPO key pairs concurrently.
+ * Each entry has a pool ID (voter identity) + calidus key (signing key).
+ * The voter ID is pool1... but the signature comes from the calidus hot key.
+ */
+export async function generateCalidusSPOKeysBatch(count: number, concurrency = 50): Promise<DRepKeys[]> {
+    const results: DRepKeys[] = [];
+    for (let i = 0; i < count; i += concurrency) {
+        const batchSize = Math.min(concurrency, count - i);
+        const batch = await Promise.all(
+            Array.from({ length: batchSize }, async () => {
+                // Generate both a pool key (for identity) and a calidus key (for signing)
+                const [poolResult, calidusResult] = await Promise.all([
+                    execAsync('cardano-signer keygen --path pool --json-extended'),
+                    execAsync('cardano-signer keygen --path calidus --json-extended'),
+                ]);
+                const poolJson = JSON.parse(poolResult.stdout);
+                const calidusJson = JSON.parse(calidusResult.stdout);
+                return {
+                    secretKey: calidusJson.secretKey,      // sign with calidus key
+                    publicKey: calidusJson.publicKey,
+                    drepId: poolJson.poolIdBech,            // voter ID is the pool
+                    role: 'SPO',
+                    calidusId: calidusJson.calidusIdBech,   // for evidence
+                } as DRepKeys;
+            })
+        );
+        results.push(...batch);
+    }
+    return results;
+}
+
+/**
+ * Generate Stakeholder (stake) key pairs concurrently.
+ * Uses cardano-signer --path stake. Constructs testnet stake address from public key.
+ */
+export async function generateStakeKeysBatch(count: number, concurrency = 50): Promise<DRepKeys[]> {
+    const { createHash } = await import('crypto');
+    const { bech32 } = await import('bech32');
+    const results: DRepKeys[] = [];
+    for (let i = 0; i < count; i += concurrency) {
+        const batchSize = Math.min(concurrency, count - i);
+        const batch = await Promise.all(
+            Array.from({ length: batchSize }, () =>
+                execAsync('cardano-signer keygen --path stake --json-extended')
+                    .then(({ stdout }) => {
+                        const json = JSON.parse(stdout);
+                        // Construct testnet stake address: 0xe0 header + blake2b_224(pubkey)
+                        const pubKeyBytes = Buffer.from(json.publicKey, 'hex');
+                        const hash = createHash('blake2b512').update(pubKeyBytes).digest().slice(0, 28);
+                        const addrBytes = Buffer.concat([Buffer.from([0xe0]), hash]);
+                        const words = bech32.toWords(addrBytes);
+                        const stakeAddr = bech32.encode('stake_test', words);
+                        return { secretKey: json.secretKey, publicKey: json.publicKey, drepId: stakeAddr, role: 'Stakeholder' } as DRepKeys;
                     })
             ),
         );
