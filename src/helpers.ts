@@ -121,7 +121,7 @@ function computeTxHash(cborHex: string): string {
 export async function submitDirect(
     signedCborHex: string,
     unsignedCborHex?: string,
-    timeoutMs = 30_000,
+    timeoutMs = 120_000,
 ): Promise<{ hash: string }> {
     const ws = hydraMonitor.ws;
 
