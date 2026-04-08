@@ -182,8 +182,11 @@ export async function generateStakeKeysBatch(count: number, concurrency = 50): P
 
 /** Sign a merkle root with CIP-8 using cardano-signer. */
 export function signMerkleRoot(merkleRoot: string, secretKey: string, drepAddress: string): CoseWitness {
+    // Testnet addresses (stake_test, addr_test) require --testnet-magic
+    const isTestnet = drepAddress.includes('_test');
+    const testnetFlag = isTestnet ? ' --testnet-magic 1' : '';
     const raw = execSync(
-        `cardano-signer sign --cip8 --data "${merkleRoot}" --secret-key "${secretKey}" --address "${drepAddress}" --json-extended`,
+        `cardano-signer sign --cip8 --data "${merkleRoot}" --secret-key "${secretKey}" --address "${drepAddress}"${testnetFlag} --json-extended`,
         { encoding: 'utf-8' },
     );
     const json = JSON.parse(raw);
