@@ -551,8 +551,28 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
         // No server crashes
         expect(serverErrors.length).toBe(0);
 
+        // Sequentially retry the failed ones so all voters advance
+        if (failed.length > 0) {
+            console.log(`  Retrying ${failed.length} failed concurrent votes sequentially…`);
+            let retried = 0;
+            for (const r of failed) {
+                const voter = concurrentVoters[r.index];
+                const { json: voterState } = await api('GET', `/voter/${voter.drepId}`);
+                const retryNonce = (voterState.data?.version ?? 2) + 1;
+                const votes = [{ questionId: 'q1', selection: [1] }];
+                const payload: SignedVotePayload = { ballotId: prepareTxHash, nonce: retryNonce, votes };
+                const merkleRoot = computeMerkleRoot(payload);
+                const signature = signMerkleRoot(merkleRoot, voter.secretKey, voter.drepId);
+
+                const { status } = await api('POST', '/vote', {
+                    voterId: voter.drepId, nonce: retryNonce, ballotId: prepareTxHash, votes, signature,
+                });
+                if (status === 200) retried++;
+            }
+            console.log(`  Retried: ${retried}/${failed.length} succeeded`);
+        }
+
         // With voter-owned UTxOs, we expect high success rate
-        // (relaxed threshold — even 50% would indicate something is wrong)
         const successRate = succeeded.length / concurrentCount;
         console.log(`  Success rate: ${Math.round(successRate * 100)}%`);
         expect(successRate).toBeGreaterThan(0.5);
