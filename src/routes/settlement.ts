@@ -3,7 +3,7 @@ import { MeshTxBuilder } from '@meshsdk/core';
 import { createNativeScript, submitTx, Wrangler } from '@lerna-labs/hydra-sdk';
 import { blake2b256, bytesToHex, computePackage } from '@lerna-labs/hydra-proof';
 import type { FileLeaf } from '@lerna-labs/hydra-proof';
-import { initialize, voterIdToTokenName, TRP_URL, CLOSE_TOKEN, VERBOSE, IPFS_STAGING_DIR, ipfs, voteCache, success, error, debug, parseTrpSubmitResponse, submitWithRetry, hydraMonitor, getHeadId, TX_MODE, getBallotUtxo, setBallotUtxo, getVoterUtxo, deleteVoterUtxo, submitDirect } from '../helpers.js';
+import { initialize, voterIdToTokenName, TRP_URL, CLOSE_TOKEN, VERBOSE, IPFS_STAGING_DIR, ipfs, voteCache, success, error, debug, parseTrpSubmitResponse, submitWithRetry, hydraMonitor, getHeadId, TX_MODE, getBallotUtxo, setBallotUtxo, getVoterUtxo, deleteVoterUtxo, submitDirect, submitDirectBatch } from '../helpers.js';
 import { buildCountVoteTx, buildFinalizeBallotTx, hydraValueToAmounts } from '../tx-builder.js';
 import { getCachedBallot } from './lifecycle.js';
 import { BALLOT_INSTANCE_PREFIX, BALLOT_DEFINITION_PREFIX, BallotStatus } from '../types.js';
@@ -538,10 +538,440 @@ router.post('/count', async (req, res) => {
 // POST /settle — orchestrate full settlement: burn → decommit+finalize → close
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Stepped settlement endpoints — break the monolithic /settle into discrete
+// steps so each completes within normal HTTP timeout windows.
+// ---------------------------------------------------------------------------
+
+/**
+ * POST /settle/burn
+ *
+ * Burn all voter tokens in the head. Non-blocking per-token — in direct mode
+ * burns are batched concurrently. Returns burn results immediately.
+ *
+ * Call this repeatedly until `remaining === 0` before calling /settle/finalize.
+ *
+ * Body:
+ *   ballotPolicy?: string   — optional, derived from admin wallet if omitted
+ */
+router.post('/settle/burn', async (req, res) => {
+    try {
+        const { admin_wallet, client } = await initialize();
+        if (!admin_wallet || !client) {
+            return error(res, 'WALLET_INIT_FAILED', 'Could not initialize admin wallet or client', 503);
+        }
+
+        const admin_payment_address = admin_wallet.addresses.enterpriseAddressBech32 as string;
+        const {
+            scriptCbor: TOKEN_SCRIPT,
+            scriptHash: TOKEN_POLICY,
+        } = createNativeScript(admin_payment_address);
+
+        const wrangler = new Wrangler(process.env.HYDRA_API_URL, undefined, hydraMonitor);
+        const headVoters = await getVotersFromHead(wrangler, TOKEN_POLICY as string);
+
+        if (headVoters.length === 0) {
+            return success(res, { burned: 0, failed: 0, remaining: 0, total: 0, message: 'No voter tokens to burn' });
+        }
+
+        // Save pre-burn ledger state to disk on the FIRST burn call only.
+        // This is the authoritative record of every voter's on-chain state
+        // at the moment settlement began. Subsequent burn calls (retries for
+        // failed burns) must not overwrite it — the original snapshot is the
+        // source of truth for /settle/finalize.
+        const fs = await import('node:fs/promises');
+        const pathMod = await import('node:path');
+        const ledgerSnapshotPath = pathMod.join(IPFS_STAGING_DIR, 'pre-burn-ledger.json');
+
+        let ledgerExists = false;
+        try {
+            await fs.access(ledgerSnapshotPath);
+            ledgerExists = true;
+        } catch { /* doesn't exist yet */ }
+
+        if (!ledgerExists) {
+            const ledgerSnapshot = headVoters.map(v => ({
+                tokenName: v.tokenName,
+                version: v.version,
+                voteHash: v.voteHash,
+                ipfsCid: v.ipfsCid,
+            }));
+            await fs.writeFile(ledgerSnapshotPath, JSON.stringify(ledgerSnapshot, null, 2));
+            debug(`[settle/burn] Saved pre-burn ledger state: ${headVoters.length} voters → ${ledgerSnapshotPath}`);
+        } else {
+            debug(`[settle/burn] Pre-burn ledger already exists, skipping (retry burn call)`);
+        }
+
+        let burned = 0;
+        let burnFailed = 0;
+
+        if (TX_MODE === 'direct') {
+            const BURN_BATCH_SIZE = 100;
+            const burnTxs: Array<{ signedCborHex: string; unsignedCborHex: string; id: string }> = [];
+
+            for (const voter of headVoters) {
+                try {
+                    const unsignedTx = buildCountVoteTx({
+                        adminAddress: admin_payment_address,
+                        tokenPolicy: TOKEN_POLICY as string,
+                        tokenScript: TOKEN_SCRIPT as string,
+                        userId: voter.tokenName,
+                        inputRef: voter.ref,
+                        inputValue: voter.value,
+                    });
+                    const signedTx = await admin_wallet.signTx(unsignedTx);
+                    burnTxs.push({ signedCborHex: signedTx, unsignedCborHex: unsignedTx, id: voter.tokenName });
+                } catch (err: any) {
+                    console.error(`[settle/burn] Failed to build burn tx for ${voter.tokenName}:`, err.message);
+                    burnFailed++;
+                }
+            }
+
+            for (let i = 0; i < burnTxs.length; i += BURN_BATCH_SIZE) {
+                const batch = burnTxs.slice(i, i + BURN_BATCH_SIZE);
+                debug(`[settle/burn] Batch ${Math.floor(i / BURN_BATCH_SIZE) + 1} (${batch.length} txs)…`);
+                const { succeeded, failed } = await submitDirectBatch(batch);
+                burned += succeeded.size;
+                burnFailed += failed.size;
+                for (const [id] of succeeded) deleteVoterUtxo(id);
+            }
+        } else {
+            // TRP mode: batch burns concurrently (non-contending, each voter has own UTxO)
+            const BURN_BATCH_SIZE = 100;
+            for (let i = 0; i < headVoters.length; i += BURN_BATCH_SIZE) {
+                const batch = headVoters.slice(i, i + BURN_BATCH_SIZE);
+                debug(`[settle/burn] TRP batch ${Math.floor(i / BURN_BATCH_SIZE) + 1} (${batch.length} txs)…`);
+                const batchResults = await Promise.allSettled(batch.map(voter =>
+                    submitWithRetry(
+                        () => client.countVoteTx({
+                            votingAuthority: admin_payment_address,
+                            mintingScript: Buffer.from(TOKEN_SCRIPT as string, 'hex'),
+                            tokenPolicy: Buffer.from(TOKEN_POLICY as string, 'hex'),
+                            userId: Buffer.from(voter.tokenName, 'hex'),
+                        }),
+                        (tx) => admin_wallet.signTx(tx),
+                        `0:${voter.tokenName}`,
+                    ),
+                ));
+                for (let j = 0; j < batchResults.length; j++) {
+                    if (batchResults[j].status === 'fulfilled') {
+                        burned++;
+                    } else {
+                        console.error(`[settle/burn] FULL ERROR for ${batch[j].tokenName}:`, (batchResults[j] as PromiseRejectedResult).reason?.message);
+                        burnFailed++;
+                    }
+                }
+            }
+        }
+
+        // Check how many remain
+        const remaining = await getVotersFromHead(wrangler, TOKEN_POLICY as string);
+
+        return success(res, {
+            burned,
+            failed: burnFailed,
+            remaining: remaining.length,
+            total: headVoters.length,
+        });
+    } catch (err: any) {
+        console.error('[settle/burn] Failed:', err);
+        return error(res, 'INTERNAL_ERROR', err.message || 'Burn failed', 500);
+    }
+});
+
+/**
+ * POST /settle/finalize
+ *
+ * Tally votes, verify evidence, pin to IPFS, update ballot datum.
+ * Only succeeds when all voter tokens have been burned (0 remaining).
+ *
+ * Body:
+ *   ballotId: string       — ballot identifier
+ *   ballotName: string     — hex asset name of the (601) token
+ *   ballotPolicy: string   — hex policy ID
+ */
+router.post('/settle/finalize', async (req, res) => {
+    const { ballotId, ballotName, ballotPolicy } = req.body as {
+        ballotId: string;
+        ballotName: string;
+        ballotPolicy: string;
+    };
+
+    if (!ballotId || !ballotName || !ballotPolicy) {
+        return error(res, 'MISSING_FIELDS', 'Missing required fields: ballotId, ballotName, ballotPolicy', 400);
+    }
+
+    const ballot = getCachedBallot();
+    if (!ballot) {
+        return error(res, 'NO_BALLOT_CACHED', 'No ballot definition cached', 400);
+    }
+
+    try {
+        const { admin_wallet, client } = await initialize();
+        if (!admin_wallet || !client) {
+            return error(res, 'WALLET_INIT_FAILED', 'Could not initialize admin wallet or client', 503);
+        }
+
+        const admin_payment_address = admin_wallet.addresses.enterpriseAddressBech32 as string;
+        const { scriptHash: TOKEN_POLICY } = createNativeScript(admin_payment_address);
+        const wrangler = new Wrangler(process.env.HYDRA_API_URL, undefined, hydraMonitor);
+
+        // Verify all voter tokens are burned
+        const remainingVoters = await getVotersFromHead(wrangler, TOKEN_POLICY as string);
+        if (remainingVoters.length > 0) {
+            return error(res, 'INVALID_INPUT', `Cannot finalize: ${remainingVoters.length} voter token(s) still in head. Call /settle/burn first.`, 400);
+        }
+
+        const fs = await import('node:fs/promises');
+        const pathMod = await import('node:path');
+        const evidenceDir = voteCache.getDocumentsDir();
+
+        // --- Load pre-burn ledger snapshot (written by /settle/burn) ---
+        // This is the authoritative record of every voter's on-chain state
+        // at the moment settlement began — the source of truth for the evidence package.
+        const ledgerSnapshotPath = pathMod.join(IPFS_STAGING_DIR, 'pre-burn-ledger.json');
+        let ledgerVoters: Array<{ tokenName: string; version: number; voteHash: string; ipfsCid: string }>;
+        try {
+            const raw = await fs.readFile(ledgerSnapshotPath, 'utf-8');
+            ledgerVoters = JSON.parse(raw);
+        } catch {
+            return error(res, 'INVALID_INPUT', 'Pre-burn ledger snapshot not found. Call /settle/burn before /settle/finalize.', 400);
+        }
+
+        debug(`[settle/finalize] Loaded pre-burn ledger: ${ledgerVoters.length} voters`);
+
+        // --- Verify evidence against pre-burn ledger state ---
+        // Only voters with matching evidence files make it into the results.
+        // Voters without evidence are flagged for transparency.
+        const verifiedVoters: VoterRef[] = [];
+        const excludedVoters: Array<{ tokenName: string; reason: string }> = [];
+
+        for (const voter of ledgerVoters) {
+            // Try to find matching evidence file on disk
+            const evidenceFile = `vote-${voter.tokenName}-v${voter.version}.json`;
+            const evidencePath = pathMod.join(evidenceDir, evidenceFile);
+            try {
+                const raw = await fs.readFile(evidencePath, 'utf-8');
+                const evidence = JSON.parse(raw);
+                const fileHash = bytesToHex(blake2b256(JSON.stringify(evidence)));
+                if (fileHash === voter.voteHash) {
+                    verifiedVoters.push({
+                        tokenName: voter.tokenName,
+                        version: voter.version,
+                        voteHash: voter.voteHash,
+                    });
+                    continue;
+                }
+                // Hash mismatch
+                excludedVoters.push({
+                    tokenName: voter.tokenName,
+                    reason: `evidence hash mismatch: file=${fileHash.slice(0, 16)}… ledger=${voter.voteHash.slice(0, 16)}…`,
+                });
+            } catch {
+                excludedVoters.push({
+                    tokenName: voter.tokenName,
+                    reason: `evidence file not found: ${evidenceFile}`,
+                });
+            }
+        }
+
+        debug(`[settle/finalize] Verified: ${verifiedVoters.length}, excluded: ${excludedVoters.length}`);
+
+        // Build merkle tree + tally from verified voters only
+        const fileLeaves: FileLeaf[] = verifiedVoters.map(v => ({
+            name: v.tokenName,
+            contentHashHex: v.voteHash,
+        }));
+        const proofPackage = computePackage(fileLeaves, 'content+path');
+        const evidenceMerkleRoot = proofPackage.rootHex;
+        const tallies = await tallyVotes(ballot, verifiedVoters, evidenceDir);
+
+        const fullResults: FullResults = {
+            specVersion: '0.3.0',
+            ballotId,
+            status: 'finalized',
+            tallies,
+            totalVoters: verifiedVoters.length,
+            evidenceIpfsCid: '',
+            headId: getHeadId() ?? '',
+            finalizedAt: new Date().toISOString(),
+            excludedVoters: excludedVoters.length > 0 ? excludedVoters : undefined,
+        };
+
+        // Write proofs + history + exclusions
+        const proofsDir = pathMod.join(evidenceDir, 'proofs');
+        const historyDestDir = pathMod.join(evidenceDir, 'history');
+        await fs.mkdir(proofsDir, { recursive: true });
+        await fs.mkdir(historyDestDir, { recursive: true });
+
+        // Save pre-burn ledger into evidence directory for auditors
+        await fs.copyFile(ledgerSnapshotPath, pathMod.join(evidenceDir, 'pre-burn-ledger.json'));
+
+        // Save exclusions manifest if any
+        if (excludedVoters.length > 0) {
+            await fs.writeFile(
+                pathMod.join(evidenceDir, 'exclusions.json'),
+                JSON.stringify(excludedVoters, null, 2),
+            );
+        }
+
+        const historySrcDir = pathMod.join(IPFS_STAGING_DIR, 'history');
+        try {
+            const historyFiles = await fs.readdir(historySrcDir);
+            for (const file of historyFiles) {
+                await fs.copyFile(pathMod.join(historySrcDir, file), pathMod.join(historyDestDir, file));
+            }
+        } catch { /* history dir may not exist */ }
+
+        for (const file of proofPackage.files) {
+            await fs.writeFile(
+                pathMod.join(proofsDir, `${file.name}.json`),
+                JSON.stringify({ voterId: file.name, contentHashHex: file.contentHashHex, leafHashHex: file.leafHashHex, merkleRoot: evidenceMerkleRoot, proof: file.merkleProof }, null, 2),
+            );
+        }
+
+        // Pin to IPFS
+        await ipfs.pinJson('results.json', fullResults);
+        await ipfs.pinJson('proof-package.json', proofPackage);
+        const { cid: evidenceDirectoryCid } = await ipfs.pinDirectory(evidenceDir);
+        fullResults.evidenceIpfsCid = evidenceDirectoryCid;
+        const resultsHash = bytesToHex(blake2b256(JSON.stringify(fullResults)));
+
+        // Finalize ballot datum in-head
+        let finalizeTxHash: string;
+
+        if (TX_MODE === 'direct') {
+            let ballotUtxo = getBallotUtxo();
+            if (!ballotUtxo) {
+                const snap = await wrangler.http.getSnapshotUtxo();
+                for (const [ref, utxo] of Object.entries(snap)) {
+                    const u = utxo as any;
+                    for (const [pid, assets] of Object.entries(u.value)) {
+                        if (pid === 'lovelace' || typeof assets !== 'object') continue;
+                        for (const name of Object.keys(assets as Record<string, number>)) {
+                            if (name.startsWith(BALLOT_INSTANCE_PREFIX)) {
+                                const [txH, idx] = ref.split('#');
+                                ballotUtxo = { ref: { txHash: txH, outputIndex: parseInt(idx) }, value: hydraValueToAmounts(u.value), datum: u.inlineDatum, address: u.address };
+                                break;
+                            }
+                        }
+                        if (ballotUtxo) break;
+                    }
+                    if (ballotUtxo) break;
+                }
+            }
+            if (!ballotUtxo) throw new Error('Ballot UTxO not found for finalize');
+
+            const unsignedTx = buildFinalizeBallotTx({
+                adminAddress: admin_payment_address,
+                ballotId, resultsHash,
+                evidenceCid: evidenceDirectoryCid,
+                merkleRoot: evidenceMerkleRoot,
+                inputRef: ballotUtxo.ref,
+                inputValue: ballotUtxo.value,
+            });
+            const signedTx = await admin_wallet.signTx(unsignedTx);
+            const result = await submitDirect(signedTx, unsignedTx);
+            finalizeTxHash = result.hash;
+        } else {
+            const result = await submitWithRetry(
+                () => client.finalizeBallotTx({
+                    votingAuthority: admin_payment_address,
+                    ballotPolicy: Buffer.from(ballotPolicy, 'hex'),
+                    ballotToken: Buffer.from(ballotName, 'hex'),
+                    ballotId: Buffer.from(ballotId, 'hex'),
+                    resultsHash: Buffer.from(resultsHash, 'hex'),
+                    evidenceCid: Buffer.from(evidenceDirectoryCid),
+                    merkleRoot: Buffer.from(evidenceMerkleRoot, 'hex'),
+                }),
+                (tx) => admin_wallet.signTx(tx),
+                `0:${ballotName}`,
+            );
+            finalizeTxHash = result.hash;
+        }
+
+        return success(res, {
+            txHash: finalizeTxHash,
+            resultsHash,
+            evidenceDirectoryCid,
+            evidenceMerkleRoot,
+            totalVoters: verifiedVoters.length,
+            excludedVoters: excludedVoters.length > 0 ? excludedVoters : undefined,
+        });
+    } catch (err: any) {
+        console.error('[settle/finalize] Failed:', err);
+        return error(res, 'INTERNAL_ERROR', err.message || 'Finalize failed', 500);
+    }
+});
+
+/**
+ * POST /settle/close
+ *
+ * Close the Hydra head after finalization. Triggers L1 close + fanout.
+ *
+ * Body:
+ *   closeToken: string — required to authorize head close
+ */
+router.post('/settle/close', async (req, res) => {
+    const { closeToken } = req.body as { closeToken: string };
+
+    if (!closeToken || closeToken !== CLOSE_TOKEN) {
+        return error(res, 'CLOSE_TOKEN_INVALID', 'Incorrect close token', 400);
+    }
+
+    try {
+        const currentStatus = hydraMonitor.headStatus;
+        debug(`[settle/close] Current status: ${currentStatus}`);
+
+        if (currentStatus === 'FINAL') {
+            return success(res, { status: 'FINAL', message: 'Head already finalized' });
+        }
+
+        if (currentStatus === 'FANOUT_POSSIBLE') {
+            hydraMonitor.ws.send({ tag: 'Fanout' });
+            await hydraMonitor.waitForStatus('FINAL', 600_000);
+            return success(res, { status: 'FINAL' });
+        }
+
+        if (currentStatus === 'CLOSED') {
+            await hydraMonitor.waitForStatus('FANOUT_POSSIBLE', 300_000);
+            hydraMonitor.ws.send({ tag: 'Fanout' });
+            await hydraMonitor.waitForStatus('FINAL', 600_000);
+            return success(res, { status: 'FINAL' });
+        }
+
+        // Head is still Open — close it
+        hydraMonitor.ws.send({ tag: 'Close' });
+
+        const onStatus = (status: string) => {
+            if (status === 'FANOUT_POSSIBLE') {
+                debug('[settle/close] Fanout possible, sending Fanout…');
+                hydraMonitor.ws.send({ tag: 'Fanout' });
+            }
+        };
+        hydraMonitor.on('status', onStatus);
+
+        try {
+            await hydraMonitor.waitForStatus('FINAL', 600_000);
+        } finally {
+            hydraMonitor.removeListener('status', onStatus);
+        }
+
+        return success(res, { status: 'FINAL' });
+    } catch (err: any) {
+        console.error('[settle/close] Failed:', err);
+        return error(res, 'INTERNAL_ERROR', err.message || 'Close failed', 500);
+    }
+});
+
+// ---------------------------------------------------------------------------
+// POST /settle — monolithic settlement (kept for backwards compatibility)
+// ---------------------------------------------------------------------------
+
 /**
  * POST /settle
  *
- * Full settlement orchestration:
+ * Full settlement orchestration (single request).
  *   1. Burn all voter tokens (in-head via TRP)
  *   2. Tally votes + pin evidence to IPFS
  *   3. Build finalize tx via TRP and submit it as a **decommit** — the ballot
@@ -601,13 +1031,20 @@ router.post('/settle', async (req, res) => {
         // --- Step 1: Burn all voter tokens ---
         // Burns use the UTxO refs captured in the single snapshot from Step 0.
         // All voters are burned regardless of evidence verification status.
+        // Burns are non-contending (each spends a unique voter UTxO), so they
+        // can be batched concurrently in direct mode.
         let burned = 0;
         let burnFailed = 0;
         let burnTotalAttempts = 0;
         let burnMaxAttempts = 0;
-        for (const voter of headVoters) {
-            try {
-                if (TX_MODE === 'direct') {
+
+        if (TX_MODE === 'direct') {
+            // Build all burn txs, then submit in batches
+            const BURN_BATCH_SIZE = 100;
+            const burnTxs: Array<{ signedCborHex: string; unsignedCborHex: string; id: string }> = [];
+
+            for (const voter of headVoters) {
+                try {
                     const unsignedTx = buildCountVoteTx({
                         adminAddress: admin_payment_address,
                         tokenPolicy: TOKEN_POLICY as string,
@@ -617,11 +1054,35 @@ router.post('/settle', async (req, res) => {
                         inputValue: voter.value,
                     });
                     const signedTx = await admin_wallet.signTx(unsignedTx);
-                    await submitDirect(signedTx, unsignedTx);
-                    deleteVoterUtxo(voter.tokenName);
-                    burnTotalAttempts += 1;
-                } else {
-                    const { attempts } = await submitWithRetry(
+                    burnTxs.push({ signedCborHex: signedTx, unsignedCborHex: unsignedTx, id: voter.tokenName });
+                } catch (err: any) {
+                    console.error(`[settle/burn] Failed to build burn tx for ${voter.tokenName}:`, err.message);
+                    burnFailed++;
+                }
+            }
+
+            // Submit in batches
+            for (let i = 0; i < burnTxs.length; i += BURN_BATCH_SIZE) {
+                const batch = burnTxs.slice(i, i + BURN_BATCH_SIZE);
+                debug(`[settle/burn] Submitting batch ${Math.floor(i / BURN_BATCH_SIZE) + 1} (${batch.length} txs)…`);
+                const { succeeded, failed } = await submitDirectBatch(batch);
+                burned += succeeded.size;
+                burnFailed += failed.size;
+                burnTotalAttempts += batch.length;
+
+                for (const [id] of succeeded) deleteVoterUtxo(id);
+                for (const [id, reason] of failed) {
+                    console.error(`[settle/burn] Batch burn failed for ${id}: ${reason.slice(0, 100)}`);
+                }
+            }
+        } else {
+            // TRP mode: batched burns (non-contending, each voter has own UTxO)
+            const BURN_BATCH_SIZE = 100;
+            for (let i = 0; i < headVoters.length; i += BURN_BATCH_SIZE) {
+                const batch = headVoters.slice(i, i + BURN_BATCH_SIZE);
+                debug(`[settle/burn] TRP batch ${Math.floor(i / BURN_BATCH_SIZE) + 1} (${batch.length} txs)…`);
+                const batchResults = await Promise.allSettled(batch.map(voter =>
+                    submitWithRetry(
                         () => client.countVoteTx({
                             votingAuthority: admin_payment_address,
                             mintingScript: Buffer.from(TOKEN_SCRIPT as string, 'hex'),
@@ -630,15 +1091,20 @@ router.post('/settle', async (req, res) => {
                         }),
                         (tx) => admin_wallet.signTx(tx),
                         `0:${voter.tokenName}`,
-                    );
-                    if (attempts > 1) debug(`[settle/burn] Burn for ${voter.tokenName} succeeded after ${attempts} attempts`);
-                    burnTotalAttempts += attempts;
-                    burnMaxAttempts = Math.max(burnMaxAttempts, attempts);
+                    ),
+                ));
+                for (let j = 0; j < batchResults.length; j++) {
+                    const r = batchResults[j];
+                    if (r.status === 'fulfilled') {
+                        const { attempts } = r.value;
+                        burnTotalAttempts += attempts;
+                        burnMaxAttempts = Math.max(burnMaxAttempts, attempts);
+                        burned++;
+                    } else {
+                        console.error(`[settle/burn] FULL ERROR for ${batch[j].tokenName}:`, r.reason?.message);
+                        burnFailed++;
+                    }
                 }
-                burned++;
-            } catch (err: any) {
-                console.error(`[settle/burn] FULL ERROR for token ${voter.tokenName}:`, err);
-                burnFailed++;
             }
         }
 
@@ -660,7 +1126,7 @@ router.post('/settle', async (req, res) => {
                                 inputValue: voter.value,
                             });
                             const signedTx = await admin_wallet.signTx(unsignedTx);
-                            await submitDirect(signedTx, unsignedTx);
+                            await submitDirect(signedTx, unsignedTx, { awaitSnapshot: false });
                         } else {
                             await submitWithRetry(
                                 () => client.countVoteTx({

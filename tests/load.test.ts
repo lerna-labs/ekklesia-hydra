@@ -98,6 +98,7 @@ const voters: DRepKeys[] = [];
 const results: TimedResult[] = [];
 let adversarialResults: Array<{ name: string; status: number; expected: number; code?: string; pass: boolean; durationMs: number }> = [];
 let burstResults: Array<{ phase: string; total: number; succeeded: number; failed: number; fetchErrors: number; elapsedMs: number; times?: number[] }> = [];
+let txMode = 'unknown';
 
 // Key generation runs concurrently with setup phases.
 // Started in beforeAll, awaited before voting begins.
@@ -252,8 +253,9 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
 
         expect(status).toBe(200);
         expect(json.data.ballotCached).toBe(true);
+        txMode = json.data.txMode ?? 'trp';
         setupDurationMs = Math.round(performance.now() - setupStartTime);
-        console.log(`  Head opened (setup: ${Math.round(setupDurationMs / 1000)}s)`);
+        console.log(`  Head opened (setup: ${Math.round(setupDurationMs / 1000)}s, txMode: ${txMode})`);
     }, 660_000);
 
     // ===== Phase 3: Wait for voting window =====
@@ -1110,7 +1112,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
         const log = (s: string) => { lines.push(s); console.log(`  ${s}`); };
 
         log('========== PERFORMANCE SUMMARY ==========');
-        log(`Voters: ${VOTER_COUNT}`);
+        log(`Voters: ${VOTER_COUNT} | TX_MODE: ${txMode}`);
         log(`Key generation: ${Math.round(keyGenDurationMs / 1000)}s (concurrent with setup)`);
         log(`Setup (sweep → prepare → L1 confirm → head open): ${Math.round(setupDurationMs / 1000)}s`);
         log(`Timestamp: ${new Date().toISOString()}`);
@@ -1242,7 +1244,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
         // --- Write raw results as JSON ---
         const jsonPath = path.join(reportDir, `load-${VOTER_COUNT}v-${timestamp}.json`);
         await fs.writeFile(jsonPath, JSON.stringify({
-            config: { voters: VOTER_COUNT, timestamp: new Date().toISOString() },
+            config: { voters: VOTER_COUNT, txMode, timestamp: new Date().toISOString() },
             summary: lines,
             softFailures,
             hardBail,

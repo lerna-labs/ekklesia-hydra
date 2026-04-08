@@ -103,6 +103,8 @@ router.post('/start', async (req, res) => {
         for (const dir of [votesDir, latestDir, historyDir]) {
             try { await fs.rm(dir, { recursive: true, force: true }); } catch { /* ignore */ }
         }
+        // Remove stale pre-burn ledger from previous session
+        try { await fs.rm(path.join(IPFS_STAGING_DIR, 'pre-burn-ledger.json'), { force: true }); } catch { /* ignore */ }
         await voteCache.rehydrate(); // rebuilds in-memory map from now-empty latest/
         clearUtxoCache(); // clear direct-pipeline UTxO ref cache
         console.log('Vote cache, history, and ballot cache cleared for new head session.');

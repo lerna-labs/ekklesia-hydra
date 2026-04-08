@@ -118,11 +118,21 @@ function computeTxHash(cborHex: string): string {
     return deserializeTx(cborHex).body().hash();
 }
 
+export interface SubmitDirectOptions {
+    timeoutMs?: number;
+    /** Wait for SnapshotConfirmed before resolving. Default true.
+     *  Set to false for non-contending operations (cast_vote, burns)
+     *  where the tx spends a unique UTxO and no other tx depends on it. */
+    awaitSnapshot?: boolean;
+}
+
 export async function submitDirect(
     signedCborHex: string,
     unsignedCborHex?: string,
-    timeoutMs = 120_000,
+    options?: SubmitDirectOptions,
 ): Promise<{ hash: string }> {
+    const timeoutMs = options?.timeoutMs ?? 120_000;
+    const awaitSnapshot = options?.awaitSnapshot ?? true;
     const ws = hydraMonitor.ws;
 
     if (ws.connectionState !== 'CONNECTED') {
@@ -130,10 +140,8 @@ export async function submitDirect(
         await ws.waitForGreetings();
     }
 
-    // Compute expected tx hash for message correlation.
-    // Use unsigned CBOR if provided (avoids re-parsing), otherwise use signed.
     const expectedTxId = computeTxHash(unsignedCborHex ?? signedCborHex);
-    debug(`[submitDirect] Submitting tx ${expectedTxId.slice(0, 16)}…`);
+    debug(`[submitDirect] Submitting tx ${expectedTxId.slice(0, 16)}… (awaitSnapshot=${awaitSnapshot})`);
 
     return new Promise((resolve, reject) => {
         let settled = false;
@@ -155,8 +163,12 @@ export async function submitDirect(
         const onMsg = (msg: any) => {
             if (msg.tag === 'TxValid' && msg.transactionId === expectedTxId) {
                 debug(`[submitDirect] TxValid accepted: ${expectedTxId.slice(0, 16)}…`);
+                if (!awaitSnapshot) {
+                    // Non-contending: resolve immediately on TxValid
+                    settle(resolve, { hash: expectedTxId });
+                    return;
+                }
                 txAccepted = true;
-                // Don't resolve yet — wait for SnapshotConfirmed
             } else if (msg.tag === 'TxInvalid') {
                 const invalidTxId = msg.transaction?.txId ?? msg.txId ?? '';
                 if (invalidTxId === expectedTxId) {
@@ -165,7 +177,6 @@ export async function submitDirect(
                     settle(reject, new Error(`TxInvalid: ${reason}`));
                 }
             } else if (msg.tag === 'SnapshotConfirmed' && txAccepted) {
-                // Check if our tx is in the confirmed list
                 const confirmed: any[] = msg.snapshot?.confirmed ?? msg.confirmed ?? [];
                 const found = confirmed.some((tx: any) => tx.txId === expectedTxId);
                 if (found) {
@@ -185,6 +196,97 @@ export async function submitDirect(
                 cborHex: signedCborHex,
             },
         });
+    });
+}
+
+/**
+ * Submit a batch of transactions concurrently via WebSocket.
+ * Resolves on TxValid for each tx (no SnapshotConfirmed wait — batched burns are non-contending).
+ * Returns results keyed by the provided `id` for each tx.
+ */
+export async function submitDirectBatch(
+    txs: Array<{ signedCborHex: string; unsignedCborHex: string; id: string }>,
+    timeoutMs = 120_000,
+): Promise<{ succeeded: Map<string, string>; failed: Map<string, string> }> {
+    const ws = hydraMonitor.ws;
+
+    if (ws.connectionState !== 'CONNECTED') {
+        debug('[submitDirectBatch] WebSocket not connected, reconnecting…');
+        await ws.waitForGreetings();
+    }
+
+    // Compute tx hashes upfront and build lookup maps
+    const hashToId = new Map<string, string>();
+    const txEntries: Array<{ id: string; hash: string; signedCborHex: string }> = [];
+    for (const tx of txs) {
+        const hash = computeTxHash(tx.unsignedCborHex);
+        hashToId.set(hash, tx.id);
+        txEntries.push({ id: tx.id, hash, signedCborHex: tx.signedCborHex });
+    }
+
+    debug(`[submitDirectBatch] Submitting ${txs.length} txs…`);
+
+    return new Promise((resolve, reject) => {
+        const succeeded = new Map<string, string>(); // id → txHash
+        const failed = new Map<string, string>();     // id → reason
+        let settled = false;
+        const total = txEntries.length;
+
+        const checkDone = () => {
+            if (succeeded.size + failed.size >= total) {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                ws.removeListener('message', onMsg);
+                resolve({ succeeded, failed });
+            }
+        };
+
+        const timer = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            ws.removeListener('message', onMsg);
+            // Mark remaining as timed out
+            for (const entry of txEntries) {
+                if (!succeeded.has(entry.id) && !failed.has(entry.id)) {
+                    failed.set(entry.id, 'timeout');
+                }
+            }
+            resolve({ succeeded, failed });
+        }, timeoutMs);
+
+        const onMsg = (msg: any) => {
+            if (msg.tag === 'TxValid') {
+                const txId = msg.transactionId;
+                const id = hashToId.get(txId);
+                if (id && !succeeded.has(id)) {
+                    succeeded.set(id, txId);
+                    checkDone();
+                }
+            } else if (msg.tag === 'TxInvalid') {
+                const txId = msg.transaction?.txId ?? msg.txId ?? '';
+                const id = hashToId.get(txId);
+                if (id && !failed.has(id)) {
+                    const reason = msg.validationError?.reason ?? 'unknown';
+                    failed.set(id, reason);
+                    checkDone();
+                }
+            }
+        };
+
+        ws.on('message', onMsg);
+
+        // Fire all NewTx messages
+        for (const entry of txEntries) {
+            ws.send({
+                tag: 'NewTx',
+                transaction: {
+                    type: 'Witnessed Tx ConwayEra' as const,
+                    description: '',
+                    cborHex: entry.signedCborHex,
+                },
+            });
+        }
     });
 }
 
