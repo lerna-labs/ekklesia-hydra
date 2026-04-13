@@ -1,0 +1,1376 @@
+openapi: 3.1.0
+info:
+  title: Ekklesia Hydra Middleware API
+  version: 0.3.0
+  description: |
+    Express API middleware that manages voting operations inside a Hydra L2
+    state channel on Cardano. Handles ballot minting on L1, in-head voter
+    registration/voting via TRP, evidence pinning to IPFS, and settlement
+    (finalize → burn → close).
+
+    All responses follow a uniform envelope:
+      - Success: `{ "status": "SUCCESS", "data": { ... } }`
+      - Error:   `{ "status": "ERROR", "code": "...", "message": "..." }`
+
+    All endpoints require the `x-api-key` header except where otherwise noted
+    (the middleware applies globally).
+
+servers:
+  - url: http://localhost:3000
+    description: Local development
+  - url: https://{host}
+    description: Deployed instance
+    variables:
+      host:
+        default: hydra.example.com
+
+security:
+  - ApiKeyAuth: []
+
+tags:
+  - name: Ballot Setup (L1)
+    description: L1 ballot token minting and admin wallet consolidation.
+  - name: Head Lifecycle
+    description: Open / close the Hydra head and inspect head status.
+  - name: Voting (In-Head)
+    description: Voter registration and vote casting. Runs inside the head via TRP.
+  - name: Settlement
+    description: Finalize results, burn voter tokens, close head.
+  - name: Queue
+    description: Inspect and drain the write-ahead log (WAL) for in-head txs.
+  - name: Query
+    description: Ballot, votes, voter lookup, head ledger.
+  - name: Audit
+    description: Verification bundles (live and post-settlement).
+
+paths:
+  # ---------- Ballot Setup (L1) ----------
+  /prepare:
+    post:
+      tags: [Ballot Setup (L1)]
+      summary: Mint (600)+(601) ballot token pair on L1
+      description: |
+        Mints a timelocked native-script policy (all:[sig(admin), before(votingOpenSlot)]),
+        pins the full ballot definition + proof package to IPFS, and submits
+        the L1 minting transaction. The (601) instance token output is what
+        must be committed into the Hydra head via `/start`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [namespace, ballot]
+              properties:
+                namespace:
+                  type: string
+                  example: vote.ekklesia.intersect.budget2026
+                ballot:
+                  $ref: '#/components/schemas/BallotDefinition'
+                gasAmount:
+                  type: integer
+                  description: ADA (not lovelace) to attach to the (601) UTxO for in-head ops.
+                  default: 3
+                cip179:
+                  type: boolean
+                  description: If true, attach CIP-179 surveyDetails as label 17 metadata.
+                  default: false
+                resultsAddress:
+                  type: string
+                  description: |
+                    Where both ballot tokens should eventually live. Echoed back
+                    in the response so the caller can pass it to /start (cached
+                    server-side for the finalize tx that routes (601) here) and
+                    to /prepare/handoff (which moves (600) here after the head
+                    opens). Defaults to admin if omitted.
+      responses:
+        '200':
+          description: Mint transaction submitted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrepareResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /prepare/cancel:
+    post:
+      tags: [Ballot Setup (L1)]
+      summary: Cancel a prepared ballot (burn 600+601)
+      description: |
+        Spends the (600) and (601) UTxOs and burns both tokens under the
+        original native-script minting policy. Only allowed before a head
+        opens and before the timelock buffer is reached — the shared
+        `checkBallotModifiable` guardrail enforces this. Refunded ADA goes
+        to `refundAddress`, or to the admin address if omitted.
+
+        Assumes the tokens are still admin-spendable. If `/prepare` was
+        called with a non-admin `definitionAddress` / `instanceAddress`,
+        cancellation is the caller's responsibility (needs external witnesses).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [namespace, votingWindowOpen, definitionUtxo, instanceUtxo]
+              properties:
+                namespace:
+                  type: string
+                  description: Same namespace used in /prepare — determines fingerprint + asset names.
+                votingWindowOpen:
+                  type: string
+                  format: date-time
+                  description: Same voting-window open timestamp used at /prepare — re-derives the timelocked policy.
+                definitionUtxo:
+                  type: object
+                  required: [txHash, outputIndex]
+                  properties:
+                    txHash: { type: string }
+                    outputIndex: { type: integer, minimum: 0 }
+                instanceUtxo:
+                  type: object
+                  required: [txHash, outputIndex]
+                  properties:
+                    txHash: { type: string }
+                    outputIndex: { type: integer, minimum: 0 }
+                refundAddress:
+                  type: string
+                  description: Where refunded ADA goes. Defaults to the admin address.
+      responses:
+        '200':
+          description: Cancellation submitted
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        type: object
+                        properties:
+                          txHash: { type: string }
+                          cancelled: { type: boolean }
+                          policyId: { type: string }
+                          fingerprint: { type: string }
+                          refundAddress: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /prepare/update:
+    post:
+      tags: [Ballot Setup (L1)]
+      summary: Update a prepared ballot before head opens
+      description: |
+        Spends the (600)+(601) UTxOs and re-emits them with refreshed inline
+        datums. Re-pins the ballot JSON to IPFS, recomputes `merkleRoot`,
+        bumps the datum schema version from 1 → 2 so observers can distinguish
+        updated-pre-open datums from the original mint datums.
+
+        Policy and asset names are **immutable** — the namespace cannot
+        change. To change namespace, call `/prepare/cancel` then `/prepare`.
+        Destination addresses may be changed on update; omitting each field
+        leaves the current UTxO's address untouched.
+
+        Guarded by `checkBallotModifiable` — rejected once a head is active
+        or within the timelock buffer.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [namespace, ballot, definitionUtxo, instanceUtxo]
+              properties:
+                namespace: { type: string }
+                ballot: { $ref: '#/components/schemas/BallotDefinition' }
+                definitionUtxo:
+                  type: object
+                  required: [txHash, outputIndex]
+                  properties:
+                    txHash: { type: string }
+                    outputIndex: { type: integer, minimum: 0 }
+                instanceUtxo:
+                  type: object
+                  required: [txHash, outputIndex]
+                  properties:
+                    txHash: { type: string }
+                    outputIndex: { type: integer, minimum: 0 }
+                gasAmount: { type: integer, default: 3 }
+                cip179: { type: boolean, default: false }
+                resultsAddress: { type: string, description: Echoed back for use by /start and /prepare/handoff. }
+      responses:
+        '200':
+          description: Update submitted — returns new commitUtxos
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrepareResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /prepare/handoff:
+    post:
+      tags: [Ballot Setup (L1)]
+      summary: Move (600) to its final custody address (post-head-open)
+      description: |
+        Spends the (600) ballot definition UTxO at admin and re-outputs it at
+        `destinationAddress` with the original inline datum preserved. Intended
+        to run after `/start` succeeds, when the edit window (update/cancel)
+        is no longer applicable.
+
+        Because (600) never enters the head, this is a pure L1 custody move —
+        the minting policy is untouched, no tokens are minted or burned.
+
+        Guardrail: rejects unless `hydraMonitor.headStatus === 'OPEN'`. This
+        ensures ballots can't be custody-handed-off while still editable.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [definitionUtxo]
+              properties:
+                definitionUtxo:
+                  type: object
+                  required: [txHash, outputIndex]
+                  properties:
+                    txHash: { type: string }
+                    outputIndex: { type: integer, minimum: 0 }
+                destinationAddress:
+                  type: string
+                  description: |
+                    Where (600) lands after handoff. Defaults to the `resultsAddress`
+                    cached during /start; falls back to admin if neither was set.
+                    Native-script addresses (multisig / timelock / permalock)
+                    are supported — the holder must satisfy the script to move
+                    the token further.
+      responses:
+        '200':
+          description: Handoff submitted
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        type: object
+                        properties:
+                          txHash: { type: string }
+                          definitionAsset: { type: string, description: Full asset unit (policyId + assetName) of the moved (600). }
+                          destinationAddress: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /sweep:
+    post:
+      tags: [Ballot Setup (L1)]
+      summary: Consolidate admin wallet UTxOs (L1)
+      description: Sweep native tokens to a dump address and merge fragmented ADA.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                dumpAddress:
+                  type: string
+                  description: Required if wallet holds native tokens.
+      responses:
+        '200':
+          description: Sweep result
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        type: object
+                        properties:
+                          swept: { type: integer }
+                          consolidated: { type: boolean }
+                          utxosBefore: { type: integer }
+                          txHash: { type: string }
+                          message: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  # ---------- Head Lifecycle ----------
+  /health:
+    get:
+      tags: [Head Lifecycle]
+      summary: Hydra node health + head status
+      responses:
+        '200':
+          description: Node reachable
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        type: object
+                        properties:
+                          headStatus: { type: string, example: Open }
+                          headId: { type: string, nullable: true }
+                          nodeVersion: { type: string, nullable: true }
+                          connected: { type: boolean }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /head-info:
+    get:
+      tags: [Head Lifecycle]
+      summary: Full HydraHeadInfo
+      responses:
+        '200':
+          description: Full head info from the monitor
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /start:
+    post:
+      tags: [Head Lifecycle]
+      summary: Commit UTxOs and open head
+      description: |
+        Commits the listed UTxOs (including the (601) ballot token) and waits
+        for the head to reach Open status. Optionally fetches and caches the
+        ballot definition from IPFS. Caches ballot identity (policy/token) for
+        voting routes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [utxos]
+              properties:
+                utxos:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required: [txHash, outputIndex]
+                    properties:
+                      txHash: { type: string }
+                      outputIndex: { type: integer, minimum: 0 }
+                ballotIpfsCid:
+                  type: string
+                  description: Ballot definition CID returned by /prepare. Caches the ballot.
+                ballotPolicy:
+                  type: string
+                  description: Hex policy ID of the ballot tokens.
+                ballotToken:
+                  type: string
+                  description: Hex instance asset name of the (601) token.
+                resultsAddress:
+                  type: string
+                  description: |
+                    Destination for the (601) token after the finalize tx.
+                    Cached server-side and passed into `finalize_ballot` as
+                    `results_address`. If omitted, the finalize output falls
+                    back to the admin payment address.
+      responses:
+        '200':
+          description: Head opened
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        type: object
+                        properties:
+                          ballotCached: { type: boolean }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /close:
+    post:
+      tags: [Head Lifecycle]
+      summary: Close the head (requires close token)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [closeToken]
+              properties:
+                closeToken: { type: string }
+      responses:
+        '200':
+          description: Head closed
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        type: object
+                        properties:
+                          closed: { type: boolean }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  # ---------- Queue ----------
+  /queue/status:
+    get:
+      tags: [Queue]
+      summary: Current WAL queue state
+      responses:
+        '200':
+          description: Queue status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+
+  /queue/drain:
+    post:
+      tags: [Queue]
+      summary: Block until queue is empty
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                timeoutMs: { type: integer, default: 600000 }
+      responses:
+        '200':
+          description: Queue drained
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        type: object
+                        properties:
+                          drained: { type: boolean }
+                          message: { type: string }
+
+  # ---------- Voting ----------
+  /register:
+    post:
+      tags: [Voting (In-Head)]
+      summary: Register a voter (mint voter token in-head)
+      description: |
+        Mints the voter's ephemeral in-head token. Idempotent against existing
+        registration — returns 409 if the voter is already in the cache.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [voterId]
+              properties:
+                voterId:
+                  type: string
+                  description: Bech32 voter ID (drep1…, stake1…, pool1…, addr1…, calidus1…).
+      responses:
+        '200':
+          description: Voter registered
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        type: object
+                        properties:
+                          txHash: { type: string }
+                          tokenName: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /vote:
+    post:
+      tags: [Voting (In-Head)]
+      summary: Cast or update a vote (auto-registers first-time voters)
+      description: |
+        Unified vote endpoint — if the voter is not yet registered, mints their
+        token and casts the first vote in a single atomic tx (vote-and-register).
+        Otherwise updates the existing vote (cast_vote). A per-voter mutex
+        serializes concurrent requests for the same voter.
+
+        Pipeline: validate selections against cached ballot → compute
+        blake2b_256 merkle root of signed payload → verify COSE signature(s) →
+        build VoteEvidence → pin to IPFS → TRP-resolve tx → admin sign →
+        enqueue → await TxValid.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VoteRequest'
+      responses:
+        '200':
+          description: Vote accepted in-head
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VoteResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/SignatureInvalid' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /vote-and-register:
+    post:
+      tags: [Voting (In-Head)]
+      summary: (Deprecated) alias for /vote with nonce defaulted to 1
+      deprecated: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VoteRequest'
+      responses:
+        '200':
+          description: Same as /vote
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VoteResponse'
+
+  # ---------- Settlement ----------
+  /finalize:
+    post:
+      tags: [Settlement]
+      summary: Tally + pin evidence + update (601) datum
+      description: |
+        Cache-based finalization path. Reads the in-memory vote cache, builds
+        merkle tree of evidence, pins results + proof package + evidence
+        directory to IPFS, and submits the finalize tx in-head. Use the
+        stepped `/settle/*` endpoints (or monolithic `/settle`) for full
+        settlement with authoritative on-chain voter query.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SettleFinalizeRequest'
+      responses:
+        '200':
+          description: Finalized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FinalizeResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /count:
+    post:
+      tags: [Settlement]
+      summary: Burn all voter tokens (cache-based iteration)
+      responses:
+        '200':
+          description: Burn results
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        type: object
+                        properties:
+                          burned: { type: integer }
+                          failed: { type: integer }
+                          total: { type: integer }
+                          results:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                voterId: { type: string }
+                                txHash: { type: string }
+                                error: { type: string }
+
+  /settle/burn:
+    post:
+      tags: [Settlement]
+      summary: Stepped burn — burn voter tokens discovered from head UTxOs
+      description: |
+        Queries the head's UTxO set for the authoritative voter list and burns
+        every voter token. Writes a pre-burn ledger snapshot to disk on first
+        call (source of truth for `/settle/finalize`). Idempotent — safe to
+        retry if some burns fail. Call until `remaining === 0`.
+      responses:
+        '200':
+          description: Burn batch result
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        type: object
+                        properties:
+                          burned: { type: integer }
+                          failed: { type: integer }
+                          remaining: { type: integer }
+                          total: { type: integer }
+                          message: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /settle/finalize:
+    post:
+      tags: [Settlement]
+      summary: Stepped finalize — tally, pin, update ballot datum
+      description: |
+        Only succeeds when all voter tokens have been burned. Reads the
+        pre-burn ledger snapshot and verifies each voter's local evidence
+        against the on-chain state before inclusion.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SettleFinalizeRequest'
+      responses:
+        '200':
+          description: Finalized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FinalizeResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /settle/close:
+    post:
+      tags: [Settlement]
+      summary: Stepped close — Close → Fanout → FINAL
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [closeToken]
+              properties:
+                closeToken: { type: string }
+      responses:
+        '200':
+          description: Head reached FINAL
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        type: object
+                        properties:
+                          status: { type: string, example: FINAL }
+                          message: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /settle:
+    post:
+      tags: [Settlement]
+      summary: Monolithic settlement — burn → finalize → close
+      description: |
+        Kept for backwards compatibility. Prefer the stepped endpoints for
+        long-running settlements so each phase completes within normal HTTP
+        timeout windows.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ballotId, ballotName, ballotPolicy, closeToken]
+              properties:
+                ballotId: { type: string }
+                ballotName: { type: string, description: Hex fingerprint (28-byte blake2b_224 of namespace). }
+                ballotPolicy: { type: string, description: Hex policy ID. }
+                closeToken: { type: string }
+      responses:
+        '200':
+          description: Settlement complete
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        type: object
+                        properties:
+                          steps:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                step: { type: string }
+                                status: { type: string }
+                                data: { type: object }
+                                error: { type: string }
+                          resultsHash: { type: string }
+                          evidenceDirectoryCid: { type: string }
+                          evidenceMerkleRoot: { type: string }
+                          totalVoters: { type: integer }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  # ---------- Query ----------
+  /:
+    get:
+      tags: [Query]
+      summary: Liveness probe
+      responses:
+        '200':
+          description: Alive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+
+  /ledger:
+    post:
+      tags: [Query]
+      summary: In-head UTxO set + admin address
+      responses:
+        '200':
+          description: Ledger snapshot
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        type: object
+                        properties:
+                          utxos: { type: object, additionalProperties: true }
+                          admin_wallet: { type: string }
+
+  /ballot:
+    get:
+      tags: [Query]
+      summary: Cached ballot definition (post-/start)
+      responses:
+        '200':
+          description: Ballot
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        $ref: '#/components/schemas/BallotDefinition'
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /votes:
+    get:
+      tags: [Query]
+      summary: All votes (slim view)
+      responses:
+        '200':
+          description: Vote list
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        type: object
+                        properties:
+                          totalVoters: { type: integer }
+                          votes:
+                            type: array
+                            items: { $ref: '#/components/schemas/VoteSummary' }
+
+  /voter/{voterId}:
+    get:
+      tags: [Query]
+      summary: Single voter's cache entry
+      parameters:
+        - name: voterId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Voter found
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data: { $ref: '#/components/schemas/VoteCacheEntry' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /flush-cache:
+    post:
+      tags: [Query]
+      summary: Wipe disk cache + rehydrate (test utility)
+      responses:
+        '200':
+          description: Cache flushed
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        type: object
+                        properties:
+                          cleared: { type: integer }
+                          remaining: { type: integer }
+
+  # ---------- Audit ----------
+  /audit:
+    get:
+      tags: [Audit]
+      summary: Slim verification index (ballot + voter hashes/CIDs)
+      responses:
+        '200':
+          description: Audit index
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        type: object
+                        properties:
+                          ballot:
+                            oneOf:
+                              - $ref: '#/components/schemas/BallotDefinition'
+                              - type: 'null'
+                          ballotCached: { type: boolean }
+                          totalVoters: { type: integer }
+                          voters:
+                            type: array
+                            items: { $ref: '#/components/schemas/VoteSummary' }
+
+  /audit/vote/{voterId}:
+    get:
+      tags: [Audit]
+      summary: Full evidence for a single voter (fetches IPFS)
+      parameters:
+        - name: voterId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Audit bundle
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        type: object
+                        properties:
+                          cacheEntry: { $ref: '#/components/schemas/VoteCacheEntry' }
+                          evidence:
+                            oneOf:
+                              - $ref: '#/components/schemas/VoteEvidence'
+                              - type: 'null'
+                          history:
+                            type: array
+                            items: { $ref: '#/components/schemas/VoteHistoryEntry' }
+                          verification:
+                            type: object
+                            properties:
+                              ipfsCid: { type: string }
+                              expectedVoteHash: { type: string }
+                              historyLength: { type: integer }
+                              instructions:
+                                type: array
+                                items: { type: string }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /audit/full:
+    get:
+      tags: [Audit]
+      summary: Complete audit bundle (disk reads only, no IPFS)
+      responses:
+        '200':
+          description: Audit bundle
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        type: object
+                        properties:
+                          ballot:
+                            oneOf:
+                              - $ref: '#/components/schemas/BallotDefinition'
+                              - type: 'null'
+                          totalVoters: { type: integer }
+                          voters:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                voterId: { type: string }
+                                credentialHrp: { type: string }
+                                voteHash: { type: string }
+                                ipfsCid: { type: string }
+                                version: { type: integer }
+                                txHash: { type: string }
+                                evidence:
+                                  oneOf:
+                                    - $ref: '#/components/schemas/VoteEvidence'
+                                    - type: 'null'
+                                history:
+                                  type: array
+                                  items: { $ref: '#/components/schemas/VoteHistoryEntry' }
+                                proof:
+                                  type: object
+                                  nullable: true
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: x-api-key
+
+  responses:
+    BadRequest:
+      description: Missing or invalid fields
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    Conflict:
+      description: State conflict (e.g., voter already registered, stale nonce)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    NotFound:
+      description: Entity not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    SignatureInvalid:
+      description: COSE signature or script witness verification failed
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    InternalError:
+      description: Internal error
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    Unavailable:
+      description: Downstream dependency (Hydra node / IPFS / wallet) unavailable
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  schemas:
+    # ---------- Envelopes ----------
+    SuccessEnvelope:
+      type: object
+      required: [status, data]
+      properties:
+        status: { type: string, enum: [SUCCESS] }
+        data: { type: object }
+
+    ErrorEnvelope:
+      type: object
+      required: [status, code, message]
+      properties:
+        status: { type: string, enum: [ERROR] }
+        code:
+          type: string
+          description: Machine-readable error code.
+          enum:
+            - UNAUTHORIZED
+            - MISSING_FIELDS
+            - INVALID_INPUT
+            - INVALID_VOTER_ID
+            - SIGNATURE_INVALID
+            - CONFLICT
+            - NO_BALLOT_CACHED
+            - WALLET_INIT_FAILED
+            - CLIENT_INIT_FAILED
+            - CLOSE_TOKEN_INVALID
+            - IPFS_UNAVAILABLE
+            - HYDRA_UNREACHABLE
+            - INTERNAL_ERROR
+        message: { type: string }
+
+    # ---------- Ballot Definition ----------
+    BallotOption:
+      type: object
+      required: [label, value]
+      properties:
+        label: { type: string }
+        value: { type: integer }
+
+    BallotQuestion:
+      type: object
+      required: [questionId, question, method]
+      properties:
+        questionId: { type: string }
+        question: { type: string }
+        description: { type: string }
+        method:
+          type: string
+          enum: [binary, single-choice, multi-choice, range, ranked, weighted]
+        options:
+          type: array
+          items: { $ref: '#/components/schemas/BallotOption' }
+        minSelections: { type: integer }
+        maxSelections: { type: integer }
+        valueRange:
+          type: object
+          properties:
+            min: { type: integer }
+            max: { type: integer }
+        rankCount: { type: integer }
+        budget:
+          type: integer
+          description: For weighted questions — voter's total point allocation.
+
+    RoleWeighting:
+      type: object
+      properties:
+        DRep: { type: string, enum: [CredentialBased, StakeBased] }
+        SPO: { type: string, enum: [CredentialBased, StakeBased, PledgeBased] }
+        CC: { type: string, enum: [CredentialBased] }
+        Stakeholder: { type: string, enum: [StakeBased] }
+
+    EkklesiaBallotExtension:
+      type: object
+      required: [namespace, votingAuthority, context, acceptedCredentials, merkleRoot, ballotIpfsCid, votingWindow]
+      properties:
+        namespace: { type: string }
+        votingAuthority: { type: string }
+        context: { type: string, enum: [hydra-head] }
+        acceptedCredentials:
+          type: array
+          items: { type: string }
+        merkleRoot: { type: string }
+        ballotIpfsCid: { type: string }
+        votingWindow:
+          type: object
+          required: [open, close]
+          properties:
+            open: { type: string, format: date-time }
+            close: { type: string, format: date-time }
+
+    BallotDefinition:
+      type: object
+      required: [specVersion, title, description, questions, roleWeighting, endEpoch, ekklesia]
+      properties:
+        specVersion: { type: string, example: "0.3.0" }
+        title: { type: string }
+        description: { type: string }
+        questions:
+          type: array
+          items: { $ref: '#/components/schemas/BallotQuestion' }
+        roleWeighting: { $ref: '#/components/schemas/RoleWeighting' }
+        endEpoch: { type: integer }
+        ekklesia: { $ref: '#/components/schemas/EkklesiaBallotExtension' }
+
+    PrepareResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessEnvelope'
+        - type: object
+          properties:
+            data:
+              type: object
+              properties:
+                txHash: { type: string }
+                policyId: { type: string, description: Hex policy ID of the timelocked native script. }
+                fingerprint: { type: string, description: 28-byte blake2b_224 of namespace (hex). }
+                definitionAssetName: { type: string, description: Full (600) asset name hex (prefix + fingerprint). }
+                instanceAssetName: { type: string, description: Full (601) asset name hex. }
+                ballotIpfsCid: { type: string }
+                ballotContentHash: { type: string, description: blake2b_256 merkle root of questions. }
+                questionCount: { type: integer }
+                gasAmount: { type: integer }
+                timelockSlot: { type: integer }
+                resultsAddress: { type: string, description: Echoed resultsAddress (defaults to admin if not supplied). }
+                commitUtxos:
+                  type: array
+                  description: UTxOs to commit into the head via /start.
+                  items:
+                    type: object
+                    properties:
+                      txHash: { type: string }
+                      outputIndex: { type: integer }
+                      description: { type: string }
+
+    # ---------- Vote types ----------
+    WeightedEntry:
+      type: object
+      required: [option, weight]
+      properties:
+        option: { type: integer }
+        weight: { type: integer, minimum: 0 }
+
+    VoteSelection:
+      type: object
+      required: [questionId]
+      description: |
+        Exactly one of `selection`, `ranking`, or `weights` must be present,
+        depending on the question's method:
+          - binary / single-choice / multi-choice / range → selection
+          - ranked → ranking
+          - weighted → weights (must sum to the question's budget)
+      properties:
+        questionId: { type: string }
+        selection:
+          type: array
+          items: { type: integer }
+        ranking:
+          type: array
+          items: { type: integer }
+        weights:
+          type: array
+          items: { $ref: '#/components/schemas/WeightedEntry' }
+
+    CoseWitness:
+      type: object
+      required: [coseSign1Hex, coseKeyHex]
+      properties:
+        coseSign1Hex: { type: string }
+        coseKeyHex: { type: string }
+        key: { type: string }
+        signature: { type: string }
+
+    NativeScriptDef:
+      type: object
+      description: Portable native script definition.
+      oneOf:
+        - properties:
+            type: { type: string, enum: [sig] }
+            keyHash: { type: string }
+          required: [type, keyHash]
+        - properties:
+            type: { type: string, enum: [all, any] }
+            scripts:
+              type: array
+              items: { $ref: '#/components/schemas/NativeScriptDef' }
+          required: [type, scripts]
+        - properties:
+            type: { type: string, enum: [atLeast] }
+            required: { type: integer }
+            scripts:
+              type: array
+              items: { $ref: '#/components/schemas/NativeScriptDef' }
+          required: [type, required, scripts]
+        - properties:
+            type: { type: string, enum: [after, before] }
+            slot: { type: string }
+          required: [type, slot]
+
+    CalidusDeclaration:
+      type: object
+      required: [calidusId]
+      properties:
+        calidusId:
+          type: string
+          description: Bech32 calidus key ID (calidus1…). Pool1… voterId still identifies the pool.
+
+    VoteSignatureData:
+      type: object
+      description: |
+        Either key-based (`coseSign1Hex` + `coseKeyHex` in the top-level fields)
+        OR script-based (`nativeScript` + `witnesses[]`). For calidus votes,
+        include `calidusDeclaration`.
+      properties:
+        coseSign1Hex: { type: string }
+        coseKeyHex: { type: string }
+        key: { type: string }
+        signature: { type: string }
+        nativeScript: { $ref: '#/components/schemas/NativeScriptDef' }
+        witnesses:
+          type: array
+          items: { $ref: '#/components/schemas/CoseWitness' }
+        calidusDeclaration: { $ref: '#/components/schemas/CalidusDeclaration' }
+
+    SignedVotePayload:
+      type: object
+      required: [ballotId, nonce, votes]
+      description: Exact payload the voter signs with their COSE key.
+      properties:
+        ballotId: { type: string }
+        nonce: { type: integer }
+        votes:
+          type: array
+          items: { $ref: '#/components/schemas/VoteSelection' }
+
+    EkklesiaVoteExtension:
+      type: object
+      required: [voterId, credentialHrp, nonce, signedPayload, witnesses, merkleProof]
+      properties:
+        voterId: { type: string }
+        credentialHrp: { type: string }
+        nonce: { type: integer }
+        signedPayload: { $ref: '#/components/schemas/SignedVotePayload' }
+        witnesses:
+          type: array
+          items: { $ref: '#/components/schemas/CoseWitness' }
+        nativeScript: { $ref: '#/components/schemas/NativeScriptDef' }
+        calidusDeclaration: { $ref: '#/components/schemas/CalidusDeclaration' }
+        merkleProof:
+          type: object
+          properties:
+            root: { type: string }
+            steps:
+              type: array
+              items:
+                type: object
+                properties:
+                  siblingHex: { type: string }
+
+    VoteEvidence:
+      type: object
+      required: [specVersion, surveyTxId, responderRole, answers, ekklesia]
+      description: Full vote evidence as pinned to IPFS. blake2b_256 of canonical JSON == on-chain voteHash.
+      properties:
+        specVersion: { type: string }
+        surveyTxId: { type: string }
+        responderRole: { type: string }
+        answers:
+          type: array
+          items: { $ref: '#/components/schemas/VoteSelection' }
+        ekklesia: { $ref: '#/components/schemas/EkklesiaVoteExtension' }
+
+    VoteRequest:
+      type: object
+      required: [voterId, ballotId, votes, signature]
+      properties:
+        voterId:
+          type: string
+          description: Bech32 voter ID (drep1… / stake1… / pool1… / addr1… / calidus1…).
+        nonce:
+          type: integer
+          description: |
+            Monotonic version. Optional for first vote (auto-set to 1).
+            For updates must strictly exceed the current on-chain version.
+        ballotId: { type: string }
+        votes:
+          type: array
+          items: { $ref: '#/components/schemas/VoteSelection' }
+        signature: { $ref: '#/components/schemas/VoteSignatureData' }
+        responderRole:
+          type: string
+          description: e.g., "DRep", "SPO", "Stakeholder". Defaults to "DRep".
+
+    VoteResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessEnvelope'
+        - type: object
+          properties:
+            data:
+              type: object
+              properties:
+                txHash: { type: string }
+                voteHash: { type: string }
+                ipfsCid: { type: string }
+                version: { type: integer }
+                tokenName: { type: string }
+                registered:
+                  type: boolean
+                  description: True when this call registered the voter (first vote path).
+
+    VoteSummary:
+      type: object
+      properties:
+        voterId: { type: string }
+        credentialHrp: { type: string }
+        voteHash: { type: string }
+        ipfsCid: { type: string }
+        version: { type: integer }
+        txHash: { type: string }
+        timestamp: { type: integer }
+
+    VoteCacheEntry:
+      type: object
+      required: [voterId, credentialHrp, voteHash, ipfsCid, txHash, version, timestamp]
+      properties:
+        voterId: { type: string }
+        credentialHrp: { type: string }
+        voteHash: { type: string }
+        ipfsCid: { type: string }
+        txHash: { type: string }
+        version: { type: integer }
+        timestamp: { type: integer }
+
+    VoteHistoryEntry:
+      type: object
+      required: [version, voteHash, ipfsCid, txHash, timestamp]
+      properties:
+        version: { type: integer }
+        voteHash: { type: string }
+        ipfsCid: { type: string }
+        txHash: { type: string }
+        prevTxHash: { type: string }
+        timestamp: { type: integer }
+
+    # ---------- Settlement ----------
+    SettleFinalizeRequest:
+      type: object
+      required: [ballotId, ballotName, ballotPolicy]
+      properties:
+        ballotId: { type: string, description: Ballot identifier (ULID or tx hash). }
+        ballotName: { type: string, description: Hex fingerprint of the (601) token. }
+        ballotPolicy: { type: string, description: Hex policy ID of the ballot tokens. }
+
+    FinalizeResponse:
+      allOf:
+        - $ref: '#/components/schemas/SuccessEnvelope'
+        - type: object
+          properties:
+            data:
+              type: object
+              properties:
+                txHash: { type: string }
+                resultsHash: { type: string }
+                evidenceDirectoryCid: { type: string }
+                resultsCid: { type: string }
+                evidenceMerkleRoot: { type: string }
+                totalVoters: { type: integer }
+                excludedVoters:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      tokenName: { type: string }
+                      reason: { type: string }

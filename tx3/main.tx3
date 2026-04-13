@@ -180,6 +180,7 @@ tx finalize_ballot(
     merkle_root: Bytes,
     ballot_policy: Bytes,
     ballot_token: Bytes,
+    results_address: Address,
 ) {
     input gas {
         from: Voting_Authority,
@@ -188,7 +189,7 @@ tx finalize_ballot(
     }
 
     output ballot_result {
-        to: Voting_Authority,
+        to: results_address,
         amount: gas - fees,
         datum: BallotResult {
             Fields: [

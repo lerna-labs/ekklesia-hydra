@@ -283,3 +283,66 @@ export function success(res: Response, data: Record<string, any>, statusCode = 2
 export function error(res: Response, code: ErrorCode, message: string, statusCode: number) {
     return res.status(statusCode).json({ status: 'ERROR', code, message });
 }
+
+// ---------------------------------------------------------------------------
+// Ballot Modification Guardrail
+// ---------------------------------------------------------------------------
+
+/**
+ * Head states that block ballot modification (update or cancel). When the
+ * head is in any of these states the (601) token is either already committed,
+ * in-flight, or has left the middleware's control — the ballot must not be
+ * mutated under us.
+ *
+ * `Unknown`, `Idle`, and `Final` are considered safe: pre-init or fully
+ * settled. Anything else is active.
+ */
+const ACTIVE_HEAD_STATES = new Set([
+    'INITIALIZING',
+    'OPEN',
+    'CLOSED',
+    'FANOUT_POSSIBLE',
+]);
+
+export interface ModifyCheckArgs {
+    /** Absolute slot at which the minting policy timelocks. */
+    votingOpenSlot: number;
+    /** Current tip slot (fetched by the caller from Blockfrost). */
+    currentSlot: number;
+    /** Safety buffer in slots before the timelock — reject if within this window. */
+    bufferSlots?: number;
+}
+
+export type ModifyCheckResult =
+    | { ok: true }
+    | { ok: false; code: 'INVALID_INPUT' | 'CONFLICT'; message: string; statusCode: 400 | 409 };
+
+/**
+ * Shared precondition for /prepare/update and /prepare/cancel.
+ * Checks head status and timelock headroom. UTxO existence must be verified
+ * separately by the caller (it needs the Blockfrost fetcher already in scope).
+ */
+export function checkBallotModifiable(args: ModifyCheckArgs): ModifyCheckResult {
+    const buffer = args.bufferSlots ?? 60;
+    const status = hydraMonitor.headStatus;
+
+    if (status && ACTIVE_HEAD_STATES.has(status)) {
+        return {
+            ok: false,
+            code: 'CONFLICT',
+            message: `Ballot cannot be modified: Hydra head is ${status}. Modifications are only allowed before /start.`,
+            statusCode: 409,
+        };
+    }
+
+    if (args.currentSlot >= args.votingOpenSlot - buffer) {
+        return {
+            ok: false,
+            code: 'CONFLICT',
+            message: `Ballot cannot be modified: current slot ${args.currentSlot} is at or past the minting policy timelock (${args.votingOpenSlot}, buffer ${buffer}).`,
+            statusCode: 409,
+        };
+    }
+
+    return { ok: true };
+}

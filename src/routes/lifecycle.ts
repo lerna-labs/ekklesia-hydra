@@ -14,6 +14,7 @@ const router = Router();
 let cachedBallot: BallotDefinition | null = null;
 let cachedBallotPolicy: string | null = null;
 let cachedBallotToken: string | null = null;
+let cachedResultsAddress: string | null = null;
 
 /** Get the cached ballot definition (used by other routes). */
 export function getCachedBallot(): BallotDefinition | null {
@@ -24,6 +25,15 @@ export function getCachedBallot(): BallotDefinition | null {
 export function getCachedBallotIdentity(): { ballotPolicy: string; ballotToken: string } | null {
     if (!cachedBallotPolicy || !cachedBallotToken) return null;
     return { ballotPolicy: cachedBallotPolicy, ballotToken: cachedBallotToken };
+}
+
+/**
+ * Destination address for the (601) token after finalize. Set during /start
+ * from the `resultsAddress` body field. Null means "send to admin address"
+ * (the default behaviour before this was wired through).
+ */
+export function getCachedResultsAddress(): string | null {
+    return cachedResultsAddress;
 }
 
 router.get('/health', async (_, res) => {
@@ -79,6 +89,7 @@ router.post('/start', async (req, res) => {
     const ballotIpfsCid = req.body.ballotIpfsCid as string | undefined;
     const ballotPolicy = req.body.ballotPolicy as string | undefined;
     const ballotToken = req.body.ballotToken as string | undefined;
+    const resultsAddress = req.body.resultsAddress as string | undefined;
 
     if (!utxos || !Array.isArray(utxos) || utxos.length === 0) {
         return error(res, 'MISSING_FIELDS', 'Missing or empty utxos array. Provide [{txHash, outputIndex}, ...]', 400);
@@ -96,6 +107,7 @@ router.post('/start', async (req, res) => {
         cachedBallot = null;
         cachedBallotPolicy = null;
         cachedBallotToken = null;
+        cachedResultsAddress = null;
         const votesDir = path.join(IPFS_STAGING_DIR, 'votes');
         const latestDir = path.join(IPFS_STAGING_DIR, 'latest');
         const historyDir = path.join(IPFS_STAGING_DIR, 'history');
@@ -128,6 +140,13 @@ router.post('/start', async (req, res) => {
             cachedBallotPolicy = ballotPolicy;
             cachedBallotToken = ballotToken;
             console.log(`Ballot identity cached: policy=${ballotPolicy.slice(0, 16)}… token=${ballotToken.slice(0, 16)}…`);
+        }
+
+        // Cache results address — where the finalized (601) is sent at settlement.
+        // Null means "fall back to admin address" downstream in settlement.ts.
+        if (resultsAddress) {
+            cachedResultsAddress = resultsAddress;
+            console.log(`Results address cached: ${resultsAddress}`);
         }
 
         return success(res, { ballotCached: cachedBallot !== null });
