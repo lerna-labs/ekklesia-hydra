@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { Wrangler } from '@lerna-labs/hydra-sdk';
-import { CLOSE_TOKEN, ipfs, voteCache, IPFS_STAGING_DIR, success, error, hydraMonitor, txQueue } from '../helpers.js';
+import { CLOSE_TOKEN, ipfs, voteCache, IPFS_STAGING_DIR, success, error, hydraMonitor, txQueue, debug } from '../helpers.js';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import type { BallotDefinition } from '../types.js';
@@ -184,8 +184,18 @@ router.post('/start', async (req, res) => {
     }
 });
 
+/**
+ * POST /close — DEPRECATED. Prefer `POST /settle/close`.
+ *
+ * Drives the head through Close → Contesting → Closed → FanoutPossible →
+ * Fanout → Final using the shared HydraMonitor (not a fresh Wrangler with
+ * its own WebSocket). Functionally identical to /settle/close. Kept here
+ * so existing integrations keep working; new callers should hit
+ * `/settle/close` directly to make the intent clear.
+ *
+ * Body: { closeToken: string }
+ */
 router.post('/close', async (req, res) => {
-    const wrangler = new Wrangler(process.env.HYDRA_API_URL, undefined, hydraMonitor);
     const close_token = req.body.closeToken;
 
     if (!close_token || close_token !== CLOSE_TOKEN) {
@@ -194,8 +204,44 @@ router.post('/close', async (req, res) => {
     }
 
     try {
-        await wrangler.waitForHeadClose(180000);
-        return success(res, { closed: true });
+        const currentStatus = hydraMonitor.headStatus;
+        debug(`[close] Current status: ${currentStatus}`);
+
+        if (currentStatus === 'FINAL') {
+            return success(res, { status: 'FINAL', message: 'Head already finalized' });
+        }
+
+        if (currentStatus === 'FANOUT_POSSIBLE') {
+            hydraMonitor.ws.send({ tag: 'Fanout' });
+            await hydraMonitor.waitForStatus('FINAL', 600_000);
+            return success(res, { status: 'FINAL' });
+        }
+
+        if (currentStatus === 'CLOSED') {
+            await hydraMonitor.waitForStatus('FANOUT_POSSIBLE', 300_000);
+            hydraMonitor.ws.send({ tag: 'Fanout' });
+            await hydraMonitor.waitForStatus('FINAL', 600_000);
+            return success(res, { status: 'FINAL' });
+        }
+
+        // Head is still Open — send Close and drive through the full lifecycle.
+        hydraMonitor.ws.send({ tag: 'Close' });
+
+        const onStatus = (status: string) => {
+            if (status === 'FANOUT_POSSIBLE') {
+                debug('[close] Fanout possible, sending Fanout…');
+                hydraMonitor.ws.send({ tag: 'Fanout' });
+            }
+        };
+        hydraMonitor.on('status', onStatus);
+
+        try {
+            await hydraMonitor.waitForStatus('FINAL', 600_000);
+        } finally {
+            hydraMonitor.removeListener('status', onStatus);
+        }
+
+        return success(res, { status: 'FINAL' });
     } catch (err: any) {
         console.error('Failed to close head?', err);
         return error(res, 'INTERNAL_ERROR', err.message || 'Failed to close head', 500);

@@ -6,7 +6,7 @@ info:
     Express API middleware that manages voting operations inside a Hydra L2
     state channel on Cardano. Handles ballot minting on L1, in-head voter
     registration/voting via TRP, evidence pinning to IPFS, and settlement
-    (finalize → burn → close).
+    (burn → finalize → close).
 
     All responses follow a uniform envelope:
       - Success: `{ "status": "SUCCESS", "data": { ... } }`
@@ -14,6 +14,37 @@ info:
 
     All endpoints require the `x-api-key` header except where otherwise noted
     (the middleware applies globally).
+
+    ## Head close-out order (canonical)
+
+    A Hydra head that has had any votes cast must be settled in this exact
+    order. Skipping or reordering a step will either leave voter tokens
+    stuck in the head, strand the (601) in a pre-finalized state on L1, or
+    time out waiting for Fanout.
+
+    1. `POST /settle/burn` — loop until `data.remaining === 0`. The
+       throttle caps per-run throughput, so large voter sets may need
+       several calls. The pre-burn ledger snapshot is written on the
+       first call and preserved across retries.
+    2. `POST /settle/finalize` — tallies, pins evidence to IPFS, writes
+       the finalized BallotResult datum into the (601) UTxO and routes
+       it to the cached `resultsAddress`. Server-enforced precondition:
+       zero voter tokens remain in the head.
+    3. `POST /settle/close` — drives `Close → FanoutPossible → Fanout →
+       Final`. Body: `{ "closeToken": "…" }`. On fanout, the (601) token
+       lands on L1 at `resultsAddress` with its finalized datum intact.
+
+    **Aborting an empty head** (no voter activity): step 3 alone is fine
+    — the (601) fans out with its original placeholder datum.
+
+    **Deprecated shortcuts** (`POST /settle`, `POST /close`) still work
+    but should not be used by new integrations. See their per-endpoint
+    descriptions for migration notes.
+
+    All settlement endpoints read ballot identity (ballotId / ballotPolicy
+    / ballotToken / resultsAddress) from the cache populated by `/start`.
+    No identity fields are accepted in request bodies — one head, one
+    ballot.
 
 servers:
   - url: http://localhost:3000
@@ -35,7 +66,10 @@ tags:
   - name: Voting (In-Head)
     description: Voter registration and vote casting. Runs inside the head via TRP.
   - name: Settlement
-    description: Finalize results, burn voter tokens, close head.
+    description: |
+      Burn voter tokens, finalize results, close the head — in that order.
+      See the API description at the top of this spec for the full canonical
+      close-out flow and failure modes of skipping a step.
   - name: Queue
     description: Inspect and drain the write-ahead log (WAL) for in-head txs.
   - name: Query
@@ -414,7 +448,15 @@ paths:
   /close:
     post:
       tags: [Head Lifecycle]
-      summary: Close the head (requires close token)
+      summary: (Deprecated) Close the head — use /settle/close instead
+      deprecated: true
+      description: |
+        **Deprecated.** Functionally equivalent to `POST /settle/close` — kept
+        only so existing integrations don't break. New callers should hit
+        `/settle/close` directly.
+
+        Drives the head through `Close → FanoutPossible → Fanout → Final`
+        using the shared HydraMonitor WebSocket.
       requestBody:
         required: true
         content:
@@ -426,7 +468,7 @@ paths:
                 closeToken: { type: string }
       responses:
         '200':
-          description: Head closed
+          description: Head reached FINAL
           content:
             application/json:
               schema:
@@ -436,7 +478,8 @@ paths:
                       data:
                         type: object
                         properties:
-                          closed: { type: boolean }
+                          status: { type: string, example: FINAL }
+                          message: { type: string }
         '400': { $ref: '#/components/responses/BadRequest' }
         '500': { $ref: '#/components/responses/InternalError' }
 
