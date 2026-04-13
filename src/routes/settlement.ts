@@ -4,7 +4,7 @@ import { blake2b256, bytesToHex, computePackage } from '@lerna-labs/hydra-proof'
 import type { FileLeaf } from '@lerna-labs/hydra-proof';
 import { initialize, voterIdToTokenName, CLOSE_TOKEN, VERBOSE, IPFS_STAGING_DIR, ipfs, voteCache, success, error, debug, hydraMonitor, getHeadId, txQueue, enqueueAndWait } from '../helpers.js';
 import { hydraValueToAmounts } from '../tx-builder.js';
-import { getCachedBallot, getCachedResultsAddress } from './lifecycle.js';
+import { getCachedBallot, getCachedBallotId, getCachedBallotIdentity, getCachedResultsAddress } from './lifecycle.js';
 import { BALLOT_INSTANCE_PREFIX, BALLOT_DEFINITION_PREFIX, HRP_TO_ROLE } from '../types.js';
 import type {
     FullResults,
@@ -264,21 +264,18 @@ function cacheToVoterRefs(votes: VoteCacheEntry[]): VoterRef[] {
  *   ballotId: string       — ballot identifier (ULID or tx hash)
  *   ballotName: string     — hex asset name suffix (fingerprint) of the (601) token
  */
-router.post('/finalize', async (req, res) => {
-    const { ballotId, ballotName, ballotPolicy } = req.body as {
-        ballotId: string;
-        ballotName: string;
-        ballotPolicy: string;
-    };
-
-    if (!ballotId || !ballotName || !ballotPolicy) {
-        return error(res, 'MISSING_FIELDS', 'Missing required fields: ballotId, ballotName, ballotPolicy', 400);
-    }
-
+router.post('/finalize', async (_req, res) => {
     const ballot = getCachedBallot();
     if (!ballot) {
         return error(res, 'NO_BALLOT_CACHED', 'No ballot definition cached. Was /start called with ballotIpfsCid?', 400);
     }
+
+    const identity = getCachedBallotIdentity();
+    const ballotId = getCachedBallotId();
+    if (!identity || !ballotId) {
+        return error(res, 'NO_BALLOT_CACHED', 'Ballot identity not cached. Call /start with ballotPolicy and ballotToken first.', 400);
+    }
+    const { ballotPolicy, ballotToken: ballotName } = identity;
 
     try {
         const { admin_wallet, client } = await initialize();
@@ -493,10 +490,10 @@ router.post('/count', async (req, res) => {
  *
  * Call this repeatedly until `remaining === 0` before calling /settle/finalize.
  *
- * Body:
- *   ballotPolicy?: string   — optional, derived from admin wallet if omitted
+ * No body — voter token policy is derived from the admin wallet's native
+ * script; ballot identity comes from the cache populated by /start.
  */
-router.post('/settle/burn', async (req, res) => {
+router.post('/settle/burn', async (_req, res) => {
     // Ensure vote queue is drained before settlement begins
     if (!txQueue.isDrained()) {
         const qs = txQueue.status();
@@ -604,26 +601,21 @@ router.post('/settle/burn', async (req, res) => {
  * Tally votes, verify evidence, pin to IPFS, update ballot datum.
  * Only succeeds when all voter tokens have been burned (0 remaining).
  *
- * Body:
- *   ballotId: string       — ballot identifier
- *   ballotName: string     — hex asset name of the (601) token
- *   ballotPolicy: string   — hex policy ID
+ * No body — identity (ballotId, ballotName, ballotPolicy) is read from the
+ * cache populated by /start. One head, one ballot.
  */
-router.post('/settle/finalize', async (req, res) => {
-    const { ballotId, ballotName, ballotPolicy } = req.body as {
-        ballotId: string;
-        ballotName: string;
-        ballotPolicy: string;
-    };
-
-    if (!ballotId || !ballotName || !ballotPolicy) {
-        return error(res, 'MISSING_FIELDS', 'Missing required fields: ballotId, ballotName, ballotPolicy', 400);
-    }
-
+router.post('/settle/finalize', async (_req, res) => {
     const ballot = getCachedBallot();
     if (!ballot) {
         return error(res, 'NO_BALLOT_CACHED', 'No ballot definition cached', 400);
     }
+
+    const identity = getCachedBallotIdentity();
+    const ballotId = getCachedBallotId();
+    if (!identity || !ballotId) {
+        return error(res, 'NO_BALLOT_CACHED', 'Ballot identity not cached. Call /start with ballotPolicy and ballotToken first.', 400);
+    }
+    const { ballotPolicy, ballotToken: ballotName } = identity;
 
     try {
         const { admin_wallet, client } = await initialize();
@@ -866,21 +858,16 @@ router.post('/settle/close', async (req, res) => {
  *   4. Close the head — fanout is trivial (ADA-only, no datums/tokens)
  *
  * Body:
- *   ballotId: string       — ballot identifier (ULID or tx hash)
- *   ballotName: string     — hex fingerprint of the ballot tokens
- *   ballotPolicy: string   — hex policy ID of the ballot tokens
  *   closeToken: string     — required to authorize head close
+ *
+ * Identity fields (ballotId, ballotName, ballotPolicy) are read from the
+ * cache populated by /start. One head, one ballot.
  */
 router.post('/settle', async (req, res) => {
-    const { ballotId, ballotName, ballotPolicy, closeToken } = req.body as {
-        ballotId: string;
-        ballotName: string;
-        ballotPolicy: string;
-        closeToken: string;
-    };
+    const { closeToken } = req.body as { closeToken: string };
 
-    if (!ballotId || !ballotName || !ballotPolicy || !closeToken) {
-        return error(res, 'MISSING_FIELDS', 'Missing required fields: ballotId, ballotName, ballotPolicy, closeToken', 400);
+    if (!closeToken) {
+        return error(res, 'MISSING_FIELDS', 'Missing required field: closeToken', 400);
     }
 
     if (closeToken !== CLOSE_TOKEN) {
@@ -894,6 +881,13 @@ router.post('/settle', async (req, res) => {
         if (!ballot) {
             return error(res, 'NO_BALLOT_CACHED', 'No ballot definition cached', 400);
         }
+
+        const identity = getCachedBallotIdentity();
+        const ballotId = getCachedBallotId();
+        if (!identity || !ballotId) {
+            return error(res, 'NO_BALLOT_CACHED', 'Ballot identity not cached. Call /start with ballotPolicy and ballotToken first.', 400);
+        }
+        const { ballotPolicy, ballotToken: ballotName } = identity;
 
         const { admin_wallet, client } = await initialize();
         if (!admin_wallet || !client) {

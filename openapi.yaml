@@ -377,6 +377,14 @@ paths:
                 ballotToken:
                   type: string
                   description: Hex instance asset name of the (601) token.
+                ballotId:
+                  type: string
+                  description: |
+                    Hex bytes written into the finalized (601) datum's
+                    `ballotId` field. Cached server-side for the settlement
+                    endpoints — do NOT resend at finalize time. Defaults to
+                    the 28-byte fingerprint (the suffix of `ballotToken`
+                    after the 4-byte CIP-67 label prefix, i.e. 56 hex chars).
                 resultsAddress:
                   type: string
                   description: |
@@ -397,6 +405,9 @@ paths:
                         type: object
                         properties:
                           ballotCached: { type: boolean }
+                          ballotId:
+                            type: string
+                            description: The effective cached ballotId (either the value supplied in the request body or the fingerprint fallback).
         '400': { $ref: '#/components/responses/BadRequest' }
         '500': { $ref: '#/components/responses/InternalError' }
 
@@ -564,15 +575,10 @@ paths:
       description: |
         Cache-based finalization path. Reads the in-memory vote cache, builds
         merkle tree of evidence, pins results + proof package + evidence
-        directory to IPFS, and submits the finalize tx in-head. Use the
-        stepped `/settle/*` endpoints (or monolithic `/settle`) for full
-        settlement with authoritative on-chain voter query.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/SettleFinalizeRequest'
+        directory to IPFS, and submits the finalize tx in-head.
+
+        No request body — ballot identity (ballotId / ballotPolicy / ballotToken)
+        is read from the cache populated by `/start`. One head, one ballot.
       responses:
         '200':
           description: Finalized
@@ -620,7 +626,18 @@ paths:
         Queries the head's UTxO set for the authoritative voter list and burns
         every voter token. Writes a pre-burn ledger snapshot to disk on first
         call (source of truth for `/settle/finalize`). Idempotent — safe to
-        retry if some burns fail. Call until `remaining === 0`.
+        retry if some burns fail.
+
+        **Call repeatedly until `remaining === 0`** before invoking
+        `/settle/finalize`. Each call processes up to the worker throttle
+        (MAX_IN_FLIGHT); snapshots with more voters than the throttle
+        window need multiple invocations. The pre-burn ledger snapshot is
+        written once on the first call and preserved across retries.
+
+        Full stepped settlement flow:
+          1. `POST /settle/burn` (loop until `remaining === 0`)
+          2. `POST /settle/finalize`
+          3. `POST /settle/close` (with `closeToken`)
       responses:
         '200':
           description: Burn batch result
@@ -648,12 +665,8 @@ paths:
         Only succeeds when all voter tokens have been burned. Reads the
         pre-burn ledger snapshot and verifies each voter's local evidence
         against the on-chain state before inclusion.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/SettleFinalizeRequest'
+
+        No request body — ballot identity comes from the `/start` cache.
       responses:
         '200':
           description: Finalized
@@ -695,22 +708,30 @@ paths:
   /settle:
     post:
       tags: [Settlement]
-      summary: Monolithic settlement — burn → finalize → close
+      summary: (Deprecated) Monolithic settlement — burn → finalize → close
+      deprecated: true
       description: |
-        Kept for backwards compatibility. Prefer the stepped endpoints for
-        long-running settlements so each phase completes within normal HTTP
-        timeout windows.
+        **Deprecated.** Use the stepped flow instead:
+
+          1. `POST /settle/burn` — loop until `remaining === 0`
+          2. `POST /settle/finalize`
+          3. `POST /settle/close` — with `closeToken`
+
+        Kept for backwards compatibility with early integrations. This
+        single-request orchestration is prone to HTTP timeouts on larger
+        voter sets and gives no per-phase visibility when a partial failure
+        occurs. New callers should always use the stepped endpoints.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [ballotId, ballotName, ballotPolicy, closeToken]
+              required: [closeToken]
+              description: |
+                Ballot identity is read from the cache populated by `/start` —
+                not passed in the body. Only the auth token is required here.
               properties:
-                ballotId: { type: string }
-                ballotName: { type: string, description: Hex fingerprint (28-byte blake2b_224 of namespace). }
-                ballotPolicy: { type: string, description: Hex policy ID. }
                 closeToken: { type: string }
       responses:
         '200':
@@ -1345,14 +1366,6 @@ components:
         timestamp: { type: integer }
 
     # ---------- Settlement ----------
-    SettleFinalizeRequest:
-      type: object
-      required: [ballotId, ballotName, ballotPolicy]
-      properties:
-        ballotId: { type: string, description: Ballot identifier (ULID or tx hash). }
-        ballotName: { type: string, description: Hex fingerprint of the (601) token. }
-        ballotPolicy: { type: string, description: Hex policy ID of the ballot tokens. }
-
     FinalizeResponse:
       allOf:
         - $ref: '#/components/schemas/SuccessEnvelope'

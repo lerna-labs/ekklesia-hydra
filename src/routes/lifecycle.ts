@@ -14,6 +14,7 @@ const router = Router();
 let cachedBallot: BallotDefinition | null = null;
 let cachedBallotPolicy: string | null = null;
 let cachedBallotToken: string | null = null;
+let cachedBallotId: string | null = null;
 let cachedResultsAddress: string | null = null;
 
 /** Get the cached ballot definition (used by other routes). */
@@ -25,6 +26,15 @@ export function getCachedBallot(): BallotDefinition | null {
 export function getCachedBallotIdentity(): { ballotPolicy: string; ballotToken: string } | null {
     if (!cachedBallotPolicy || !cachedBallotToken) return null;
     return { ballotPolicy: cachedBallotPolicy, ballotToken: cachedBallotToken };
+}
+
+/**
+ * Cached ballot identifier — the opaque bytes stored in the finalized (601)
+ * datum's `ballotId` field. Set during /start; defaults to the 28-byte
+ * fingerprint (the suffix of ballotToken) if the caller doesn't supply one.
+ */
+export function getCachedBallotId(): string | null {
+    return cachedBallotId;
 }
 
 /**
@@ -72,6 +82,11 @@ router.get('/head-info', async (_, res) => {
  *
  * Open a Hydra head by committing the (601) ballot instance token + gas UTxOs.
  *
+ * All identity fields (ballotPolicy, ballotToken, ballotId, resultsAddress)
+ * are cached at this point. Downstream settlement endpoints read them from
+ * the cache — they are NOT accepted as request bodies on /finalize,
+ * /settle/finalize, or /settle. One head, one ballot.
+ *
  * Body:
  *   utxos: Array<{ txHash: string, outputIndex: number }>
  *     — UTxO refs to commit (the (601) token output + gas output from /prepare)
@@ -82,6 +97,11 @@ router.get('/head-info', async (_, res) => {
  *     — hex policy ID of the ballot tokens (returned by /prepare as policyId)
  *   ballotToken: string
  *     — hex instance asset name of the (601) token (returned by /prepare as instanceAssetName)
+ *   ballotId?: string
+ *     — hex bytes written into the finalized (601) datum's ballotId field.
+ *       Defaults to the 28-byte fingerprint (the 56-hex-char suffix of ballotToken).
+ *   resultsAddress?: string
+ *     — destination for the (601) token after finalize (defaults to admin).
  */
 router.post('/start', async (req, res) => {
     const wrangler = new Wrangler(process.env.HYDRA_API_URL, undefined, hydraMonitor);
@@ -89,6 +109,7 @@ router.post('/start', async (req, res) => {
     const ballotIpfsCid = req.body.ballotIpfsCid as string | undefined;
     const ballotPolicy = req.body.ballotPolicy as string | undefined;
     const ballotToken = req.body.ballotToken as string | undefined;
+    const ballotId = req.body.ballotId as string | undefined;
     const resultsAddress = req.body.resultsAddress as string | undefined;
 
     if (!utxos || !Array.isArray(utxos) || utxos.length === 0) {
@@ -107,6 +128,7 @@ router.post('/start', async (req, res) => {
         cachedBallot = null;
         cachedBallotPolicy = null;
         cachedBallotToken = null;
+        cachedBallotId = null;
         cachedResultsAddress = null;
         const votesDir = path.join(IPFS_STAGING_DIR, 'votes');
         const latestDir = path.join(IPFS_STAGING_DIR, 'latest');
@@ -135,11 +157,14 @@ router.post('/start', async (req, res) => {
             }
         }
 
-        // Cache ballot identity for voting routes
+        // Cache ballot identity for voting + settlement routes
         if (ballotPolicy && ballotToken) {
             cachedBallotPolicy = ballotPolicy;
             cachedBallotToken = ballotToken;
-            console.log(`Ballot identity cached: policy=${ballotPolicy.slice(0, 16)}… token=${ballotToken.slice(0, 16)}…`);
+            // Default ballotId = the 28-byte fingerprint (suffix of ballotToken,
+            // after the 4-byte CIP-67 label prefix → 8 hex chars).
+            cachedBallotId = ballotId ?? ballotToken.slice(8);
+            console.log(`Ballot identity cached: policy=${ballotPolicy.slice(0, 16)}… token=${ballotToken.slice(0, 16)}… ballotId=${cachedBallotId.slice(0, 16)}…`);
         }
 
         // Cache results address — where the finalized (601) is sent at settlement.
@@ -149,7 +174,10 @@ router.post('/start', async (req, res) => {
             console.log(`Results address cached: ${resultsAddress}`);
         }
 
-        return success(res, { ballotCached: cachedBallot !== null });
+        return success(res, {
+            ballotCached: cachedBallot !== null,
+            ballotId: cachedBallotId,
+        });
     } catch (err: any) {
         console.error('Failed to start head:', err);
         return error(res, 'INTERNAL_ERROR', err.message || 'Failed to start head', 500);

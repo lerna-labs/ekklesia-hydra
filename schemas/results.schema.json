@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Lerna-Labs/ekklesia-hydra/schemas/results.schema.json",
+  "title": "FullResults",
+  "description": "Complete tally and provenance bundle pinned to IPFS at finalization. The blake2b_256 of the canonical JSON of this object equals the on-chain `resultsHash` in the (601) ballot result datum, and the IPFS directory containing this file is referenced by `evidenceCid` in that same datum.",
+  "type": "object",
+  "required": ["specVersion", "ballotId", "status", "tallies", "totalVoters", "evidenceIpfsCid", "headId", "finalizedAt"],
+  "additionalProperties": false,
+  "properties": {
+    "specVersion": { "type": "string", "examples": ["0.3.0"] },
+    "ballotId": {
+      "type": "string",
+      "description": "Ballot identifier (ULID or tx hash). Matches the on-chain (601) datum `ballotId` field and every voter's `signedPayload.ballotId`."
+    },
+    "status": { "const": "finalized" },
+    "tallies": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/QuestionTally" },
+      "description": "One entry per question. Order matches the original BallotDefinition.questions order."
+    },
+    "totalVoters": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of unique voters whose evidence was verified and included. Off-chain only — not present in any on-chain datum."
+    },
+    "evidenceIpfsCid": {
+      "type": "string",
+      "description": "IPFS directory CID for the complete evidence package containing this results.json plus all per-voter evidence + proofs. Filled in after the directory is pinned (reads as empty string in any pre-pin draft)."
+    },
+    "headId": {
+      "type": "string",
+      "description": "Hydra head ID where the votes were collected. Empty string if not available at finalize time."
+    },
+    "finalizedAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 UTC timestamp at which the finalize tx was built (server clock — not chain time)."
+    },
+    "votersByRole": {
+      "type": "object",
+      "description": "Per-role voter counts (e.g., { DRep: 800, SPO: 200 }).",
+      "additionalProperties": { "type": "integer", "minimum": 0 }
+    },
+    "excludedVoters": {
+      "type": "array",
+      "description": "Voters whose on-chain token existed at settlement but whose evidence could not be verified. Present only when at least one exclusion occurred.",
+      "items": {
+        "type": "object",
+        "required": ["tokenName", "reason"],
+        "additionalProperties": false,
+        "properties": {
+          "tokenName": {
+            "type": "string",
+            "description": "29-byte voter token asset name, hex (58 chars)."
+          },
+          "reason": { "type": "string" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "OptionTally": {
+      "type": "object",
+      "required": ["option", "count", "weight"],
+      "additionalProperties": false,
+      "properties": {
+        "option": {
+          "type": "integer",
+          "description": "Matches a `BallotOption.value` in the source ballot."
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Raw unweighted count of voters who selected this option."
+        },
+        "weight": {
+          "type": "string",
+          "pattern": "^[0-9]+$",
+          "description": "Lovelace-denominated weight as a stringified BigInt. '0' for credential-based weighting modes."
+        }
+      }
+    },
+    "RoleTally": {
+      "type": "object",
+      "required": ["weightingMode", "results"],
+      "additionalProperties": false,
+      "properties": {
+        "weightingMode": {
+          "type": "string",
+          "enum": ["CredentialBased", "StakeBased", "PledgeBased"],
+          "description": "Mirrors the role's entry in BallotDefinition.roleWeighting."
+        },
+        "results": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/OptionTally" }
+        }
+      }
+    },
+    "QuestionTally": {
+      "type": "object",
+      "required": ["questionId", "roleResults"],
+      "additionalProperties": false,
+      "properties": {
+        "questionId": { "type": "string" },
+        "roleResults": {
+          "type": "object",
+          "description": "Keyed by role label ('DRep', 'SPO', 'CC', 'Stakeholder'). Only roles present in BallotDefinition.roleWeighting appear here.",
+          "additionalProperties": { "$ref": "#/$defs/RoleTally" }
+        }
+      }
+    }
+  }
+}

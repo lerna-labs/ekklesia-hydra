@@ -1,0 +1,215 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Lerna-Labs/ekklesia-hydra/schemas/vote-evidence.schema.json",
+  "title": "VoteEvidence",
+  "description": "Full vote evidence pinned to IPFS at vote time. Combines CIP-179 surveyResponse core with the Ekklesia extension. The blake2b_256 of the canonical JSON of this object equals the on-chain `voteHash` in the voter token datum.",
+  "type": "object",
+  "required": ["specVersion", "surveyTxId", "responderRole", "answers", "ekklesia"],
+  "additionalProperties": false,
+  "properties": {
+    "specVersion": { "type": "string", "examples": ["0.3.0"] },
+    "surveyTxId": {
+      "type": "string",
+      "description": "Ballot identifier (ULID or tx hash). Same as `signedPayload.ballotId`."
+    },
+    "responderRole": {
+      "type": "string",
+      "description": "Voter role label, e.g. 'DRep', 'SPO', 'Stakeholder'."
+    },
+    "answers": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/VoteSelection" }
+    },
+    "ekklesia": { "$ref": "#/$defs/EkklesiaVoteExtension" }
+  },
+  "$defs": {
+    "WeightedEntry": {
+      "type": "object",
+      "required": ["option", "weight"],
+      "additionalProperties": false,
+      "properties": {
+        "option": { "type": "integer" },
+        "weight": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "VoteSelection": {
+      "type": "object",
+      "required": ["questionId"],
+      "additionalProperties": false,
+      "description": "Exactly one of `selection` / `ranking` / `weights` must be present, depending on the question's method.",
+      "properties": {
+        "questionId": { "type": "string", "minLength": 1 },
+        "selection": {
+          "type": "array",
+          "items": { "type": "integer" },
+          "description": "Used by binary, single-choice, multi-choice, and range questions."
+        },
+        "ranking": {
+          "type": "array",
+          "items": { "type": "integer" },
+          "uniqueItems": true,
+          "description": "Used by ranked questions. Index 0 = first preference."
+        },
+        "weights": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/WeightedEntry" },
+          "description": "Used by weighted questions. Sum of all `weight` values must equal the question's `budget`."
+        }
+      },
+      "oneOf": [
+        { "required": ["selection"], "not": { "anyOf": [{ "required": ["ranking"] }, { "required": ["weights"] }] } },
+        { "required": ["ranking"], "not": { "anyOf": [{ "required": ["selection"] }, { "required": ["weights"] }] } },
+        { "required": ["weights"], "not": { "anyOf": [{ "required": ["selection"] }, { "required": ["ranking"] }] } }
+      ]
+    },
+    "CoseWitness": {
+      "type": "object",
+      "required": ["coseSign1Hex", "coseKeyHex", "key", "signature"],
+      "additionalProperties": false,
+      "properties": {
+        "coseSign1Hex": {
+          "type": "string",
+          "description": "Hex-encoded COSE_Sign1 message — the only field consumed by the middleware for verification."
+        },
+        "coseKeyHex": {
+          "type": "string",
+          "description": "Hex-encoded COSE_Key — the public-key half used to verify coseSign1Hex."
+        },
+        "key": {
+          "type": "string",
+          "description": "Legacy/duplicative — raw public-key hex as some CIP-30 signData implementations return. Not consumed by the middleware. Pass empty string if unused."
+        },
+        "signature": {
+          "type": "string",
+          "description": "Legacy/duplicative — raw signature hex. Not consumed by the middleware. Pass empty string if unused."
+        }
+      }
+    },
+    "NativeScriptDef": {
+      "description": "Portable native script definition (mirrors @meshsdk/common NativeScript).",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["type", "keyHash"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "sig" },
+            "keyHash": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "scripts"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "enum": ["all", "any"] },
+            "scripts": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/NativeScriptDef" }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "required", "scripts"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "atLeast" },
+            "required": { "type": "integer", "minimum": 1 },
+            "scripts": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/NativeScriptDef" }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "slot"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "enum": ["after", "before"] },
+            "slot": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "CalidusDeclaration": {
+      "type": "object",
+      "required": ["calidusId"],
+      "additionalProperties": false,
+      "properties": {
+        "calidusId": {
+          "type": "string",
+          "description": "Bech32 calidus key ID (calidus1...). The voter ID remains the pool bech32; this declares the hot key that signed."
+        }
+      }
+    },
+    "SignedVotePayload": {
+      "type": "object",
+      "required": ["ballotId", "nonce", "votes"],
+      "additionalProperties": false,
+      "description": "The exact JSON object the voter signs with their COSE key. blake2b_256 of canonical JSON form = the message verified against the COSE_Sign1.",
+      "properties": {
+        "ballotId": { "type": "string" },
+        "nonce": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Monotonic version. Must strictly exceed the prior on-chain version."
+        },
+        "votes": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/VoteSelection" }
+        }
+      }
+    },
+    "EkklesiaVoteExtension": {
+      "type": "object",
+      "required": ["voterId", "credentialHrp", "nonce", "signedPayload", "witnesses", "merkleProof"],
+      "additionalProperties": false,
+      "properties": {
+        "voterId": {
+          "type": "string",
+          "description": "Original bech32 voter ID (drep1.../pool1.../stake1.../addr1.../calidus1...)."
+        },
+        "credentialHrp": {
+          "type": "string",
+          "enum": ["drep", "pool", "calidus", "stake", "stake_test", "addr", "addr_test"]
+        },
+        "nonce": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Matches `signedPayload.nonce` and the on-chain voter datum `version`."
+        },
+        "signedPayload": { "$ref": "#/$defs/SignedVotePayload" },
+        "witnesses": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/CoseWitness" },
+          "description": "Single-entry array for key-based credentials; multiple entries (satisfying the script) for native-script credentials."
+        },
+        "nativeScript": { "$ref": "#/$defs/NativeScriptDef" },
+        "calidusDeclaration": { "$ref": "#/$defs/CalidusDeclaration" },
+        "merkleProof": {
+          "type": "object",
+          "required": ["root", "steps"],
+          "additionalProperties": false,
+          "description": "Per-vote merkle inclusion proof; populated at finalization. Empty root + empty steps in evidence written at vote time.",
+          "properties": {
+            "root": { "type": "string" },
+            "steps": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["siblingHex"],
+                "additionalProperties": false,
+                "properties": { "siblingHex": { "type": "string" } }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
