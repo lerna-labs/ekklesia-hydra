@@ -1,15 +1,17 @@
 /**
- * Disk-backed Transaction Write-Ahead Log (WAL).
+ * Disk-backed Transaction Write-Ahead Log (WAL) with EventEmitter.
  *
  * Tracks every transaction from build through confirmation to provide
- * crash resilience. If the middleware or Hydra node restarts, pending
- * transactions can be recovered and resubmitted.
+ * crash resilience. Emits events so HTTP handlers can wait for TxValid
+ * and the queue worker can react to state changes.
  *
  * Each entry is a JSON file in `IPFS_STAGING_DIR/tx-queue/`.
  * State transitions: BUILT → SUBMITTED → ACCEPTED → CONFIRMED → APPLIED
  * Failed transactions: any state → FAILED
+ * Retry: FAILED/SUBMITTED → BUILT (for retryable errors)
  */
 
+import { EventEmitter } from 'node:events';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 
@@ -19,11 +21,18 @@ import path from 'node:path';
 
 export type TxState = 'BUILT' | 'SUBMITTED' | 'ACCEPTED' | 'CONFIRMED' | 'APPLIED' | 'FAILED';
 
+export type TxType = 'register' | 'vote-and-register' | 'cast_vote' | 'count_vote' | 'finalize';
+
+/** Whether a tx type contends on the shared ballot token UTxO. */
+export function isContending(type: TxType): boolean {
+    return type === 'register' || type === 'vote-and-register' || type === 'finalize';
+}
+
 export interface TxQueueEntry {
     /** Unique ID — voterId:nonce for votes, tokenName for burns. */
     id: string;
     /** Transaction type. */
-    type: 'register' | 'vote-and-register' | 'cast_vote' | 'count_vote' | 'finalize';
+    type: TxType;
     /** Current lifecycle state. */
     state: TxState;
     /** Computed tx hash (blake2b-256 of tx body). */
@@ -43,16 +52,35 @@ export interface TxQueueEntry {
 }
 
 // ---------------------------------------------------------------------------
+// TxQueue Events
+// ---------------------------------------------------------------------------
+
+export interface TxQueueEvents {
+    /** Entry reached ACCEPTED state (TxValid received). */
+    accepted: (data: { id: string; txHash: string }) => void;
+    /** Entry reached FAILED state. */
+    failed: (data: { id: string; error: string }) => void;
+    /** Entry reached CONFIRMED state (SnapshotConfirmed). */
+    confirmed: (data: { id: string; txHash: string }) => void;
+    /** New entry enqueued in BUILT state — signals worker to check for work. */
+    enqueued: (data: { id: string }) => void;
+}
+
+// ---------------------------------------------------------------------------
 // TxQueue
 // ---------------------------------------------------------------------------
 
-export class TxQueue {
+export class TxQueue extends EventEmitter {
     private readonly queueDir: string;
     private entries = new Map<string, TxQueueEntry>();
     private initialized = false;
 
     constructor(stagingDir: string) {
+        super();
         this.queueDir = path.join(stagingDir, 'tx-queue');
+        // Burst burns enqueue thousands of waitForAcceptance listeners.
+        // The default 10 produces noisy MaxListenersExceededWarning.
+        this.setMaxListeners(0);
     }
 
     /** Initialize: ensure directory exists and load existing entries from disk. */
@@ -72,12 +100,13 @@ export class TxQueue {
         this.initialized = true;
     }
 
-    /** Write a new entry to disk and memory. */
+    /** Write a new entry to disk and memory. Emits 'enqueued'. */
     async enqueue(entry: Omit<TxQueueEntry, 'createdAt' | 'updatedAt'>): Promise<string> {
         const now = Date.now();
         const full: TxQueueEntry = { ...entry, createdAt: now, updatedAt: now };
         this.entries.set(full.id, full);
         await this.writeToDisk(full);
+        this.emit('enqueued', { id: full.id });
         return full.id;
     }
 
@@ -91,12 +120,25 @@ export class TxQueue {
         await this.writeToDisk(entry);
     }
 
+    async markBuilt(id: string): Promise<void> {
+        await this.updateState(id, 'BUILT');
+        this.emit('enqueued', { id }); // signal worker to re-check
+    }
     async markSubmitted(id: string): Promise<void> { await this.updateState(id, 'SUBMITTED'); }
-    async markAccepted(id: string): Promise<void> { await this.updateState(id, 'ACCEPTED'); }
-    async markConfirmed(id: string): Promise<void> { await this.updateState(id, 'CONFIRMED'); }
+    async markAccepted(id: string): Promise<void> {
+        const entry = this.entries.get(id);
+        await this.updateState(id, 'ACCEPTED');
+        if (entry) this.emit('accepted', { id, txHash: entry.txHash });
+    }
+    async markConfirmed(id: string): Promise<void> {
+        const entry = this.entries.get(id);
+        await this.updateState(id, 'CONFIRMED');
+        if (entry) this.emit('confirmed', { id, txHash: entry.txHash });
+    }
     async markApplied(id: string): Promise<void> { await this.updateState(id, 'APPLIED'); }
     async markFailed(id: string, error: string): Promise<void> {
         await this.updateState(id, 'FAILED', { error });
+        this.emit('failed', { id, error });
     }
 
     /** Increment attempt count. */
@@ -106,6 +148,54 @@ export class TxQueue {
         entry.attempts++;
         entry.updatedAt = Date.now();
         await this.writeToDisk(entry);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Wait helpers — for HTTP handlers to await state transitions
+    // ---------------------------------------------------------------------------
+
+    /**
+     * Wait for an entry to reach ACCEPTED state (TxValid received).
+     * Resolves with txHash. Rejects on FAILED or timeout.
+     */
+    waitForAcceptance(id: string, timeoutMs = 120_000): Promise<{ txHash: string }> {
+        const entry = this.entries.get(id);
+        // Already in terminal state?
+        if (entry?.state === 'ACCEPTED' || entry?.state === 'CONFIRMED' || entry?.state === 'APPLIED') {
+            return Promise.resolve({ txHash: entry.txHash });
+        }
+        if (entry?.state === 'FAILED') {
+            return Promise.reject(new Error(entry.error ?? 'Transaction failed'));
+        }
+
+        return new Promise((resolve, reject) => {
+            let settled = false;
+            const cleanup = () => {
+                this.removeListener('accepted', onAccepted);
+                this.removeListener('failed', onFailed);
+            };
+            const settle = (fn: Function, value: any) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                cleanup();
+                fn(value);
+            };
+
+            const timer = setTimeout(() => {
+                settle(reject, new Error(`Timeout waiting for TxValid on entry ${id}`));
+            }, timeoutMs);
+
+            const onAccepted = (data: { id: string; txHash: string }) => {
+                if (data.id === id) settle(resolve, { txHash: data.txHash });
+            };
+            const onFailed = (data: { id: string; error: string }) => {
+                if (data.id === id) settle(reject, new Error(data.error));
+            };
+
+            this.on('accepted', onAccepted);
+            this.on('failed', onFailed);
+        });
     }
 
     // ---------------------------------------------------------------------------
@@ -125,9 +215,19 @@ export class TxQueue {
         return undefined;
     }
 
+    /** Get all entries in BUILT state (ready to dispatch). */
+    getBuilt(): TxQueueEntry[] {
+        return [...this.entries.values()].filter(e => e.state === 'BUILT');
+    }
+
     /** Get all entries in BUILT or SUBMITTED state (need to be sent/resent). */
     getPending(): TxQueueEntry[] {
         return [...this.entries.values()].filter(e => e.state === 'BUILT' || e.state === 'SUBMITTED');
+    }
+
+    /** Get all entries in SUBMITTED state (sent but not yet TxValid). */
+    getSubmitted(): TxQueueEntry[] {
+        return [...this.entries.values()].filter(e => e.state === 'SUBMITTED');
     }
 
     /** Get all entries in ACCEPTED state (TxValid received but not snapshot-confirmed). */
@@ -147,11 +247,46 @@ export class TxQueue {
         );
     }
 
-    /** Check if a voter has any pending entries (for per-voter ordering). */
-    hasVoterPending(voterId: string): boolean {
+    /** Count entries in SUBMITTED + ACCEPTED state (in-flight to head). */
+    getInFlightToHead(): number {
+        let count = 0;
+        for (const entry of this.entries.values()) {
+            if (entry.state === 'SUBMITTED' || entry.state === 'ACCEPTED') count++;
+        }
+        return count;
+    }
+
+    /** Check if a voter has any active (non-terminal) entries. */
+    hasVoterActive(voterId: string): boolean {
         for (const entry of this.entries.values()) {
             if (entry.voterId === voterId &&
-                entry.state !== 'APPLIED' && entry.state !== 'FAILED' && entry.state !== 'CONFIRMED') {
+                entry.state !== 'APPLIED' && entry.state !== 'FAILED') {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Check if a voter has any active entries OTHER than the given entry.
+     * Used by the worker's per-voter dispatch ordering check.
+     */
+    hasVoterActiveExcept(voterId: string, exceptEntryId: string): boolean {
+        for (const entry of this.entries.values()) {
+            if (entry.voterId === voterId &&
+                entry.id !== exceptEntryId &&
+                entry.state !== 'APPLIED' && entry.state !== 'FAILED') {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Check if any contending tx (register/vote-and-register/finalize) is in-flight. */
+    hasContendingInFlight(): boolean {
+        for (const entry of this.entries.values()) {
+            if (isContending(entry.type) &&
+                (entry.state === 'SUBMITTED' || entry.state === 'ACCEPTED')) {
                 return true;
             }
         }
@@ -221,7 +356,6 @@ export class TxQueue {
     // ---------------------------------------------------------------------------
 
     private entryPath(id: string): string {
-        // Sanitize ID for filesystem
         const safe = id.replace(/[^a-zA-Z0-9_:-]/g, '_');
         return path.join(this.queueDir, `${safe}.json`);
     }

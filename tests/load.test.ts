@@ -57,6 +57,16 @@ interface TimedResult {
 // Load-test-specific helpers
 // ---------------------------------------------------------------------------
 
+/** Build a vote signature for any voter type, including calidus declaration when needed. */
+function buildVoteSignature(voter: DRepKeys, merkleRoot: string): any {
+    const signingAddress = voter.calidusId ?? voter.drepId;
+    const sig: any = { ...signMerkleRoot(merkleRoot, voter.secretKey, signingAddress) };
+    if (voter.calidusId) {
+        sig.calidusDeclaration = { calidusId: voter.calidusId };
+    }
+    return sig;
+}
+
 function printStats(label: string, results: TimedResult[]) {
     const successful = results.filter(r => r.success);
     const failed = results.filter(r => !r.success);
@@ -101,7 +111,9 @@ const voters: DRepKeys[] = [];
 const results: TimedResult[] = [];
 let adversarialResults: Array<{ name: string; status: number; expected: number; code?: string; pass: boolean; durationMs: number }> = [];
 let burstResults: Array<{ phase: string; total: number; succeeded: number; failed: number; fetchErrors: number; elapsedMs: number; times?: number[] }> = [];
-let txMode = 'unknown';
+// Pipeline marker for the perf summary. With the unified queue worker
+// there's only one path, so this is constant.
+const txMode = 'queue';
 
 // Key generation runs concurrently with setup phases.
 // Started in beforeAll, awaited before voting begins.
@@ -278,9 +290,8 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
 
         expect(status).toBe(200);
         expect(json.data.ballotCached).toBe(true);
-        txMode = json.data.txMode ?? 'trp';
         setupDurationMs = Math.round(performance.now() - setupStartTime);
-        console.log(`  Head opened (setup: ${Math.round(setupDurationMs / 1000)}s, txMode: ${txMode})`);
+        console.log(`  Head opened (setup: ${Math.round(setupDurationMs / 1000)}s, pipeline: ${txMode})`);
     }, 660_000);
 
     // ===== Phase 3: Wait for voting window =====
@@ -307,13 +318,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
             const votes = [{ questionId: 'q1', selection: [1] }]; // Yes
             const payload: SignedVotePayload = { ballotId: prepareTxHash, nonce: 1, votes };
             const merkleRoot = computeMerkleRoot(payload);
-            // For calidus voters, sign with the calidus key but use pool ID as voter address
-            const signingAddress = voter.calidusId ?? voter.drepId;
-            const sig = signMerkleRoot(merkleRoot, voter.secretKey, signingAddress);
-            const signature: any = { ...sig };
-            if (voter.calidusId) {
-                signature.calidusDeclaration = { calidusId: voter.calidusId };
-            }
+            const signature = buildVoteSignature(voter, merkleRoot);
 
             const { status, json, durationMs } = await api('POST', '/vote-and-register', {
                 voterId: voter.drepId,
@@ -356,10 +361,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
             const votes = [{ questionId: 'q1', selection: [0] }]; // Changed to No
             const payload: SignedVotePayload = { ballotId: prepareTxHash, nonce: 2, votes };
             const merkleRoot = computeMerkleRoot(payload);
-            const signingAddress = voter.calidusId ?? voter.drepId;
-            const sig = signMerkleRoot(merkleRoot, voter.secretKey, signingAddress);
-            const signature: any = { ...sig };
-            if (voter.calidusId) signature.calidusDeclaration = { calidusId: voter.calidusId };
+            const signature = buildVoteSignature(voter, merkleRoot);
 
             const { status, json, durationMs } = await api('POST', '/vote', {
                 voterId: voter.drepId,
@@ -418,7 +420,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
             const votes = [{ questionId: 'q1', selection: [2] }]; // Abstain
             const payload: SignedVotePayload = { ballotId: prepareTxHash, nonce: nextNonce, votes };
             const merkleRoot = computeMerkleRoot(payload);
-            const signature = signMerkleRoot(merkleRoot, voter.secretKey, voter.drepId);
+            const signature = buildVoteSignature(voter, merkleRoot);
 
             try {
                 const { status, json, durationMs } = await api('POST', '/vote', {
@@ -494,10 +496,10 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
                 const votes = [{ questionId: 'q1', selection: [2] }];
                 const payload: SignedVotePayload = { ballotId: prepareTxHash, nonce: retryNonce, votes };
                 const merkleRoot = computeMerkleRoot(payload);
-                const signature = signMerkleRoot(merkleRoot, voter.secretKey, voter.drepId);
+                const signature = buildVoteSignature(voter, merkleRoot);
 
                 const { status } = await api('POST', '/vote', {
-                    voterId: voter.drepId, nonce: retryNonce, ballotId: prepareTxHash, votes, signature,
+                    voterId: voter.drepId, nonce: retryNonce, ballotId: prepareTxHash, votes, signature, responderRole: voter.role,
                 });
                 if (status === 200) retried++;
             }
@@ -533,7 +535,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
             const votes = [{ questionId: 'q1', selection: [1] }]; // Back to Yes
             const payload: SignedVotePayload = { ballotId: prepareTxHash, nonce: nextNonce, votes };
             const merkleRoot = computeMerkleRoot(payload);
-            const signature = signMerkleRoot(merkleRoot, voter.secretKey, voter.drepId);
+            const signature = buildVoteSignature(voter, merkleRoot);
 
             try {
                 const { status, json, durationMs } = await api('POST', '/vote', {
@@ -602,10 +604,10 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
                 const votes = [{ questionId: 'q1', selection: [1] }];
                 const payload: SignedVotePayload = { ballotId: prepareTxHash, nonce: retryNonce, votes };
                 const merkleRoot = computeMerkleRoot(payload);
-                const signature = signMerkleRoot(merkleRoot, voter.secretKey, voter.drepId);
+                const signature = buildVoteSignature(voter, merkleRoot);
 
                 const { status } = await api('POST', '/vote', {
-                    voterId: voter.drepId, nonce: retryNonce, ballotId: prepareTxHash, votes, signature,
+                    voterId: voter.drepId, nonce: retryNonce, ballotId: prepareTxHash, votes, signature, responderRole: voter.role,
                 });
                 if (status === 200) retried++;
             }
@@ -1188,7 +1190,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
         const log = (s: string) => { lines.push(s); console.log(`  ${s}`); };
 
         log('========== PERFORMANCE SUMMARY ==========');
-        log(`Voters: ${VOTER_COUNT} | TX_MODE: ${txMode}`);
+        log(`Voters: ${VOTER_COUNT} | Pipeline: ${txMode} (TRP resolve + WS submit + queue worker)`);
         log(`Key generation: ${Math.round(keyGenDurationMs / 1000)}s (concurrent with setup)`);
         log(`Setup (sweep → prepare → L1 confirm → head open): ${Math.round(setupDurationMs / 1000)}s`);
         log(`Timestamp: ${new Date().toISOString()}`);
@@ -1212,7 +1214,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
 
         // --- Retry stats ---
         log('');
-        log('Retry stats (submitWithRetry):');
+        log('Retry stats (queue worker):');
         for (const op of ['vote-and-register', 'cast_vote'] as const) {
             const subset = results.filter(r => r.operation === op && r.success && r.attempts);
             if (subset.length === 0) continue;

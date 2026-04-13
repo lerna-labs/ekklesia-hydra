@@ -1,13 +1,15 @@
-import { getAdmin, createIpfsClient, createDiskCache, submitTx, HydraMonitor } from '@lerna-labs/hydra-sdk';
+import { getAdmin, createIpfsClient, createDiskCache, HydraMonitor } from '@lerna-labs/hydra-sdk';
 import type { IpfsClient, DiskCache } from '@lerna-labs/hydra-sdk';
 import { MeshWallet } from '@meshsdk/core';
+import { deserializeTx } from '@meshsdk/core-cst';
 import { TRPClientLogged as Client } from './trp-client.js';
 import { bech32 } from 'bech32';
-import { createHash } from 'crypto';
 import { blake2b } from 'blakejs';
 import { CREDENTIAL_PREFIX } from './types.js';
 import type { VoteCacheEntry, VoteHistoryEntry } from './types.js';
 import { TxQueue } from './tx-queue.js';
+import type { TxType } from './tx-queue.js';
+import { QueueWorker } from './queue-worker.js';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import type { Response } from 'express';
@@ -18,7 +20,6 @@ export const CLOSE_TOKEN = process.env.CLOSE_TOKEN || 'shutitdown';
 export const IPFS_API_URL = process.env.IPFS_API_URL || 'http://localhost:5001';
 export const IPFS_STAGING_DIR = process.env.IPFS_STAGING_DIR || '/ipfs-staging';
 export const VERBOSE = process.env.VERBOSE === '1' || process.env.VERBOSE === 'true';
-export const TX_MODE = (process.env.TX_MODE || 'trp') as 'trp' | 'direct';
 
 /** Log only when VERBOSE mode is enabled. Errors always log regardless. */
 export function debug(...args: unknown[]): void {
@@ -41,76 +42,8 @@ export function getHeadId(): string | null {
 }
 
 // ---------------------------------------------------------------------------
-// UTxO Reference Cache (for direct tx pipeline)
+// Tx hash helper (blake2b-256 of the tx body — invariant across signing)
 // ---------------------------------------------------------------------------
-
-import type { UtxoRef, Amount } from './tx-builder.js';
-import { hydraValueToAmounts } from './tx-builder.js';
-
-export interface CachedUtxo {
-    ref: UtxoRef;
-    value: Amount[];
-    datum?: any;
-    address: string;
-}
-
-/** Ballot token UTxO — shared gas input for register/finalize. */
-let _ballotUtxo: CachedUtxo | null = null;
-
-/** Per-voter token UTxOs — keyed by userId (hex asset name). */
-const _voterUtxos = new Map<string, CachedUtxo>();
-
-export function getBallotUtxo(): CachedUtxo | null { return _ballotUtxo; }
-export function setBallotUtxo(u: CachedUtxo | null): void { _ballotUtxo = u; }
-export function getVoterUtxo(userId: string): CachedUtxo | undefined { return _voterUtxos.get(userId); }
-export function setVoterUtxo(userId: string, u: CachedUtxo): void { _voterUtxos.set(userId, u); }
-export function deleteVoterUtxo(userId: string): void { _voterUtxos.delete(userId); }
-export function clearUtxoCache(): void { _ballotUtxo = null; _voterUtxos.clear(); }
-
-/**
- * Seed the ballot UTxO cache from the head snapshot.
- * Called once after head opens and on reconnect.
- */
-export async function seedBallotUtxoFromSnapshot(
-    snapshotUtxos: Record<string, any>,
-    ballotInstancePrefix: string,
-): Promise<CachedUtxo | null> {
-    for (const [ref, utxo] of Object.entries(snapshotUtxos)) {
-        const u = utxo as any;
-        for (const [pid, assets] of Object.entries(u.value)) {
-            if (pid === 'lovelace' || typeof assets !== 'object') continue;
-            for (const name of Object.keys(assets as Record<string, number>)) {
-                if (name.startsWith(ballotInstancePrefix)) {
-                    const [txHash, idx] = ref.split('#');
-                    const cached: CachedUtxo = {
-                        ref: { txHash, outputIndex: parseInt(idx) },
-                        value: hydraValueToAmounts(u.value),
-                        datum: u.inlineDatum,
-                        address: u.address,
-                    };
-                    _ballotUtxo = cached;
-                    debug(`[utxo-cache] Ballot UTxO seeded: ${ref}`);
-                    return cached;
-                }
-            }
-        }
-    }
-    return null;
-}
-
-// ---------------------------------------------------------------------------
-// Direct WebSocket submission (bypass TRP)
-// ---------------------------------------------------------------------------
-
-/**
- * Submit a signed transaction directly to the Hydra head via WebSocket.
- *
- * Sends `NewTx` on the monitor's existing WebSocket connection and waits
- * for `TxValid` (success) or `TxInvalid` (failure).
- *
- * No HTTP overhead, no TRP rate limiting.
- */
-import { deserializeTx } from '@meshsdk/core-cst';
 
 /**
  * Compute the Cardano transaction hash from unsigned or signed CBOR.
@@ -118,188 +51,6 @@ import { deserializeTx } from '@meshsdk/core-cst';
  */
 function computeTxHash(cborHex: string): string {
     return deserializeTx(cborHex).body().hash();
-}
-
-export interface SubmitDirectOptions {
-    timeoutMs?: number;
-    /** Wait for SnapshotConfirmed before resolving. Default true.
-     *  Set to false for non-contending operations (cast_vote, burns)
-     *  where the tx spends a unique UTxO and no other tx depends on it. */
-    awaitSnapshot?: boolean;
-}
-
-export async function submitDirect(
-    signedCborHex: string,
-    unsignedCborHex?: string,
-    options?: SubmitDirectOptions,
-): Promise<{ hash: string }> {
-    const timeoutMs = options?.timeoutMs ?? 120_000;
-    const awaitSnapshot = options?.awaitSnapshot ?? true;
-    const ws = hydraMonitor.ws;
-
-    if (ws.connectionState !== 'CONNECTED') {
-        debug('[submitDirect] WebSocket not connected, reconnecting…');
-        await ws.waitForGreetings();
-    }
-
-    const expectedTxId = computeTxHash(unsignedCborHex ?? signedCborHex);
-    debug(`[submitDirect] Submitting tx ${expectedTxId.slice(0, 16)}… (awaitSnapshot=${awaitSnapshot})`);
-
-    return new Promise((resolve, reject) => {
-        let settled = false;
-        let txAccepted = false;
-
-        const settle = (fn: Function, value: any) => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(timer);
-            ws.removeListener('message', onMsg);
-            fn(value);
-        };
-
-        const timer = setTimeout(
-            () => settle(reject, new Error(`submitDirect timed out for tx ${expectedTxId.slice(0, 16)}…`)),
-            timeoutMs,
-        );
-
-        const onMsg = (msg: any) => {
-            if (msg.tag === 'TxValid' && msg.transactionId === expectedTxId) {
-                debug(`[submitDirect] TxValid accepted: ${expectedTxId.slice(0, 16)}…`);
-                if (!awaitSnapshot) {
-                    // Non-contending: resolve immediately on TxValid
-                    settle(resolve, { hash: expectedTxId });
-                    return;
-                }
-                txAccepted = true;
-            } else if (msg.tag === 'TxInvalid') {
-                const invalidTxId = msg.transaction?.txId ?? msg.txId ?? '';
-                if (invalidTxId === expectedTxId) {
-                    const reason = msg.validationError?.reason ?? JSON.stringify(msg);
-                    debug(`[submitDirect] TxInvalid for ${expectedTxId.slice(0, 16)}…: ${reason.slice(0, 200)}`);
-                    settle(reject, new Error(`TxInvalid: ${reason}`));
-                }
-            } else if (msg.tag === 'SnapshotConfirmed' && txAccepted) {
-                const confirmed: any[] = msg.snapshot?.confirmed ?? msg.confirmed ?? [];
-                const found = confirmed.some((tx: any) => tx.txId === expectedTxId);
-                if (found) {
-                    debug(`[submitDirect] SnapshotConfirmed for ${expectedTxId.slice(0, 16)}…`);
-                    settle(resolve, { hash: expectedTxId });
-                }
-            }
-        };
-
-        ws.on('message', onMsg);
-
-        ws.send({
-            tag: 'NewTx',
-            transaction: {
-                type: 'Witnessed Tx ConwayEra' as const,
-                description: '',
-                cborHex: signedCborHex,
-            },
-        });
-    });
-}
-
-/**
- * Submit a batch of transactions concurrently via WebSocket.
- * Resolves on TxValid for each tx (no SnapshotConfirmed wait — batched burns are non-contending).
- * Returns results keyed by the provided `id` for each tx.
- */
-export async function submitDirectBatch(
-    txs: Array<{ signedCborHex: string; unsignedCborHex: string; id: string }>,
-    timeoutMs = 120_000,
-): Promise<{ succeeded: Map<string, string>; failed: Map<string, string> }> {
-    const ws = hydraMonitor.ws;
-
-    if (ws.connectionState !== 'CONNECTED') {
-        debug('[submitDirectBatch] WebSocket not connected, reconnecting…');
-        await ws.waitForGreetings();
-    }
-
-    // Compute tx hashes upfront and build lookup maps
-    const hashToId = new Map<string, string>();
-    const txEntries: Array<{ id: string; hash: string; signedCborHex: string }> = [];
-    for (const tx of txs) {
-        const hash = computeTxHash(tx.unsignedCborHex);
-        hashToId.set(hash, tx.id);
-        txEntries.push({ id: tx.id, hash, signedCborHex: tx.signedCborHex });
-    }
-
-    debug(`[submitDirectBatch] Submitting ${txs.length} txs…`);
-
-    return new Promise((resolve, reject) => {
-        const succeeded = new Map<string, string>(); // id → txHash
-        const failed = new Map<string, string>();     // id → reason
-        let settled = false;
-        const total = txEntries.length;
-
-        const checkDone = () => {
-            if (succeeded.size + failed.size >= total) {
-                if (settled) return;
-                settled = true;
-                clearTimeout(timer);
-                ws.removeListener('message', onMsg);
-                resolve({ succeeded, failed });
-            }
-        };
-
-        const timer = setTimeout(() => {
-            if (settled) return;
-            settled = true;
-            ws.removeListener('message', onMsg);
-            // Mark remaining as timed out
-            for (const entry of txEntries) {
-                if (!succeeded.has(entry.id) && !failed.has(entry.id)) {
-                    failed.set(entry.id, 'timeout');
-                }
-            }
-            resolve({ succeeded, failed });
-        }, timeoutMs);
-
-        const onMsg = (msg: any) => {
-            if (msg.tag === 'TxValid') {
-                const txId = msg.transactionId;
-                const id = hashToId.get(txId);
-                if (id && !succeeded.has(id)) {
-                    succeeded.set(id, txId);
-                    checkDone();
-                }
-            } else if (msg.tag === 'TxInvalid') {
-                const txId = msg.transaction?.txId ?? msg.txId ?? '';
-                const id = hashToId.get(txId);
-                if (id && !failed.has(id)) {
-                    const reason = msg.validationError?.reason ?? 'unknown';
-                    failed.set(id, reason);
-                    checkDone();
-                }
-            }
-        };
-
-        ws.on('message', onMsg);
-
-        // Fire all NewTx messages
-        for (const entry of txEntries) {
-            ws.send({
-                tag: 'NewTx',
-                transaction: {
-                    type: 'Witnessed Tx ConwayEra' as const,
-                    description: '',
-                    cborHex: entry.signedCborHex,
-                },
-            });
-        }
-    });
-}
-
-/**
- * Check if a TxInvalid error is retryable (stale UTxO ref).
- * When this returns true, the caller should rehydrate the UTxO cache
- * from the head snapshot and rebuild the transaction.
- */
-export function isDirectRetryable(message: string): boolean {
-    const lower = message.toLowerCase();
-    return lower.includes('badinputsutxo') || lower.includes('bad inputs');
 }
 
 // ---------------------------------------------------------------------------
@@ -322,137 +73,61 @@ export const voteCache: DiskCache<VoteCacheEntry> = createDiskCache<VoteCacheEnt
 );
 
 // ---------------------------------------------------------------------------
-// Transaction Queue (singleton)
+// Transaction Queue (singleton) + Queue Worker
 // ---------------------------------------------------------------------------
 
 export const txQueue = new TxQueue(IPFS_STAGING_DIR);
 
 /**
- * Parse a TRP submitTx response. Throws on JSON-RPC errors so the caller
- * doesn't silently treat a rejected transaction as success.
+ * Background dispatcher for the WAL. Submits BUILT entries to the head via
+ * WebSocket, listens for TxValid/TxInvalid/SnapshotConfirmed, and enforces
+ * ordering rules (per-voter sequencing + ballot-token contention).
+ *
+ * Started in `index.ts` after `hydraMonitor.start()` succeeds.
  */
-export function parseTrpSubmitResponse(responseText: string): { hash?: string } {
-    const parsed = JSON.parse(responseText);
-    if (parsed.error) {
-        const detail = typeof parsed.error.data === 'string'
-            ? parsed.error.data
-            : JSON.stringify(parsed.error.data);
-        throw new Error(`TRP submit rejected: ${parsed.error.message} — ${detail}`);
-    }
-    return { hash: parsed.result?.hash ?? parsed.hash };
+export const queueWorker = new QueueWorker(txQueue, hydraMonitor);
+
+// ---------------------------------------------------------------------------
+// enqueueAndWait — single-call: sign + WAL enqueue + await TxValid
+// ---------------------------------------------------------------------------
+
+export interface EnqueueArgs {
+    /** Stable, idempotent ID — `voterId:nonce` for votes, `burn:tokenName` for burns. */
+    id: string;
+    type: TxType;
+    /** Unsigned CBOR (from TRP resolve) — used to compute the tx hash before signing. */
+    unsignedCborHex: string;
+    /** Signed CBOR (admin signature applied) — what the worker submits to the head. */
+    signedCborHex: string;
+    /** Optional voter ID for per-voter ordering enforcement in the worker. */
+    voterId?: string;
+    /** Per-entry timeout (default 120s). */
+    timeoutMs?: number;
 }
 
 /**
- * Check if a TRP error is retryable.
- *
- * Retryable conditions:
- * - UTxO contention (BadInputsUTxO, stale snapshot)
- * - Rate limiting (HTTP 429 from TRP/Dolos)
- * - Failed to resolve (TRP behind head state)
- *
- * Non-retryable errors (validation, script errors) should fail immediately.
+ * Enqueue a signed transaction to the WAL and wait for the queue worker to
+ * report TxValid. The tx hash is computed from the **unsigned** CBOR — it
+ * is invariant across signing because it's blake2b-256 of the tx body only.
  */
-export function isRetryableError(err: { message?: string; statusCode?: number }): boolean {
-    // HTTP 429 — TRP rate limit
-    if (err.statusCode === 429) return true;
+export async function enqueueAndWait(args: EnqueueArgs): Promise<{ txHash: string }> {
+    const txHash = computeTxHash(args.unsignedCborHex);
 
-    const lower = (err.message ?? '').toLowerCase();
-    return (
-        lower.includes('429') ||
-        lower.includes('too many requests') ||
-        lower.includes('badinputsutxo') ||
-        lower.includes('bad inputs') ||
-        lower.includes('utxo') && lower.includes('not found') ||
-        lower.includes('failed to resolve')
-    );
+    await txQueue.enqueue({
+        id: args.id,
+        type: args.type,
+        state: 'BUILT',
+        txHash,
+        signedCborHex: args.signedCborHex,
+        voterId: args.voterId,
+        attempts: 0,
+    });
+
+    return txQueue.waitForAcceptance(args.id, args.timeoutMs);
 }
 
-export interface RetryOptions {
-    maxAttempts?: number;    // default: 5
-    baseDelayMs?: number;   // default: 150
-    maxDelayMs?: number;    // default: 2000
-    timeoutMs?: number;     // default: 60000 (60s total budget)
-}
-
-/**
- * Resolve, sign, and submit a transaction with automatic retry on UTxO contention.
- *
- * When the Hydra head snapshot updates between resolve and submit (or TRP is
- * behind the head), the transaction references a stale UTxO. This function
- * re-resolves against the latest snapshot and retries.
- *
- * Only retries on contention errors (BadInputsUTxO, Failed to resolve).
- * Validation errors, script errors, etc. fail immediately.
- */
-export async function submitWithRetry(
-    resolveFn: () => Promise<{ tx: string }>,
-    signFn: (tx: string) => Promise<string>,
-    submitId: string,
-    options?: RetryOptions,
-): Promise<{ hash: string; attempts: number }> {
-    const maxAttempts = options?.maxAttempts ?? 5;
-    const baseDelayMs = options?.baseDelayMs ?? 150;
-    const maxDelayMs = options?.maxDelayMs ?? 2000;
-    const timeoutMs = options?.timeoutMs ?? 60_000;
-
-    const startTime = Date.now();
-    let lastError: Error | null = null;
-
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        // Check total time budget
-        if (Date.now() - startTime > timeoutMs) {
-            throw lastError ?? new Error(`submitWithRetry timed out after ${timeoutMs}ms`);
-        }
-
-        try {
-            // 1. Resolve against latest snapshot
-            const { tx } = await resolveFn();
-
-            // 2. Sign locally
-            const signedTx = await signFn(tx);
-
-            // 3. Submit to TRP
-            const submitResponse = await submitTx(TRP_URL, signedTx, submitId);
-            const submitText = await submitResponse.text();
-
-            // 4. Parse — throws on error
-            const { hash } = parseTrpSubmitResponse(submitText);
-
-            if (attempt > 1) {
-                debug(`[submitWithRetry] Succeeded on attempt ${attempt} for ${submitId}`);
-            }
-
-            return { hash: hash ?? '', attempts: attempt };
-        } catch (err: any) {
-            lastError = err;
-
-            // Don't retry non-retryable errors
-            if (!isRetryableError(err)) {
-                throw err;
-            }
-
-            // Don't retry if we've exhausted attempts
-            if (attempt >= maxAttempts) {
-                throw err;
-            }
-
-            // Don't retry if we've exceeded the time budget
-            const elapsed = Date.now() - startTime;
-            if (elapsed > timeoutMs) {
-                throw err;
-            }
-
-            // Exponential backoff with jitter
-            const delay = Math.min(baseDelayMs * Math.pow(2, attempt - 1), maxDelayMs);
-            const jitter = Math.floor(Math.random() * delay * 0.3);
-            debug(`[submitWithRetry] Attempt ${attempt} failed for ${submitId} (${err.message?.slice(0, 60)}), retrying in ${delay + jitter}ms`);
-            await new Promise(r => setTimeout(r, delay + jitter));
-        }
-    }
-
-    // Should never reach here, but just in case
-    throw lastError ?? new Error('submitWithRetry exhausted all attempts');
-}
+/** Re-export computeTxHash for callers that need the hash before enqueue. */
+export { computeTxHash };
 
 /** Recursively convert BigInt values to strings for JSON serialization. */
 export function sanitizeBigInts(obj: any): any {

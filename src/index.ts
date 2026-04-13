@@ -13,8 +13,9 @@ setGlobalDispatcher(new Agent({
 }));
 
 import express from 'express';
+import { Wrangler } from '@lerna-labs/hydra-sdk';
 import { authHeaderMiddleware } from './middleware.js';
-import { HYDRA_NETWORK, VERBOSE, voteCache, hydraMonitor, txQueue } from './helpers.js';
+import { HYDRA_NETWORK, VERBOSE, voteCache, hydraMonitor, txQueue, queueWorker } from './helpers.js';
 
 import auditRoutes from './routes/audit.js';
 import ballotRoutes from './routes/ballot.js';
@@ -53,11 +54,13 @@ process.on('unhandledRejection', (reason) => {
 
 process.on('SIGTERM', async () => {
     console.log('SIGTERM received, shutting down gracefully');
+    queueWorker.stop();
     await hydraMonitor.stop();
     process.exit(0);
 });
 process.on('SIGINT', async () => {
     console.log('SIGINT received, shutting down gracefully');
+    queueWorker.stop();
     await hydraMonitor.stop();
     process.exit(0);
 });
@@ -126,6 +129,37 @@ async function start() {
     if (!connected) {
         console.warn(`HydraMonitor failed to connect after ${maxWaitMs / 1000}s — starting anyway (will auto-reconnect)`);
     }
+
+    // Start the queue worker — attaches WS listener and begins dispatch loop.
+    queueWorker.start();
+
+    // Reconcile any in-flight WAL entries against the current head snapshot.
+    // Best-effort: BUILT entries get re-dispatched; SUBMITTED/ACCEPTED entries
+    // are checked against the snapshot for confirmation.
+    if (connected) {
+        try {
+            const wrangler = new Wrangler(process.env.HYDRA_API_URL, undefined, hydraMonitor);
+            const result = await queueWorker.reconcile(() => wrangler.http.getSnapshotUtxo());
+            if (result.reconciled > 0 || result.resubmitted > 0) {
+                console.log(`Queue reconciled: ${result.reconciled} confirmed, ${result.resubmitted} pending re-dispatch`);
+            }
+        } catch (err: any) {
+            console.warn(`Queue reconciliation failed (continuing): ${err.message}`);
+        }
+    }
+
+    // Re-reconcile on every monitor reconnect — head may have advanced or restarted.
+    hydraMonitor.on('connected', async () => {
+        try {
+            const wrangler = new Wrangler(process.env.HYDRA_API_URL, undefined, hydraMonitor);
+            const result = await queueWorker.reconcile(() => wrangler.http.getSnapshotUtxo());
+            if (result.reconciled > 0 || result.resubmitted > 0) {
+                console.log(`Queue re-reconciled after reconnect: ${result.reconciled} confirmed, ${result.resubmitted} pending`);
+            }
+        } catch (err: any) {
+            console.warn(`Queue re-reconcile failed: ${err.message}`);
+        }
+    });
 
     app.listen(port, () => {
         console.log(`Hydra middleware running on http://localhost:${port} (network ${HYDRA_NETWORK})`);

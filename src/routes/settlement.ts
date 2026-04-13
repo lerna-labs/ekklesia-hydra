@@ -1,10 +1,9 @@
 import { Router } from 'express';
-import { MeshTxBuilder } from '@meshsdk/core';
-import { createNativeScript, submitTx, Wrangler } from '@lerna-labs/hydra-sdk';
+import { createNativeScript, Wrangler } from '@lerna-labs/hydra-sdk';
 import { blake2b256, bytesToHex, computePackage } from '@lerna-labs/hydra-proof';
 import type { FileLeaf } from '@lerna-labs/hydra-proof';
-import { initialize, voterIdToTokenName, TRP_URL, CLOSE_TOKEN, VERBOSE, IPFS_STAGING_DIR, ipfs, voteCache, success, error, debug, parseTrpSubmitResponse, submitWithRetry, hydraMonitor, getHeadId, TX_MODE, getBallotUtxo, setBallotUtxo, getVoterUtxo, deleteVoterUtxo, submitDirect, submitDirectBatch, txQueue } from '../helpers.js';
-import { buildCountVoteTx, buildFinalizeBallotTx, hydraValueToAmounts } from '../tx-builder.js';
+import { initialize, voterIdToTokenName, CLOSE_TOKEN, VERBOSE, IPFS_STAGING_DIR, ipfs, voteCache, success, error, debug, hydraMonitor, getHeadId, txQueue, enqueueAndWait } from '../helpers.js';
+import { hydraValueToAmounts } from '../tx-builder.js';
 import { getCachedBallot } from './lifecycle.js';
 import { BALLOT_INSTANCE_PREFIX, BALLOT_DEFINITION_PREFIX, BallotStatus, HRP_TO_ROLE } from '../types.js';
 import type {
@@ -67,108 +66,6 @@ interface HeadVoterInfo {
     value: Array<{ unit: string; quantity: string }>;
     /** UTxO address. */
     address: string;
-}
-
-// ---------------------------------------------------------------------------
-// MeshTxBuilder-based in-head finalize (bypasses tx3 for datum encoding test)
-// ---------------------------------------------------------------------------
-
-/**
- * Build and submit a finalize transaction inside the Hydra head using
- * MeshTxBuilder. The ballot token UTxO is the sole input (it carries all
- * the ADA + the token). Output is the same UTxO with updated datum.
- *
- * Datum shape: Constr 0 [[ballotId, resultsHash, evidenceCid, merkleRoot], 1]
- * Matches the tx3 BallotResult { Fields: List<Bytes>, Version: Int } type.
- */
-async function finalizeBallotViaMesh(
-    wrangler: Wrangler,
-    adminWallet: any,
-    adminAddress: string,
-    ballotId: string,
-    resultsHash: string,
-    evidenceCid: string,
-    merkleRoot: string,
-): Promise<string> {
-    const snapshot = await wrangler.http.getSnapshotUtxo();
-
-    // Find the ballot token UTxO (the only UTxO with the ballot instance token)
-    let ballotRef: string | null = null;
-    let ballotEntry: any = null;
-
-    for (const [ref, utxo] of Object.entries(snapshot)) {
-        const u = utxo as any;
-        for (const [pid, assets] of Object.entries(u.value)) {
-            if (pid === 'lovelace' || typeof assets !== 'object') continue;
-            for (const name of Object.keys(assets as Record<string, number>)) {
-                if (name.startsWith(BALLOT_INSTANCE_PREFIX)) {
-                    ballotRef = ref;
-                    ballotEntry = u;
-                    break;
-                }
-            }
-            if (ballotRef) break;
-        }
-        if (ballotRef) break;
-    }
-
-    if (!ballotRef || !ballotEntry) throw new Error('Ballot token UTxO not found in head');
-
-    const [txHash, txIdx] = ballotRef.split('#');
-
-    // Build amount array from snapshot value
-    const amount: Array<{ unit: string; quantity: string }> = [];
-    for (const [key, val] of Object.entries(ballotEntry.value)) {
-        if (key === 'lovelace') {
-            amount.push({ unit: 'lovelace', quantity: String(val) });
-        } else if (typeof val === 'object') {
-            for (const [name, qty] of Object.entries(val as Record<string, number>)) {
-                amount.push({ unit: key + name, quantity: String(qty) });
-            }
-        }
-    }
-
-    // Build updated datum: Constr 0 [[fields...], version]
-    const toHex = (s: string) => s ? Buffer.from(s, 'utf-8').toString('hex') : '';
-    const updatedDatum = {
-        alternative: 0,
-        fields: [
-            [
-                ballotId || '',                 // BallotId: Bytes (already hex)
-                resultsHash || '',              // ResultsHash: Bytes (already hex)
-                toHex(evidenceCid),             // EvidenceCid: Bytes (IPFS CID → hex)
-                merkleRoot || '',               // MerkleRoot: Bytes (already hex)
-            ],
-            1,  // datum schema version
-        ],
-    };
-
-    debug('[finalizeMesh] Building in-head finalize tx via MeshTxBuilder');
-    debug('[finalizeMesh] Ballot UTxO:', ballotRef);
-    debug('[finalizeMesh] Datum fields:', JSON.stringify(updatedDatum));
-
-    // Single input → single output, zero fee
-    const txBuilder = new MeshTxBuilder();
-    txBuilder
-        .txIn(txHash, parseInt(txIdx), amount, ballotEntry.address)
-        .txOut(adminAddress, amount)
-        .txOutInlineDatumValue(updatedDatum)
-        .setFee('0')
-        .changeAddress(adminAddress);
-
-    const unsignedTx = txBuilder.completeSync();
-    const signedTx = await adminWallet.signTx(unsignedTx);
-
-    debug(`[finalizeMesh] Signed tx (${signedTx.length} chars)`);
-
-    // Submit to head via TRP
-    const ballotName = amount.find(a => a.unit !== 'lovelace')?.unit.slice(-64) ?? '';
-    const submitRes = await submitTx(TRP_URL, signedTx, `0:${ballotName}`);
-    const submitText = await submitRes.text();
-    debug('[finalizeMesh] submitTx response:', submitText);
-    const { hash: finalizeHash } = parseTrpSubmitResponse(submitText);
-
-    return finalizeHash ?? '';
 }
 
 /**
@@ -478,21 +375,23 @@ router.post('/finalize', async (req, res) => {
         // --- 6. Compute results hash ---
         const resultsHash = bytesToHex(blake2b256(JSON.stringify(fullResults)));
 
-        // --- 7. Update (601) datum via TRP ---
-        const { hash: txHash, attempts: finalizeAttempts } = await submitWithRetry(
-            () => client.finalizeBallotTx({
-                votingAuthority: admin_payment_address,
-                ballotPolicy: Buffer.from(ballotPolicy, 'hex'),
-                ballotToken: Buffer.from(ballotName, 'hex'),
-                ballotId: Buffer.from(ballotId, 'hex'),
-                resultsHash: Buffer.from(resultsHash, 'hex'),
-                evidenceCid: Buffer.from(evidenceDirectoryCid),
-                merkleRoot: Buffer.from(evidenceMerkleRoot, 'hex'),
-            }),
-            (tx) => admin_wallet.signTx(tx),
-            `0:${ballotName}`,
-        );
-        if (finalizeAttempts > 1) debug(`[finalize] Succeeded after ${finalizeAttempts} attempts`);
+        // --- 7. Update (601) datum via TRP + queue worker ---
+        const { tx: unsignedFinalizeTx } = await client.finalizeBallotTx({
+            votingAuthority: admin_payment_address,
+            ballotPolicy: Buffer.from(ballotPolicy, 'hex'),
+            ballotToken: Buffer.from(ballotName, 'hex'),
+            ballotId: Buffer.from(ballotId, 'hex'),
+            resultsHash: Buffer.from(resultsHash, 'hex'),
+            evidenceCid: Buffer.from(evidenceDirectoryCid),
+            merkleRoot: Buffer.from(evidenceMerkleRoot, 'hex'),
+        });
+        const signedFinalizeTx = await admin_wallet.signTx(unsignedFinalizeTx);
+        const { txHash } = await enqueueAndWait({
+            id: `finalize:${ballotName}`,
+            type: 'finalize',
+            unsignedCborHex: unsignedFinalizeTx,
+            signedCborHex: signedFinalizeTx,
+        });
 
         return success(res, {
             txHash,
@@ -501,7 +400,6 @@ router.post('/finalize', async (req, res) => {
             resultsCid,
             evidenceMerkleRoot,
             totalVoters: allVotes.length,
-            attempts: finalizeAttempts,
         });
     } catch (err: any) {
         console.error('Failed to finalize ballot:', err);
@@ -539,33 +437,39 @@ router.post('/count', async (req, res) => {
         } = createNativeScript(admin_payment_address);
 
         const allVotes = voteCache.getAll();
-        const results: Array<{ voterId: string; txHash?: string; attempts?: number; error?: string }> = [];
 
-        for (const vote of allVotes) {
+        // Resolve + sign + enqueue every burn, then wait for the worker to
+        // dispatch them all. Burns are non-contending so the worker pipelines
+        // them up to MAX_IN_FLIGHT in parallel.
+        const results = await Promise.allSettled(allVotes.map(async (vote) => {
             const tokenName = voterIdToTokenName(vote.voterId);
-            try {
-                const { hash: txHash, attempts } = await submitWithRetry(
-                    () => client.countVoteTx({
-                        votingAuthority: admin_payment_address,
-                        mintingScript: Buffer.from(TOKEN_SCRIPT as string, 'hex'),
-                        tokenPolicy: Buffer.from(TOKEN_POLICY as string, 'hex'),
-                        userId: Buffer.from(tokenName, 'hex'),
-                    }),
-                    (tx) => admin_wallet.signTx(tx),
-                    `0:${tokenName}`,
-                );
-                if (attempts > 1) debug(`[count] Burn for ${vote.voterId} succeeded after ${attempts} attempts`);
-                results.push({ voterId: vote.voterId, txHash, attempts });
-            } catch (err: any) {
-                console.error(`[count] FULL ERROR for ${vote.voterId}:`, err);
-                results.push({ voterId: vote.voterId, error: err.message });
-            }
-        }
+            const { tx: unsignedTx } = await client.countVoteTx({
+                votingAuthority: admin_payment_address,
+                mintingScript: Buffer.from(TOKEN_SCRIPT as string, 'hex'),
+                tokenPolicy: Buffer.from(TOKEN_POLICY as string, 'hex'),
+                userId: Buffer.from(tokenName, 'hex'),
+            });
+            const signedTx = await admin_wallet.signTx(unsignedTx);
+            const { txHash } = await enqueueAndWait({
+                id: `burn:${tokenName}`,
+                type: 'count_vote',
+                unsignedCborHex: unsignedTx,
+                signedCborHex: signedTx,
+            });
+            return { voterId: vote.voterId, txHash };
+        }));
 
-        const burned = results.filter((r) => r.txHash).length;
-        const failed = results.filter((r) => r.error).length;
+        const detailed = results.map((r, i) => {
+            if (r.status === 'fulfilled') return r.value;
+            const reason = (r.reason as Error)?.message ?? 'unknown';
+            console.error(`[count] FULL ERROR for ${allVotes[i].voterId}:`, reason);
+            return { voterId: allVotes[i].voterId, error: reason };
+        });
 
-        return success(res, { burned, failed, total: allVotes.length, results });
+        const burned = detailed.filter((r) => 'txHash' in r).length;
+        const failed = detailed.filter((r) => 'error' in r).length;
+
+        return success(res, { burned, failed, total: allVotes.length, results: detailed });
     } catch (err: any) {
         console.error('[count] FULL ERROR:', err);
         return error(res, 'INTERNAL_ERROR', err.message || 'Failed to burn voter tokens', 500);
@@ -646,65 +550,36 @@ router.post('/settle/burn', async (req, res) => {
             debug(`[settle/burn] Pre-burn ledger already exists, skipping (retry burn call)`);
         }
 
+        // Resolve + sign + enqueue every burn. The worker dispatches in
+        // parallel up to MAX_IN_FLIGHT. Burns are non-contending so they
+        // pipeline freely. Idempotent: if a burn entry already exists in
+        // the WAL (e.g., from a previous /settle/burn call), enqueueing
+        // again with the same id overwrites the prior state — but we'd
+        // also re-await its acceptance, so retries Just Work.
+        const burnResults = await Promise.allSettled(headVoters.map(async (voter) => {
+            const { tx: unsignedTx } = await client.countVoteTx({
+                votingAuthority: admin_payment_address,
+                mintingScript: Buffer.from(TOKEN_SCRIPT as string, 'hex'),
+                tokenPolicy: Buffer.from(TOKEN_POLICY as string, 'hex'),
+                userId: Buffer.from(voter.tokenName, 'hex'),
+            });
+            const signedTx = await admin_wallet.signTx(unsignedTx);
+            return enqueueAndWait({
+                id: `burn:${voter.tokenName}`,
+                type: 'count_vote',
+                unsignedCborHex: unsignedTx,
+                signedCborHex: signedTx,
+            });
+        }));
+
         let burned = 0;
         let burnFailed = 0;
-
-        if (TX_MODE === 'direct') {
-            const BURN_BATCH_SIZE = 100;
-            const burnTxs: Array<{ signedCborHex: string; unsignedCborHex: string; id: string }> = [];
-
-            for (const voter of headVoters) {
-                try {
-                    const unsignedTx = buildCountVoteTx({
-                        adminAddress: admin_payment_address,
-                        tokenPolicy: TOKEN_POLICY as string,
-                        tokenScript: TOKEN_SCRIPT as string,
-                        userId: voter.tokenName,
-                        inputRef: voter.ref,
-                        inputValue: voter.value,
-                    });
-                    const signedTx = await admin_wallet.signTx(unsignedTx);
-                    burnTxs.push({ signedCborHex: signedTx, unsignedCborHex: unsignedTx, id: voter.tokenName });
-                } catch (err: any) {
-                    console.error(`[settle/burn] Failed to build burn tx for ${voter.tokenName}:`, err.message);
-                    burnFailed++;
-                }
-            }
-
-            for (let i = 0; i < burnTxs.length; i += BURN_BATCH_SIZE) {
-                const batch = burnTxs.slice(i, i + BURN_BATCH_SIZE);
-                debug(`[settle/burn] Batch ${Math.floor(i / BURN_BATCH_SIZE) + 1} (${batch.length} txs)…`);
-                const { succeeded, failed } = await submitDirectBatch(batch);
-                burned += succeeded.size;
-                burnFailed += failed.size;
-                for (const [id] of succeeded) deleteVoterUtxo(id);
-            }
-        } else {
-            // TRP mode: batch burns concurrently (non-contending, each voter has own UTxO)
-            const BURN_BATCH_SIZE = 100;
-            for (let i = 0; i < headVoters.length; i += BURN_BATCH_SIZE) {
-                const batch = headVoters.slice(i, i + BURN_BATCH_SIZE);
-                debug(`[settle/burn] TRP batch ${Math.floor(i / BURN_BATCH_SIZE) + 1} (${batch.length} txs)…`);
-                const batchResults = await Promise.allSettled(batch.map(voter =>
-                    submitWithRetry(
-                        () => client.countVoteTx({
-                            votingAuthority: admin_payment_address,
-                            mintingScript: Buffer.from(TOKEN_SCRIPT as string, 'hex'),
-                            tokenPolicy: Buffer.from(TOKEN_POLICY as string, 'hex'),
-                            userId: Buffer.from(voter.tokenName, 'hex'),
-                        }),
-                        (tx) => admin_wallet.signTx(tx),
-                        `0:${voter.tokenName}`,
-                    ),
-                ));
-                for (let j = 0; j < batchResults.length; j++) {
-                    if (batchResults[j].status === 'fulfilled') {
-                        burned++;
-                    } else {
-                        console.error(`[settle/burn] FULL ERROR for ${batch[j].tokenName}:`, (batchResults[j] as PromiseRejectedResult).reason?.message);
-                        burnFailed++;
-                    }
-                }
+        for (let i = 0; i < burnResults.length; i++) {
+            if (burnResults[i].status === 'fulfilled') {
+                burned++;
+            } else {
+                console.error(`[settle/burn] FULL ERROR for ${headVoters[i].tokenName}:`, (burnResults[i] as PromiseRejectedResult).reason?.message);
+                burnFailed++;
             }
         }
 
@@ -882,58 +757,23 @@ router.post('/settle/finalize', async (req, res) => {
         fullResults.evidenceIpfsCid = evidenceDirectoryCid;
         const resultsHash = bytesToHex(blake2b256(JSON.stringify(fullResults)));
 
-        // Finalize ballot datum in-head
-        let finalizeTxHash: string;
-
-        if (TX_MODE === 'direct') {
-            let ballotUtxo = getBallotUtxo();
-            if (!ballotUtxo) {
-                const snap = await wrangler.http.getSnapshotUtxo();
-                for (const [ref, utxo] of Object.entries(snap)) {
-                    const u = utxo as any;
-                    for (const [pid, assets] of Object.entries(u.value)) {
-                        if (pid === 'lovelace' || typeof assets !== 'object') continue;
-                        for (const name of Object.keys(assets as Record<string, number>)) {
-                            if (name.startsWith(BALLOT_INSTANCE_PREFIX)) {
-                                const [txH, idx] = ref.split('#');
-                                ballotUtxo = { ref: { txHash: txH, outputIndex: parseInt(idx) }, value: hydraValueToAmounts(u.value), datum: u.inlineDatum, address: u.address };
-                                break;
-                            }
-                        }
-                        if (ballotUtxo) break;
-                    }
-                    if (ballotUtxo) break;
-                }
-            }
-            if (!ballotUtxo) throw new Error('Ballot UTxO not found for finalize');
-
-            const unsignedTx = buildFinalizeBallotTx({
-                adminAddress: admin_payment_address,
-                ballotId, resultsHash,
-                evidenceCid: evidenceDirectoryCid,
-                merkleRoot: evidenceMerkleRoot,
-                inputRef: ballotUtxo.ref,
-                inputValue: ballotUtxo.value,
-            });
-            const signedTx = await admin_wallet.signTx(unsignedTx);
-            const result = await submitDirect(signedTx, unsignedTx);
-            finalizeTxHash = result.hash;
-        } else {
-            const result = await submitWithRetry(
-                () => client.finalizeBallotTx({
-                    votingAuthority: admin_payment_address,
-                    ballotPolicy: Buffer.from(ballotPolicy, 'hex'),
-                    ballotToken: Buffer.from(ballotName, 'hex'),
-                    ballotId: Buffer.from(ballotId, 'hex'),
-                    resultsHash: Buffer.from(resultsHash, 'hex'),
-                    evidenceCid: Buffer.from(evidenceDirectoryCid),
-                    merkleRoot: Buffer.from(evidenceMerkleRoot, 'hex'),
-                }),
-                (tx) => admin_wallet.signTx(tx),
-                `0:${ballotName}`,
-            );
-            finalizeTxHash = result.hash;
-        }
+        // Finalize ballot datum in-head — TRP resolves, worker dispatches.
+        const { tx: unsignedFinalizeTx } = await client.finalizeBallotTx({
+            votingAuthority: admin_payment_address,
+            ballotPolicy: Buffer.from(ballotPolicy, 'hex'),
+            ballotToken: Buffer.from(ballotName, 'hex'),
+            ballotId: Buffer.from(ballotId, 'hex'),
+            resultsHash: Buffer.from(resultsHash, 'hex'),
+            evidenceCid: Buffer.from(evidenceDirectoryCid),
+            merkleRoot: Buffer.from(evidenceMerkleRoot, 'hex'),
+        });
+        const signedFinalizeTx = await admin_wallet.signTx(unsignedFinalizeTx);
+        const { txHash: finalizeTxHash } = await enqueueAndWait({
+            id: `finalize:${ballotName}`,
+            type: 'finalize',
+            unsignedCborHex: unsignedFinalizeTx,
+            signedCborHex: signedFinalizeTx,
+        });
 
         return success(res, {
             txHash: finalizeTxHash,
@@ -1074,123 +914,34 @@ router.post('/settle', async (req, res) => {
         const headVoters = await getVotersFromHead(wrangler, TOKEN_POLICY as string);
 
         // --- Step 1: Burn all voter tokens ---
-        // Burns use the UTxO refs captured in the single snapshot from Step 0.
-        // All voters are burned regardless of evidence verification status.
-        // Burns are non-contending (each spends a unique voter UTxO), so they
-        // can be batched concurrently in direct mode.
+        // Burns are enqueued to the WAL; the worker dispatches them via
+        // WebSocket up to MAX_IN_FLIGHT in parallel. Each burn spends a
+        // unique voter UTxO so there's no contention. The worker handles
+        // retries on transient errors.
+        const burnResults = await Promise.allSettled(headVoters.map(async (voter) => {
+            const { tx: unsignedTx } = await client.countVoteTx({
+                votingAuthority: admin_payment_address,
+                mintingScript: Buffer.from(TOKEN_SCRIPT as string, 'hex'),
+                tokenPolicy: Buffer.from(TOKEN_POLICY as string, 'hex'),
+                userId: Buffer.from(voter.tokenName, 'hex'),
+            });
+            const signedTx = await admin_wallet.signTx(unsignedTx);
+            return enqueueAndWait({
+                id: `burn:${voter.tokenName}`,
+                type: 'count_vote',
+                unsignedCborHex: unsignedTx,
+                signedCborHex: signedTx,
+            });
+        }));
+
         let burned = 0;
         let burnFailed = 0;
-        let burnTotalAttempts = 0;
-        let burnMaxAttempts = 0;
-
-        if (TX_MODE === 'direct') {
-            // Build all burn txs, then submit in batches
-            const BURN_BATCH_SIZE = 100;
-            const burnTxs: Array<{ signedCborHex: string; unsignedCborHex: string; id: string }> = [];
-
-            for (const voter of headVoters) {
-                try {
-                    const unsignedTx = buildCountVoteTx({
-                        adminAddress: admin_payment_address,
-                        tokenPolicy: TOKEN_POLICY as string,
-                        tokenScript: TOKEN_SCRIPT as string,
-                        userId: voter.tokenName,
-                        inputRef: voter.ref,
-                        inputValue: voter.value,
-                    });
-                    const signedTx = await admin_wallet.signTx(unsignedTx);
-                    burnTxs.push({ signedCborHex: signedTx, unsignedCborHex: unsignedTx, id: voter.tokenName });
-                } catch (err: any) {
-                    console.error(`[settle/burn] Failed to build burn tx for ${voter.tokenName}:`, err.message);
-                    burnFailed++;
-                }
-            }
-
-            // Submit in batches
-            for (let i = 0; i < burnTxs.length; i += BURN_BATCH_SIZE) {
-                const batch = burnTxs.slice(i, i + BURN_BATCH_SIZE);
-                debug(`[settle/burn] Submitting batch ${Math.floor(i / BURN_BATCH_SIZE) + 1} (${batch.length} txs)…`);
-                const { succeeded, failed } = await submitDirectBatch(batch);
-                burned += succeeded.size;
-                burnFailed += failed.size;
-                burnTotalAttempts += batch.length;
-
-                for (const [id] of succeeded) deleteVoterUtxo(id);
-                for (const [id, reason] of failed) {
-                    console.error(`[settle/burn] Batch burn failed for ${id}: ${reason.slice(0, 100)}`);
-                }
-            }
-        } else {
-            // TRP mode: batched burns (non-contending, each voter has own UTxO)
-            const BURN_BATCH_SIZE = 100;
-            for (let i = 0; i < headVoters.length; i += BURN_BATCH_SIZE) {
-                const batch = headVoters.slice(i, i + BURN_BATCH_SIZE);
-                debug(`[settle/burn] TRP batch ${Math.floor(i / BURN_BATCH_SIZE) + 1} (${batch.length} txs)…`);
-                const batchResults = await Promise.allSettled(batch.map(voter =>
-                    submitWithRetry(
-                        () => client.countVoteTx({
-                            votingAuthority: admin_payment_address,
-                            mintingScript: Buffer.from(TOKEN_SCRIPT as string, 'hex'),
-                            tokenPolicy: Buffer.from(TOKEN_POLICY as string, 'hex'),
-                            userId: Buffer.from(voter.tokenName, 'hex'),
-                        }),
-                        (tx) => admin_wallet.signTx(tx),
-                        `0:${voter.tokenName}`,
-                    ),
-                ));
-                for (let j = 0; j < batchResults.length; j++) {
-                    const r = batchResults[j];
-                    if (r.status === 'fulfilled') {
-                        const { attempts } = r.value;
-                        burnTotalAttempts += attempts;
-                        burnMaxAttempts = Math.max(burnMaxAttempts, attempts);
-                        burned++;
-                    } else {
-                        console.error(`[settle/burn] FULL ERROR for ${batch[j].tokenName}:`, r.reason?.message);
-                        burnFailed++;
-                    }
-                }
-            }
-        }
-
-        // Verify all voter tokens are burned — re-query snapshot and retry any remaining
-        if (burnFailed > 0) {
-            debug(`[settle/burn] ${burnFailed} burns failed, checking head for remaining voter tokens…`);
-            const retryVoters = await getVotersFromHead(wrangler, TOKEN_POLICY as string);
-            if (retryVoters.length > 0) {
-                debug(`[settle/burn] ${retryVoters.length} voter tokens still in head, retrying…`);
-                for (const voter of retryVoters) {
-                    try {
-                        if (TX_MODE === 'direct') {
-                            const unsignedTx = buildCountVoteTx({
-                                adminAddress: admin_payment_address,
-                                tokenPolicy: TOKEN_POLICY as string,
-                                tokenScript: TOKEN_SCRIPT as string,
-                                userId: voter.tokenName,
-                                inputRef: voter.ref,
-                                inputValue: voter.value,
-                            });
-                            const signedTx = await admin_wallet.signTx(unsignedTx);
-                            await submitDirect(signedTx, unsignedTx, { awaitSnapshot: false });
-                        } else {
-                            await submitWithRetry(
-                                () => client.countVoteTx({
-                                    votingAuthority: admin_payment_address,
-                                    mintingScript: Buffer.from(TOKEN_SCRIPT as string, 'hex'),
-                                    tokenPolicy: Buffer.from(TOKEN_POLICY as string, 'hex'),
-                                    userId: Buffer.from(voter.tokenName, 'hex'),
-                                }),
-                                (tx) => admin_wallet.signTx(tx),
-                                `0:${voter.tokenName}`,
-                            );
-                        }
-                        burned++;
-                        burnFailed--;
-                        debug(`[settle/burn] Retry burn succeeded for ${voter.tokenName}`);
-                    } catch (retryErr: any) {
-                        console.error(`[settle/burn] Retry burn FAILED for ${voter.tokenName}:`, retryErr.message);
-                    }
-                }
+        for (let i = 0; i < burnResults.length; i++) {
+            if (burnResults[i].status === 'fulfilled') {
+                burned++;
+            } else {
+                console.error(`[settle/burn] FULL ERROR for ${headVoters[i].tokenName}:`, (burnResults[i] as PromiseRejectedResult).reason?.message);
+                burnFailed++;
             }
         }
 
@@ -1201,11 +952,10 @@ router.post('/settle', async (req, res) => {
             return error(res, 'INTERNAL_ERROR', `Cannot finalize: ${postBurnVoters.length} voter token(s) still in head (${remaining}…). All tokens must be burned before close.`, 500);
         }
 
-        const burnRetries = burnTotalAttempts - burned;
         steps.push({
             step: 'burn',
             status: burnFailed === 0 ? 'SUCCESS' : 'PARTIAL',
-            data: { burned, failed: burnFailed, total: headVoters.length, retries: burnRetries, maxAttempts: burnMaxAttempts },
+            data: { burned, failed: burnFailed, total: headVoters.length },
         });
 
         // --- Step 2: Verify evidence against on-chain state ---
@@ -1334,79 +1084,27 @@ router.post('/settle', async (req, res) => {
         await logHeadSnapshot('post-burn', wrangler);
 
         // --- Step 3: Finalize ballot datum in-head ---
-        let finalizeTxHash: string;
-        let finalizeAttempts = 1;
-
-        if (TX_MODE === 'direct') {
-            let ballotUtxo = getBallotUtxo();
-            if (!ballotUtxo) {
-                // Fallback: find from snapshot
-                const snap = await wrangler.http.getSnapshotUtxo();
-                for (const [ref, utxo] of Object.entries(snap)) {
-                    const u = utxo as any;
-                    for (const [pid, assets] of Object.entries(u.value)) {
-                        if (pid === 'lovelace' || typeof assets !== 'object') continue;
-                        for (const name of Object.keys(assets as Record<string, number>)) {
-                            if (name.startsWith(BALLOT_INSTANCE_PREFIX)) {
-                                const [txH, idx] = ref.split('#');
-                                ballotUtxo = {
-                                    ref: { txHash: txH, outputIndex: parseInt(idx) },
-                                    value: hydraValueToAmounts(u.value),
-                                    datum: u.inlineDatum,
-                                    address: u.address,
-                                };
-                                break;
-                            }
-                        }
-                        if (ballotUtxo) break;
-                    }
-                    if (ballotUtxo) break;
-                }
-            }
-            if (!ballotUtxo) throw new Error('Ballot UTxO not found for finalize');
-
-            const unsignedTx = buildFinalizeBallotTx({
-                adminAddress: admin_payment_address,
-                ballotId,
-                resultsHash,
-                evidenceCid: evidenceDirectoryCid,
-                merkleRoot: evidenceMerkleRoot,
-                inputRef: ballotUtxo.ref,
-                inputValue: ballotUtxo.value,
-            });
-            const signedTx = await admin_wallet.signTx(unsignedTx);
-            const result = await submitDirect(signedTx, unsignedTx);
-            finalizeTxHash = result.hash;
-
-            setBallotUtxo({
-                ref: { txHash: finalizeTxHash, outputIndex: 0 },
-                value: ballotUtxo.value,
-                datum: ballotUtxo.datum,
-                address: ballotUtxo.address,
-            });
-        } else {
-            const result = await submitWithRetry(
-                () => client.finalizeBallotTx({
-                    votingAuthority: admin_payment_address,
-                    ballotPolicy: Buffer.from(ballotPolicy, 'hex'),
-                    ballotToken: Buffer.from(ballotName, 'hex'),
-                    ballotId: Buffer.from(ballotId, 'hex'),
-                    resultsHash: Buffer.from(resultsHash, 'hex'),
-                    evidenceCid: Buffer.from(evidenceDirectoryCid),
-                    merkleRoot: Buffer.from(evidenceMerkleRoot, 'hex'),
-                }),
-                (tx) => admin_wallet.signTx(tx),
-                `0:${ballotName}`,
-            );
-            finalizeTxHash = result.hash;
-            finalizeAttempts = result.attempts;
-            if (finalizeAttempts > 1) debug(`[settle/finalize] Succeeded after ${finalizeAttempts} attempts`);
-        }
+        const { tx: unsignedFinalizeTx } = await client.finalizeBallotTx({
+            votingAuthority: admin_payment_address,
+            ballotPolicy: Buffer.from(ballotPolicy, 'hex'),
+            ballotToken: Buffer.from(ballotName, 'hex'),
+            ballotId: Buffer.from(ballotId, 'hex'),
+            resultsHash: Buffer.from(resultsHash, 'hex'),
+            evidenceCid: Buffer.from(evidenceDirectoryCid),
+            merkleRoot: Buffer.from(evidenceMerkleRoot, 'hex'),
+        });
+        const signedFinalizeTx = await admin_wallet.signTx(unsignedFinalizeTx);
+        const { txHash: finalizeTxHash } = await enqueueAndWait({
+            id: `finalize:${ballotName}`,
+            type: 'finalize',
+            unsignedCborHex: unsignedFinalizeTx,
+            signedCborHex: signedFinalizeTx,
+        });
 
         steps.push({
             step: 'finalize',
             status: 'SUCCESS',
-            data: { txHash: finalizeTxHash, resultsHash, evidenceDirectoryCid, totalVoters: headVoters.length, attempts: finalizeAttempts },
+            data: { txHash: finalizeTxHash, resultsHash, evidenceDirectoryCid, totalVoters: headVoters.length },
         });
 
         await logHeadSnapshot('post-finalize', wrangler);
