@@ -105,12 +105,24 @@ export interface BallotQuestion {
 
 /** Ekklesia-specific extension fields on the ballot definition. */
 export interface EkklesiaBallotExtension {
+    /** Fingerprint source — e.g., "vote.ekklesia.intersect.budget2026". The middleware overwrites this from the `/prepare` request field. */
     namespace: string;
+    /**
+     * Informational bech32 address of the intended voting authority.
+     * Note: the on-chain (600) datum always records the middleware's admin
+     * address here, not this value — so this field is advisory metadata in
+     * the IPFS-pinned ballot, not a security-relevant commitment.
+     */
     votingAuthority: string;
+    /** Fixed marker — voting happens inside a Hydra head. */
     context: 'hydra-head';
+    /** Bech32 HRPs permitted to register (e.g., ["drep", "pool", "stake"]). */
     acceptedCredentials: string[];
+    /** blake2b_256 merkle root of ballot content, hex. Filled in by the middleware. */
     merkleRoot: string;
+    /** IPFS CID of the pinned ballot JSON. Filled in by the middleware. */
     ballotIpfsCid: string;
+    /** Voting window timestamps (ISO-8601 UTC). `open` is also the timelock anchor for the minting policy. */
     votingWindow: {
         open: string;
         close: string;
@@ -146,70 +158,89 @@ export interface BallotDefinition {
 }
 
 /**
- * On-chain (600) ballot definition datum. Kept slim to stay within the
- * ~5KB UTxO output limit. Full ballot content lives on IPFS.
+ * On-chain (600) ballot definition datum.
  *
- * Maps directly to the Tx3 `BallotDefinition` type (if we add one).
- * For now this is serialized as JSON for the inline datum.
+ * Plutus shape: `Constr 0 [List<Bytes>, Int]`
+ *
+ * The outer structure is always a two-field Constr 0:
+ *   - Field 0: an ordered list of byte strings (the `fields` below).
+ *   - Field 1: a schema version integer.
+ *
+ * All string-typed fields are encoded as UTF-8 bytes on-chain; hash and
+ * CID fields are their raw bytes (not hex-re-encoded). `questionCount`
+ * and `endEpoch` are encoded as Plutus `Int`s within the bytes list — see
+ * `src/routes/ballot.ts` for the exact mint-time construction.
+ *
+ * Version history:
+ *   1 — original mint (`/prepare`)
+ *   2 — edited via `/prepare/update` before the head opened
  */
 export interface BallotDefinitionDatum {
-    /** Short title for on-chain identification. */
-    title: string;
-    /** Ekklesia namespace (e.g., "vote.ekklesia.intersect.budget2026"). */
-    namespace: string;
-    /** Voting authority address (bech32). */
-    votingAuthority: string;
-    /** blake2b_256 merkle root of the ballot content (questions/options). */
-    contentHash: string;
-    /** IPFS CID of the full BallotDefinition JSON. */
-    ballotCid: string;
-    /** Number of questions in the ballot. */
-    questionCount: number;
-    /** Voting window timestamps. */
-    votingWindow: { open: string; close: string };
-    /** Cardano epoch at which voting ends. */
-    endEpoch: number;
+    fields: {
+        /** Short title for on-chain identification. */
+        title: string;
+        /** Ekklesia namespace (e.g., "vote.ekklesia.intersect.budget2026"). */
+        namespace: string;
+        /** Voting authority address (bech32). */
+        votingAuthority: string;
+        /** blake2b_256 merkle root of the ballot content (questions/options), hex. */
+        contentHash: string;
+        /** IPFS CID of the full BallotDefinition JSON. */
+        ballotCid: string;
+        /** Number of questions in the ballot. */
+        questionCount: number;
+        /** Voting window open (ISO-8601 UTC). */
+        votingWindowOpen: string;
+        /** Voting window close (ISO-8601 UTC). */
+        votingWindowClose: string;
+        /** Cardano epoch at which voting ends. */
+        endEpoch: number;
+    };
+    version: number;
 }
 
 // ---------------------------------------------------------------------------
-// Ballot Instance — (601) token datum, travels through Hydra head
+// Ballot Result — (601) token datum, travels through Hydra head
 // ---------------------------------------------------------------------------
 
 /**
- * Status codes for the (601) ballot instance datum.
- * Reserved range for future states.
- */
-export enum BallotStatus {
-    Created = 0,
-    Active = 1,
-    Tallying = 2,
-    Finalized = 3,
-    Contested = 4,
-}
-
-/**
- * On-chain (601) ballot instance datum. Kept slim (~150 bytes) to survive
- * L1 fanout (~5KB output limit). Full results live on IPFS.
+ * On-chain (601) ballot instance datum — the same type is used both pre-head
+ * (empty fields, mint-time placeholder) and post-finalize (results summary).
  *
- * Maps directly to the Tx3 `BallotResult` type.
+ * Plutus shape: `Constr 0 [List<Bytes>, Int]`
+ *
+ * Matches the Tx3 `BallotResult` type:
+ *   ```
+ *   type BallotResult {
+ *       Fields: List<Bytes>,
+ *       Version: Int,
+ *   }
+ *   ```
+ *
+ * Fields are positional — decoders MUST respect the order below.
+ * On-chain bytes are raw UTF-8 for strings/CIDs and raw hex-decoded
+ * bytes for hashes; `Version` is a Plutus `Int`.
+ *
+ * Version history:
+ *   1 — mint-time placeholder (all four byte fields empty) AND finalized state
+ *   2 — edited via `/prepare/update` before the head opened (placeholder state)
  */
-export interface BallotInstanceDatum {
-    /** Ballot identifier (ULID or tx hash) linking back to the (600) ballot definition. */
-    ballotId: string;
-    /** Lifecycle status (see BallotStatus enum). */
-    status: BallotStatus;
-    /** blake2b_256 of full results JSON on IPFS. 0x00 until finalized. */
-    resultsHash: string;
-    /** IPFS directory CID for the complete evidence package. Empty until finalized. */
-    evidenceCid: string;
-    /** Total number of voters who participated. 0 until finalized. */
-    totalVoters: number;
-    /** Merkle root of all vote evidence files. 0x00 until finalized. */
-    merkleRoot: string;
+export interface BallotResultDatum {
+    fields: {
+        /** Ballot identifier (ULID or tx hash). Empty string pre-finalize. */
+        ballotId: string;
+        /** blake2b_256 of the canonical FullResults JSON on IPFS. Empty pre-finalize. */
+        resultsHash: string;
+        /** IPFS directory CID for the complete evidence package. Empty pre-finalize. */
+        evidenceCid: string;
+        /** Merkle root of all vote evidence files. Empty pre-finalize. */
+        merkleRoot: string;
+    };
+    version: number;
 }
 
 // ---------------------------------------------------------------------------
-// Full Results — stored on IPFS, pointed to by BallotInstanceDatum.evidenceCid
+// Full Results — stored on IPFS, pointed to by BallotResultDatum.fields.evidenceCid
 // ---------------------------------------------------------------------------
 
 /** Per-option tally entry within a single role's results. */
@@ -256,18 +287,39 @@ export interface FullResults {
 // ---------------------------------------------------------------------------
 
 /**
- * On-chain voter token datum. Kept minimal — full evidence is on IPFS.
+ * On-chain voter token datum — in-head only, burned before settlement.
+ *
+ * Plutus shape: `Constr 0 [Bytes, Int, Bytes, Bytes, Bytes]`
+ *
+ * Matches the Tx3 `Vote` type:
+ *   ```
+ *   type Vote {
+ *       VoterId: Bytes,
+ *       Version: Int,
+ *       MerkleRoot: Bytes,
+ *       VoteHash: Bytes,
+ *       IpfsCid: Bytes,
+ *   }
+ *   ```
+ *
+ * Fields are positional (not nested in a list). Decoders MUST respect the
+ * order below.
+ *
+ * Version numbering:
+ *   0 — set by `register_voter` (voter registered but hasn't voted yet)
+ *   N≥1 — monotonic vote nonce; must strictly exceed the prior on-chain
+ *         version on each update (replay protection).
  */
 export interface VoterDatum {
-    /** 28-byte credential hash hex. */
+    /** Voter token asset name: 29 bytes = 1-byte credential prefix + 28-byte blake2b_224 of bech32 data. 58 hex chars. */
     voterId: string;
-    /** Monotonic nonce — must match nonce in signed payload. Doubles as replay protection. */
+    /** Monotonic nonce — must match the `nonce` field of the signed payload. */
     version: number;
-    /** blake2b_256 of the ballot merkle root. */
+    /** blake2b_256 of the canonical signed payload JSON (the message verified against the COSE signature). Empty bytes on register. */
     merkleRoot: string;
-    /** blake2b_256 of full vote evidence JSON on IPFS. */
+    /** blake2b_256 of full VoteEvidence JSON on IPFS. Empty bytes on register. */
     voteHash: string;
-    /** IPFS CID pointing to full vote evidence. */
+    /** IPFS CID pointing to full VoteEvidence. Empty bytes on register. */
     ipfsCid: string;
 }
 
@@ -315,7 +367,15 @@ export interface SignedVotePayload {
 // Vote Evidence — full bundle stored on IPFS
 // ---------------------------------------------------------------------------
 
-/** A single COSE witness — one signer's signature + key. */
+/**
+ * A single COSE witness — one signer's signature + key.
+ *
+ * The middleware only consumes `coseSign1Hex` and `coseKeyHex` for
+ * verification. `key` and `signature` are legacy / duplicative fields
+ * (the raw public-key hex and raw signature hex, as returned by some
+ * CIP-30 `signData` implementations) — carried through to the IPFS
+ * evidence bundle for downstream consumers but not read by this service.
+ */
 export interface CoseWitness {
     coseSign1Hex: string;
     coseKeyHex: string;
@@ -428,13 +488,6 @@ export interface VoteCacheEntry {
     version: number;
     timestamp: number;
 }
-
-// ---------------------------------------------------------------------------
-// Tally Result — alias for FullResults (used by finalization logic)
-// ---------------------------------------------------------------------------
-
-/** Alias: the tally result IS the full results object that gets pinned to IPFS. */
-export type TallyResult = FullResults;
 
 // ---------------------------------------------------------------------------
 // Vote History — append-only chain of all vote versions

@@ -5,13 +5,12 @@ import type { FileLeaf } from '@lerna-labs/hydra-proof';
 import { initialize, voterIdToTokenName, CLOSE_TOKEN, VERBOSE, IPFS_STAGING_DIR, ipfs, voteCache, success, error, debug, hydraMonitor, getHeadId, txQueue, enqueueAndWait } from '../helpers.js';
 import { hydraValueToAmounts } from '../tx-builder.js';
 import { getCachedBallot, getCachedResultsAddress } from './lifecycle.js';
-import { BALLOT_INSTANCE_PREFIX, BALLOT_DEFINITION_PREFIX, BallotStatus, HRP_TO_ROLE } from '../types.js';
+import { BALLOT_INSTANCE_PREFIX, BALLOT_DEFINITION_PREFIX, HRP_TO_ROLE } from '../types.js';
 import type {
     FullResults,
     QuestionTally,
     OptionTally,
     BallotDefinition,
-    BallotInstanceDatum,
     VoteCacheEntry,
     VoteEvidence,
 } from '../types.js';
