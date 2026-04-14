@@ -294,13 +294,17 @@ router.post('/finalize', async (_req, res) => {
         const voterRefs = cacheToVoterRefs(allVotes);
 
         // --- 2. Build merkle tree of vote evidence ---
+        // computePackage() crashes on an empty leaf set — guard for
+        // zero-voter ballots and emit an empty root.
         const fileLeaves: FileLeaf[] = voterRefs.map((v) => ({
             name: v.tokenName,
             contentHashHex: v.voteHash,
         }));
 
-        const proofPackage = computePackage(fileLeaves, 'content+path');
-        const evidenceMerkleRoot = proofPackage.rootHex;
+        const proofPackage = fileLeaves.length > 0
+            ? computePackage(fileLeaves, 'content+path')
+            : null;
+        const evidenceMerkleRoot = proofPackage?.rootHex ?? '';
 
         // --- 3. Tally ---
         const { tallies, votersByRole } = await tallyVotes(ballot, voterRefs, voteCache.getDocumentsDir());
@@ -341,26 +345,30 @@ router.post('/finalize', async (_req, res) => {
             // History dir may not exist if no votes were updated
         }
 
-        for (const file of proofPackage.files) {
-            const voterProof = {
-                voterId: file.name,
-                contentHashHex: file.contentHashHex,
-                leafHashHex: file.leafHashHex,
-                merkleRoot: evidenceMerkleRoot,
-                proof: file.merkleProof,
-            };
-            await fs.writeFile(
-                pathMod.join(proofsDir, `${file.name}.json`),
-                JSON.stringify(voterProof, null, 2),
-            );
+        if (proofPackage) {
+            for (const file of proofPackage.files) {
+                const voterProof = {
+                    voterId: file.name,
+                    contentHashHex: file.contentHashHex,
+                    leafHashHex: file.leafHashHex,
+                    merkleRoot: evidenceMerkleRoot,
+                    proof: file.merkleProof,
+                };
+                await fs.writeFile(
+                    pathMod.join(proofsDir, `${file.name}.json`),
+                    JSON.stringify(voterProof, null, 2),
+                );
+            }
         }
 
         // --- 6. Pin everything to IPFS ---
         // Pin results JSON
         const { cid: resultsCid } = await ipfs.pinJson('results.json', fullResults);
 
-        // Pin proof package
-        await ipfs.pinJson('proof-package.json', proofPackage);
+        // Pin proof package (skipped for empty-ballot finalize)
+        if (proofPackage) {
+            await ipfs.pinJson('proof-package.json', proofPackage);
+        }
 
         // Pin entire evidence directory (vote files + proofs/ + results)
         const { cid: evidenceDirectoryCid } = await ipfs.pinDirectory(evidenceDir);
@@ -515,15 +523,15 @@ router.post('/settle/burn', async (_req, res) => {
         const wrangler = new Wrangler(process.env.HYDRA_API_URL, undefined, hydraMonitor);
         const headVoters = await getVotersFromHead(wrangler, TOKEN_POLICY as string);
 
-        if (headVoters.length === 0) {
-            return success(res, { burned: 0, failed: 0, remaining: 0, total: 0, message: 'No voter tokens to burn' });
-        }
-
         // Save pre-burn ledger state to disk on the FIRST burn call only.
         // This is the authoritative record of every voter's on-chain state
         // at the moment settlement began. Subsequent burn calls (retries for
         // failed burns) must not overwrite it — the original snapshot is the
         // source of truth for /settle/finalize.
+        //
+        // Written unconditionally (including as an empty array when the head
+        // has no voter tokens) so /settle/finalize can always locate it. An
+        // empty ballot is still a valid ballot — it finalizes with 0 voters.
         const fs = await import('node:fs/promises');
         const pathMod = await import('node:path');
         const ledgerSnapshotPath = pathMod.join(IPFS_STAGING_DIR, 'pre-burn-ledger.json');
@@ -545,6 +553,10 @@ router.post('/settle/burn', async (_req, res) => {
             debug(`[settle/burn] Saved pre-burn ledger state: ${headVoters.length} voters → ${ledgerSnapshotPath}`);
         } else {
             debug(`[settle/burn] Pre-burn ledger already exists, skipping (retry burn call)`);
+        }
+
+        if (headVoters.length === 0) {
+            return success(res, { burned: 0, failed: 0, remaining: 0, total: 0, message: 'No voter tokens to burn (empty ballot). Pre-burn ledger snapshot written; proceed to /settle/finalize.' });
         }
 
         // Resolve + sign + enqueue every burn. The worker dispatches in
@@ -640,13 +652,24 @@ router.post('/settle/finalize', async (_req, res) => {
         // --- Load pre-burn ledger snapshot (written by /settle/burn) ---
         // This is the authoritative record of every voter's on-chain state
         // at the moment settlement began — the source of truth for the evidence package.
+        //
+        // If the snapshot is missing but the head also has zero voter tokens,
+        // we treat that as an empty-ballot finalize and synthesize an empty
+        // snapshot on the fly. This keeps /settle/finalize usable in the
+        // unusual case where /settle/burn was never called (e.g. ballots
+        // that had no voter activity and skipped straight to finalize).
         const ledgerSnapshotPath = pathMod.join(IPFS_STAGING_DIR, 'pre-burn-ledger.json');
         let ledgerVoters: Array<{ tokenName: string; version: number; voteHash: string; ipfsCid: string }>;
         try {
             const raw = await fs.readFile(ledgerSnapshotPath, 'utf-8');
             ledgerVoters = JSON.parse(raw);
         } catch {
-            return error(res, 'INVALID_INPUT', 'Pre-burn ledger snapshot not found. Call /settle/burn before /settle/finalize.', 400);
+            // We already confirmed remainingVoters.length === 0 above, so the
+            // head genuinely has no voter tokens. Write an empty snapshot and
+            // continue — the finalized results will reflect a zero-voter ballot.
+            ledgerVoters = [];
+            await fs.writeFile(ledgerSnapshotPath, JSON.stringify(ledgerVoters, null, 2));
+            debug(`[settle/finalize] No pre-burn snapshot found AND head has no voter tokens — synthesized empty snapshot at ${ledgerSnapshotPath}`);
         }
 
         debug(`[settle/finalize] Loaded pre-burn ledger: ${ledgerVoters.length} voters`);
@@ -688,13 +711,18 @@ router.post('/settle/finalize', async (_req, res) => {
 
         debug(`[settle/finalize] Verified: ${verifiedVoters.length}, excluded: ${excludedVoters.length}`);
 
-        // Build merkle tree + tally from verified voters only
+        // Build merkle tree + tally from verified voters only.
+        // computePackage() crashes on an empty leaf set (buildTree returns
+        // no levels, so `levels.at(-1)[0]` is undefined). For zero-voter
+        // ballots we skip the merkle construction and emit an empty root.
         const fileLeaves: FileLeaf[] = verifiedVoters.map(v => ({
             name: v.tokenName,
             contentHashHex: v.voteHash,
         }));
-        const proofPackage = computePackage(fileLeaves, 'content+path');
-        const evidenceMerkleRoot = proofPackage.rootHex;
+        const proofPackage = fileLeaves.length > 0
+            ? computePackage(fileLeaves, 'content+path')
+            : null;
+        const evidenceMerkleRoot = proofPackage?.rootHex ?? '';
         const { tallies, votersByRole } = await tallyVotes(ballot, verifiedVoters, evidenceDir);
 
         const fullResults: FullResults = {
@@ -735,16 +763,20 @@ router.post('/settle/finalize', async (_req, res) => {
             }
         } catch { /* history dir may not exist */ }
 
-        for (const file of proofPackage.files) {
-            await fs.writeFile(
-                pathMod.join(proofsDir, `${file.name}.json`),
-                JSON.stringify({ voterId: file.name, contentHashHex: file.contentHashHex, leafHashHex: file.leafHashHex, merkleRoot: evidenceMerkleRoot, proof: file.merkleProof }, null, 2),
-            );
+        if (proofPackage) {
+            for (const file of proofPackage.files) {
+                await fs.writeFile(
+                    pathMod.join(proofsDir, `${file.name}.json`),
+                    JSON.stringify({ voterId: file.name, contentHashHex: file.contentHashHex, leafHashHex: file.leafHashHex, merkleRoot: evidenceMerkleRoot, proof: file.merkleProof }, null, 2),
+                );
+            }
         }
 
         // Pin to IPFS
         await ipfs.pinJson('results.json', fullResults);
-        await ipfs.pinJson('proof-package.json', proofPackage);
+        if (proofPackage) {
+            await ipfs.pinJson('proof-package.json', proofPackage);
+        }
         const { cid: evidenceDirectoryCid } = await ipfs.pinDirectory(evidenceDir);
         fullResults.evidenceIpfsCid = evidenceDirectoryCid;
         const resultsHash = bytesToHex(blake2b256(JSON.stringify(fullResults)));
@@ -1005,12 +1037,15 @@ router.post('/settle', async (req, res) => {
         debug(`[settle] Verified: ${verifiedVoters.length}, excluded: ${excludedVoters.length}`);
 
         // --- Step 3: Tally + IPFS evidence (verified voters only) ---
+        // Guard computePackage for empty-voter ballots.
         const fileLeaves: FileLeaf[] = verifiedVoters.map((v) => ({
             name: v.tokenName,
             contentHashHex: v.voteHash,
         }));
-        const proofPackage = computePackage(fileLeaves, 'content+path');
-        const evidenceMerkleRoot = proofPackage.rootHex;
+        const proofPackage = fileLeaves.length > 0
+            ? computePackage(fileLeaves, 'content+path')
+            : null;
+        const evidenceMerkleRoot = proofPackage?.rootHex ?? '';
         const { tallies, votersByRole } = await tallyVotes(ballot, verifiedVoters, evidenceDir);
 
         const fullResults: FullResults = {
@@ -1056,22 +1091,26 @@ router.post('/settle', async (req, res) => {
             // History dir may not exist if no votes were updated
         }
 
-        for (const file of proofPackage.files) {
-            const voterProof = {
-                voterId: file.name,
-                contentHashHex: file.contentHashHex,
-                leafHashHex: file.leafHashHex,
-                merkleRoot: evidenceMerkleRoot,
-                proof: file.merkleProof,
-            };
-            await fs.writeFile(
-                pathMod.join(proofsDir, `${file.name}.json`),
-                JSON.stringify(voterProof, null, 2),
-            );
+        if (proofPackage) {
+            for (const file of proofPackage.files) {
+                const voterProof = {
+                    voterId: file.name,
+                    contentHashHex: file.contentHashHex,
+                    leafHashHex: file.leafHashHex,
+                    merkleRoot: evidenceMerkleRoot,
+                    proof: file.merkleProof,
+                };
+                await fs.writeFile(
+                    pathMod.join(proofsDir, `${file.name}.json`),
+                    JSON.stringify(voterProof, null, 2),
+                );
+            }
         }
 
         await ipfs.pinJson('results.json', fullResults);
-        await ipfs.pinJson('proof-package.json', proofPackage);
+        if (proofPackage) {
+            await ipfs.pinJson('proof-package.json', proofPackage);
+        }
         const { cid: evidenceDirectoryCid } = await ipfs.pinDirectory(evidenceDir);
         fullResults.evidenceIpfsCid = evidenceDirectoryCid;
         const resultsHash = bytesToHex(blake2b256(JSON.stringify(fullResults)));
