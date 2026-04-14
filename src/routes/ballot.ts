@@ -3,6 +3,7 @@ import {BlockfrostProvider, MeshTxBuilder, MeshWallet} from '@meshsdk/core';
 import {createNativeScript, getAdmin} from '@lerna-labs/hydra-sdk';
 import type {FileLeaf} from '@lerna-labs/hydra-proof';
 import {blake2b256, bytesToHex, computePackage} from '@lerna-labs/hydra-proof';
+import {blake2b} from 'blakejs';
 import {checkBallotModifiable, error, HYDRA_NETWORK, hydraMonitor, ipfs, success} from '../helpers.js';
 import {getCachedResultsAddress} from './lifecycle.js';
 import {toBallotSurveyDetails} from '../cip179.js';
@@ -127,7 +128,7 @@ router.post('/prepare', async (req, res) => {
         }
 
         // --- 2. Compute ballot fingerprint and asset names ---
-        const fingerprintBytes = blake2b256(namespace).slice(0, 28);
+        const fingerprintBytes = blake2b(Buffer.from(namespace, 'utf8'), undefined, 28);
         const fingerprint = bytesToHex(fingerprintBytes);
         const definitionAssetName = buildAssetName(BALLOT_DEFINITION_PREFIX, fingerprint);
         const instanceAssetName = buildAssetName(BALLOT_INSTANCE_PREFIX, fingerprint);
@@ -358,7 +359,7 @@ router.post('/prepare/cancel', async (req, res) => {
             return error(res, 'WALLET_INIT_FAILED', 'Failed to derive native script from admin wallet', 503);
         }
 
-        const fingerprintBytes = blake2b256(namespace).slice(0, 28);
+        const fingerprintBytes = blake2b(Buffer.from(namespace, 'utf8'), undefined, 28);
         const fingerprint = bytesToHex(fingerprintBytes);
         const definitionAssetName = buildAssetName(BALLOT_DEFINITION_PREFIX, fingerprint);
         const instanceAssetName = buildAssetName(BALLOT_INSTANCE_PREFIX, fingerprint);
@@ -468,7 +469,7 @@ router.post('/prepare/update', async (req, res) => {
             return error(res, 'WALLET_INIT_FAILED', 'Failed to derive native script from admin wallet', 503);
         }
 
-        const fingerprintBytes = blake2b256(namespace).slice(0, 28);
+        const fingerprintBytes = blake2b(Buffer.from(namespace, 'utf8'), undefined, 28);
         const fingerprint = bytesToHex(fingerprintBytes);
         const definitionAssetName = buildAssetName(BALLOT_DEFINITION_PREFIX, fingerprint);
         const instanceAssetName = buildAssetName(BALLOT_INSTANCE_PREFIX, fingerprint);
