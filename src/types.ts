@@ -270,10 +270,8 @@ export interface QuestionTally {
 export interface FullResults {
     specVersion: string;
     ballotId: string;
-    status: 'finalized';
     tallies: QuestionTally[];
     totalVoters: number;
-    evidenceIpfsCid: string;
     headId: string;
     finalizedAt: string;
     /** Per-role voter counts (e.g., { DRep: 800, SPO: 200 }). */
@@ -457,7 +455,6 @@ export interface EkklesiaVoteExtension {
 export interface VoteEvidence {
     // CIP-179 core
     specVersion: string;
-    surveyTxId: string;
     responderRole: string;
     answers: VoteSelection[];
 

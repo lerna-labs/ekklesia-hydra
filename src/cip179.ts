@@ -63,7 +63,6 @@ export interface Cip179Answer {
 
 export interface Cip179SurveyResponse {
     specVersion: string;
-    surveyTxId: string;
     responderRole: string;
     answers: Cip179Answer[];
 }
@@ -171,7 +170,6 @@ export function toBallotSurveyDetails(ballot: BallotDefinition): Cip179SurveyDet
 export function toVoteResponse(evidence: VoteEvidence): Cip179SurveyResponse {
     return {
         specVersion: evidence.specVersion,
-        surveyTxId: evidence.surveyTxId,
         responderRole: evidence.responderRole,
         answers: evidence.answers.map(selectionToCip179Answer),
     };

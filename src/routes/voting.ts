@@ -426,7 +426,6 @@ async function voteValidateAndPin(input: VotePipelineInput): Promise<VotePipelin
     // Build evidence
     const evidence: VoteEvidence = {
         specVersion: '0.3.0',
-        surveyTxId: ballotId,
         responderRole: responderRole ?? 'DRep',
         answers: votes,
         ekklesia: {

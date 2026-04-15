@@ -313,11 +313,9 @@ router.post('/finalize', async (_req, res) => {
         const fullResults: FullResults = {
             specVersion: '0.3.0',
             ballotId,
-            status: 'finalized',
             tallies,
             totalVoters: allVotes.length,
             votersByRole,
-            evidenceIpfsCid: '', // filled after pinning
             headId: getHeadId() ?? '',
             finalizedAt: new Date().toISOString(),
         };
@@ -361,23 +359,18 @@ router.post('/finalize', async (_req, res) => {
             }
         }
 
-        // --- 6. Pin everything to IPFS ---
-        // Pin results JSON
-        const { cid: resultsCid } = await ipfs.pinJson('results.json', fullResults);
-
-        // Pin proof package (skipped for empty-ballot finalize)
+        // --- 6. Write results + proof package into evidence dir and pin ---
+        // Serialize once — on-chain resultsHash hashes the exact bytes written to disk.
+        const resultsJson = JSON.stringify(fullResults, null, 2);
+        await fs.writeFile(pathMod.join(evidenceDir, 'results.json'), resultsJson);
         if (proofPackage) {
-            await ipfs.pinJson('proof-package.json', proofPackage);
+            await fs.writeFile(
+                pathMod.join(evidenceDir, 'proof-package.json'),
+                JSON.stringify(proofPackage, null, 2),
+            );
         }
-
-        // Pin entire evidence directory (vote files + proofs/ + results)
         const { cid: evidenceDirectoryCid } = await ipfs.pinDirectory(evidenceDir);
-
-        // Update results with final CID
-        fullResults.evidenceIpfsCid = evidenceDirectoryCid;
-
-        // --- 6. Compute results hash ---
-        const resultsHash = bytesToHex(blake2b256(JSON.stringify(fullResults)));
+        const resultsHash = bytesToHex(blake2b256(resultsJson));
 
         // --- 7. Update (601) datum via TRP + queue worker ---
         const { tx: unsignedFinalizeTx } = await client.finalizeBallotTx({
@@ -402,7 +395,6 @@ router.post('/finalize', async (_req, res) => {
             txHash,
             resultsHash,
             evidenceDirectoryCid,
-            resultsCid,
             evidenceMerkleRoot,
             totalVoters: allVotes.length,
         });
@@ -728,11 +720,9 @@ router.post('/settle/finalize', async (_req, res) => {
         const fullResults: FullResults = {
             specVersion: '0.3.0',
             ballotId,
-            status: 'finalized',
             tallies,
             totalVoters: verifiedVoters.length,
             votersByRole,
-            evidenceIpfsCid: '',
             headId: getHeadId() ?? '',
             finalizedAt: new Date().toISOString(),
             excludedVoters: excludedVoters.length > 0 ? excludedVoters : undefined,
@@ -772,14 +762,18 @@ router.post('/settle/finalize', async (_req, res) => {
             }
         }
 
-        // Pin to IPFS
-        await ipfs.pinJson('results.json', fullResults);
+        // Write results + proof package into evidence dir, then pin.
+        // On-chain resultsHash hashes the exact bytes written to disk.
+        const resultsJson = JSON.stringify(fullResults, null, 2);
+        await fs.writeFile(pathMod.join(evidenceDir, 'results.json'), resultsJson);
         if (proofPackage) {
-            await ipfs.pinJson('proof-package.json', proofPackage);
+            await fs.writeFile(
+                pathMod.join(evidenceDir, 'proof-package.json'),
+                JSON.stringify(proofPackage, null, 2),
+            );
         }
         const { cid: evidenceDirectoryCid } = await ipfs.pinDirectory(evidenceDir);
-        fullResults.evidenceIpfsCid = evidenceDirectoryCid;
-        const resultsHash = bytesToHex(blake2b256(JSON.stringify(fullResults)));
+        const resultsHash = bytesToHex(blake2b256(resultsJson));
 
         // Finalize ballot datum in-head — TRP resolves, worker dispatches.
         const { tx: unsignedFinalizeTx } = await client.finalizeBallotTx({
@@ -1051,11 +1045,9 @@ router.post('/settle', async (req, res) => {
         const fullResults: FullResults = {
             specVersion: '0.3.0',
             ballotId,
-            status: 'finalized',
             tallies,
             totalVoters: verifiedVoters.length,
             votersByRole,
-            evidenceIpfsCid: '',
             headId: getHeadId() ?? '',
             finalizedAt: new Date().toISOString(),
             excludedVoters: excludedVoters.length > 0 ? excludedVoters : undefined,
@@ -1107,13 +1099,18 @@ router.post('/settle', async (req, res) => {
             }
         }
 
-        await ipfs.pinJson('results.json', fullResults);
+        // Write results + proof package into evidence dir, then pin.
+        // On-chain resultsHash hashes the exact bytes written to disk.
+        const resultsJson = JSON.stringify(fullResults, null, 2);
+        await fs.writeFile(pathMod.join(evidenceDir, 'results.json'), resultsJson);
         if (proofPackage) {
-            await ipfs.pinJson('proof-package.json', proofPackage);
+            await fs.writeFile(
+                pathMod.join(evidenceDir, 'proof-package.json'),
+                JSON.stringify(proofPackage, null, 2),
+            );
         }
         const { cid: evidenceDirectoryCid } = await ipfs.pinDirectory(evidenceDir);
-        fullResults.evidenceIpfsCid = evidenceDirectoryCid;
-        const resultsHash = bytesToHex(blake2b256(JSON.stringify(fullResults)));
+        const resultsHash = bytesToHex(blake2b256(resultsJson));
 
         await logHeadSnapshot('post-burn', wrangler);
 
