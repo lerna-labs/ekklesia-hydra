@@ -21,12 +21,43 @@ import type {
     BallotDefinition,
     CoseWitness,
     NativeScriptDef,
+    SelectionEntry,
     SignedVotePayload,
     VoteCacheEntry,
     VoteEvidence,
     VoteSelection,
     VoteSignatureData,
 } from '../types.js';
+
+/** Narrow `VoteSelection.selection` to `number[]`. */
+function asNumberArray(s: VoteSelection['selection']): number[] | null {
+    if (!Array.isArray(s) || s.length === 0) return null;
+    return s.every((x) => typeof x === 'number') ? (s as number[]) : null;
+}
+
+/** Narrow `VoteSelection.selection` to `SelectionEntry[]`. */
+function asEntryArray(s: VoteSelection['selection']): SelectionEntry[] | null {
+    if (!Array.isArray(s) || s.length === 0) return null;
+    return s.every(
+        (x) =>
+            typeof x === 'object' &&
+            x !== null &&
+            typeof (x as SelectionEntry).option === 'number' &&
+            typeof (x as SelectionEntry).value === 'number',
+    )
+        ? (s as SelectionEntry[])
+        : null;
+}
+
+/**
+ * Check that `v` lies on the integer grid `{min, min+step, …, max}`.
+ * Assumes the grid itself has already been validated (ints, `(max-min) % step === 0`).
+ */
+function isOnGrid(v: number, min: number, max: number, step: number): boolean {
+    if (!Number.isInteger(v)) return false;
+    if (v < min || v > max) return false;
+    return (v - min) % step === 0;
+}
 
 /**
  * Validate voter selections against the cached ballot definition.
@@ -48,33 +79,34 @@ function validateSelections(votes: VoteSelection[], ballot: BallotDefinition): s
         switch (q.method) {
             case 'binary':
             case 'single-choice': {
-                if (!sel.selection || sel.selection.length !== 1) {
-                    return `"${qid}" (${q.method}) requires exactly 1 selection`;
+                const values = asNumberArray(sel.selection);
+                if (!values || values.length !== 1) {
+                    return `"${qid}" (${q.method}) requires exactly 1 selection (number[])`;
                 }
-                if (validValues && !validValues.has(sel.selection[0])) {
-                    return `Invalid option value ${sel.selection[0]} for "${qid}"`;
+                if (validValues && !validValues.has(values[0])) {
+                    return `Invalid option value ${values[0]} for "${qid}"`;
                 }
                 break;
             }
 
             case 'multi-choice': {
-                if (!sel.selection) {
-                    return `"${qid}" (multi-choice) requires selection array`;
+                const values = asNumberArray(sel.selection);
+                if (!values) {
+                    return `"${qid}" (multi-choice) requires a non-empty number[] selection`;
                 }
                 const min = q.minSelections ?? 0;
                 const max = q.maxSelections ?? (q.options?.length ?? 1);
-                if (sel.selection.length < min) {
-                    return `Too few selections for "${qid}": got ${sel.selection.length}, min ${min}`;
+                if (values.length < min) {
+                    return `Too few selections for "${qid}": got ${values.length}, min ${min}`;
                 }
-                if (sel.selection.length > max) {
-                    return `Too many selections for "${qid}": got ${sel.selection.length}, max ${max}`;
+                if (values.length > max) {
+                    return `Too many selections for "${qid}": got ${values.length}, max ${max}`;
                 }
-                // Check for duplicates
-                if (new Set(sel.selection).size !== sel.selection.length) {
+                if (new Set(values).size !== values.length) {
                     return `Duplicate selections for "${qid}"`;
                 }
                 if (validValues) {
-                    for (const v of sel.selection) {
+                    for (const v of values) {
                         if (!validValues.has(v)) {
                             return `Invalid option value ${v} for "${qid}"`;
                         }
@@ -84,72 +116,100 @@ function validateSelections(votes: VoteSelection[], ballot: BallotDefinition): s
             }
 
             case 'range': {
-                if (!sel.selection || sel.selection.length !== 1) {
-                    return `"${qid}" (range) requires exactly 1 value`;
+                const values = asNumberArray(sel.selection);
+                if (!values || values.length !== 1) {
+                    return `"${qid}" (range) requires exactly 1 number value`;
                 }
                 if (!q.valueRange) {
                     return `"${qid}" is range type but has no valueRange defined`;
                 }
-                const v = sel.selection[0];
-                if (v < q.valueRange.min || v > q.valueRange.max) {
-                    return `Value ${v} out of range [${q.valueRange.min}, ${q.valueRange.max}] for "${qid}"`;
+                const step = q.valueRange.step ?? 1;
+                const v = values[0];
+                if (!isOnGrid(v, q.valueRange.min, q.valueRange.max, step)) {
+                    return `Value ${v} is not on the grid [${q.valueRange.min}, ${q.valueRange.max}] step ${step} for "${qid}"`;
                 }
                 break;
             }
 
             case 'ranked': {
-                if (!sel.ranking) {
-                    return `"${qid}" (ranked) requires ranking array`;
+                const ranking = asNumberArray(sel.selection);
+                if (!ranking) {
+                    return `"${qid}" (ranked) requires a non-empty number[] selection (preference order)`;
                 }
                 const expectedCount = q.rankCount ?? (q.options?.length ?? 0);
-                if (sel.ranking.length !== expectedCount) {
-                    return `"${qid}" (ranked) requires exactly ${expectedCount} ranked entries, got ${sel.ranking.length}`;
+                if (ranking.length !== expectedCount) {
+                    return `"${qid}" (ranked) requires exactly ${expectedCount} ranked entries, got ${ranking.length}`;
                 }
-                // All entries must be valid option values
                 if (validValues) {
-                    for (const v of sel.ranking) {
+                    for (const v of ranking) {
                         if (!validValues.has(v)) {
                             return `Invalid option value ${v} in ranking for "${qid}"`;
                         }
                     }
                 }
-                // No duplicates
-                if (new Set(sel.ranking).size !== sel.ranking.length) {
+                if (new Set(ranking).size !== ranking.length) {
                     return `Duplicate entries in ranking for "${qid}"`;
                 }
                 break;
             }
 
             case 'weighted': {
-                if (!sel.weights || sel.weights.length === 0) {
-                    return `"${qid}" (weighted) requires weights array`;
+                const entries = asEntryArray(sel.selection);
+                if (!entries) {
+                    return `"${qid}" (weighted) requires a non-empty {option,value}[] selection`;
                 }
                 if (q.budget === undefined) {
                     return `"${qid}" is weighted type but has no budget defined`;
                 }
-                // All options must be valid
                 if (validValues) {
-                    for (const w of sel.weights) {
-                        if (!validValues.has(w.option)) {
-                            return `Invalid option value ${w.option} in weights for "${qid}"`;
+                    for (const e of entries) {
+                        if (!validValues.has(e.option)) {
+                            return `Invalid option value ${e.option} in weighted selection for "${qid}"`;
                         }
                     }
                 }
-                // No duplicate option entries
-                const weightOptions = sel.weights.map((w) => w.option);
-                if (new Set(weightOptions).size !== weightOptions.length) {
-                    return `Duplicate option entries in weights for "${qid}"`;
+                const optionSet = entries.map((e) => e.option);
+                if (new Set(optionSet).size !== optionSet.length) {
+                    return `Duplicate option entries in weighted selection for "${qid}"`;
                 }
-                // Weights must be non-negative integers
-                for (const w of sel.weights) {
-                    if (!Number.isInteger(w.weight) || w.weight < 0) {
-                        return `Weight must be a non-negative integer for "${qid}", got ${w.weight}`;
+                for (const e of entries) {
+                    if (!Number.isInteger(e.value) || e.value < 0) {
+                        return `Weight must be a non-negative integer for "${qid}", got ${e.value}`;
                     }
                 }
-                // Must sum to budget
-                const total = sel.weights.reduce((sum, w) => sum + w.weight, 0);
+                const total = entries.reduce((sum, e) => sum + e.value, 0);
                 if (total !== q.budget) {
                     return `Weights sum to ${total} but budget is ${q.budget} for "${qid}"`;
+                }
+                break;
+            }
+
+            case 'likert': {
+                const entries = asEntryArray(sel.selection);
+                if (!entries) {
+                    return `"${qid}" (likert) requires a non-empty {option,value}[] selection`;
+                }
+                if (!q.ratingRange) {
+                    return `"${qid}" is likert type but has no ratingRange defined`;
+                }
+                const expectedCount = q.options ? q.options.length : 0;
+                if (entries.length !== expectedCount) {
+                    return `"${qid}" (likert) expects ${expectedCount} ratings, got ${entries.length}`;
+                }
+                const optionSet = entries.map((e) => e.option);
+                if (new Set(optionSet).size !== optionSet.length) {
+                    return `Duplicate option entries in ratings for "${qid}"`;
+                }
+                const step = q.ratingRange.step ?? 1;
+                if (validValues) {
+                    for (const e of entries) {
+                        if (!validValues.has(e.option)) {
+                            return `Invalid option value ${e.option} in ratings for "${qid}"`;
+                        }
+                        if (!isOnGrid(e.value, q.ratingRange.min, q.ratingRange.max, step)) {
+                            return `Rating ${e.value} is not on the grid [${q.ratingRange.min}, ${q.ratingRange.max}] step ${step} for "${qid}"`;
+                        }
+                    }
                 }
                 break;
             }

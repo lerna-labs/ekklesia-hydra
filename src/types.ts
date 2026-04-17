@@ -61,6 +61,7 @@ export interface BallotOption {
  * - range:         submit an integer within valueRange (e.g., "rate -5 to +5")
  * - ranked:        order options by preference — position in array = rank
  * - weighted:      distribute a point budget across options (weights must sum to budget)
+ * - likert:        independently rate each option on a discrete integer scale (ratingRange)
  */
 export type VoteMethod =
     | 'binary'
@@ -68,7 +69,8 @@ export type VoteMethod =
     | 'multi-choice'
     | 'range'
     | 'ranked'
-    | 'weighted';
+    | 'weighted'
+    | 'likert';
 
 /**
  * A ballot question. The `method` field determines how selections are
@@ -88,9 +90,11 @@ export interface BallotQuestion {
     maxSelections?: number;
     /**
      * For range questions — voter submits an integer within this range.
-     * Required when method is 'range'.
+     * Required when method is 'range'. Valid values are the arithmetic grid
+     * { min, min+step, min+2*step, …, max } (step defaults to 1). All three
+     * fields must be integers and `(max - min) % step === 0`.
      */
-    valueRange?: { min: number; max: number };
+    valueRange?: { min: number; max: number; step?: number };
     /**
      * For ranked questions — how many options must be ranked.
      * Defaults to options.length (must rank all).
@@ -101,6 +105,13 @@ export interface BallotQuestion {
      * Weights submitted must sum to exactly this value.
      */
     budget?: number;
+    /**
+     * For likert questions — the discrete integer scale each option is rated
+     * on. Every option must receive one integer rating on the grid
+     * { min, min+step, …, max } (step defaults to 1). All three fields must
+     * be integers and `(max - min) % step === 0`.
+     */
+    ratingRange?: { min: number; max: number; step?: number };
 }
 
 /** Ekklesia-specific extension fields on the ballot definition. */
@@ -243,24 +254,99 @@ export interface BallotResultDatum {
 // Full Results — stored on IPFS, pointed to by BallotResultDatum.fields.evidenceCid
 // ---------------------------------------------------------------------------
 
-/** Per-option tally entry within a single role's results. */
-export interface OptionTally {
+/**
+ * Per-option count — the base tally entry for the simple selection methods
+ * (binary, single-choice, multi-choice) and for the first-preference
+ * breakdown within ranked results.
+ *
+ * Hydra never emits voter weights or weighting modes — post-hoc stake / role
+ * weighting is applied by the voting authority using their own snapshots, so
+ * results.json publishes raw participation only.
+ */
+export interface OptionCount {
     option: number;
     count: number;
-    /** Lovelace-denominated weight as string (BigInt serialized). */
-    weight: string;
 }
 
-/** Tally results for a single role on a single question. */
-export interface RoleTally {
-    weightingMode: string;
-    results: OptionTally[];
+/** Distribution entry for a range question — one bucket per observed value. */
+export interface DistributionEntry {
+    value: number;
+    count: number;
 }
 
-/** Tally for one question across all applicable roles. */
+/** Aggregate statistics over a set of integer votes (range question). */
+export interface RangeStats {
+    n: number;
+    mean: number;
+    median: number;
+    min: number;
+    max: number;
+    stdDev: number;
+}
+
+/** One option's Borda score — sum of rank-position points across ballots. */
+export interface BordaEntry {
+    option: number;
+    score: number;
+}
+
+/**
+ * Pairwise preference matrix for ranked questions. `matrix[i][j]` is the
+ * number of ballots on which `options[i]` was ranked above `options[j]`.
+ * `matrix[i][i]` is always 0. Sufficient for Condorcet, Copeland, Schulze,
+ * Ranked Pairs and other pairwise-family methods without re-reading evidence.
+ */
+export interface PairwiseMatrix {
+    options: number[];
+    matrix: number[][];
+}
+
+/** Per-option aggregate for a weighted-allocation question. */
+export interface WeightedOptionTally {
+    option: number;
+    /** Sum of points allocated to this option across all ballots. */
+    totalPoints: number;
+    /** Number of ballots that allocated a non-zero amount to this option. */
+    voterCount: number;
+    /** Mean points per ballot that answered this question. */
+    mean: number;
+    stdDev: number;
+}
+
+/** Per-option aggregate for a likert-rated question. */
+export interface LikertOptionTally {
+    option: number;
+    /** Sum of all ratings on this option. */
+    sum: number;
+    /** Number of ballots that rated this option (equals n for valid ballots). */
+    count: number;
+    mean: number;
+    median: number;
+    /** Histogram of rating → number of voters who assigned it. */
+    distribution: Record<number, number>;
+}
+
+/**
+ * Method-shaped tally payload for a single role on a single question.
+ * Discriminated on `method`; consumers narrow before reading method-specific
+ * fields. All values are deterministic functions of the evidence set —
+ * auditors can replay the exact computation from the IPFS evidence directory.
+ */
+export type MethodTally =
+    | { method: 'binary' | 'single-choice' | 'multi-choice'; results: OptionCount[] }
+    | { method: 'range'; distribution: DistributionEntry[]; stats: RangeStats }
+    | { method: 'ranked'; firstPreference: OptionCount[]; borda: BordaEntry[]; pairwise: PairwiseMatrix }
+    | { method: 'weighted'; results: WeightedOptionTally[] }
+    | { method: 'likert'; results: LikertOptionTally[] };
+
+/**
+ * Tally for one question across all applicable roles.
+ * The question-level `method` matches every `roleResults[role].method`.
+ */
 export interface QuestionTally {
     questionId: string;
-    roleResults: Record<string, RoleTally>;
+    method: VoteMethod;
+    roleResults: Record<string, MethodTally>;
 }
 
 /**
@@ -325,30 +411,31 @@ export interface VoterDatum {
 // Signed Vote Payload — what the voter's COSE key signs
 // ---------------------------------------------------------------------------
 
-/** A weighted allocation entry — option value + points assigned. */
-export interface WeightedEntry {
+/**
+ * A per-option scalar entry — the shape used by `weighted` (value = points
+ * allocated) and `likert` (value = rating on the ratingRange grid).
+ */
+export interface SelectionEntry {
     option: number;
-    weight: number;
+    value: number;
 }
 
 /**
  * An individual answer to a ballot question.
  *
- * The shape depends on the question's method:
- * - binary/single/multi/range: use `selection` (array of chosen integer values)
- * - ranked: use `ranking` (ordered array — position = preference rank, value = option value)
- * - weighted: use `weights` (array of {option, weight} entries summing to budget)
+ * The `selection` payload shape is determined by the question's `method`:
+ *   - binary / single-choice / multi-choice: number[] of chosen option values.
+ *   - range:                                 number[] of length 1 — the picked value on the valueRange grid.
+ *   - ranked:                                number[] of option values in preference order (index 0 = 1st preference).
+ *   - weighted:                              SelectionEntry[] — `value` is points allocated, must sum to budget.
+ *   - likert:                                SelectionEntry[] — `value` is rating on the ratingRange grid, one entry per option.
  *
- * Exactly one of selection/ranking/weights must be present.
+ * The validator and tally both switch on the question's method; the field
+ * name is unified so consumers have a single place to read the answer.
  */
 export interface VoteSelection {
     questionId: string;
-    /** Selected option values (binary, single-choice, multi-choice, range). */
-    selection?: number[];
-    /** Ordered preference ranking (ranked choice — index 0 = 1st preference). */
-    ranking?: number[];
-    /** Point allocation across options (weighted — must sum to budget). */
-    weights?: WeightedEntry[];
+    selection: number[] | SelectionEntry[];
 }
 
 /**

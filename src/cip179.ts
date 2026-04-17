@@ -35,11 +35,26 @@ export interface Cip179Question {
     methodType: string;
     options?: string[];
     maxSelections?: number;
+    /**
+     * Numeric constraint for range questions. `step` is an Ekklesia-extension
+     * field — absent on standard CIP-179 clients, which can still interpret
+     * min/max; when present, auditors can reconstruct the exact valid grid.
+     */
     numericConstraints?: {
         minValue: number;
         maxValue: number;
+        step?: number;
     };
-    /** For custom methods (ranked, weighted) — URI + hash of the schema. */
+    /** For ranked questions — number of options that must be ranked. */
+    rankCount?: number;
+    /** For weighted questions — total points the voter allocates. */
+    budget?: number;
+    /**
+     * For likert questions — discrete rating scale. `step` defaults to 1.
+     * Every question option receives one rating on this grid.
+     */
+    ratingRange?: { min: number; max: number; step?: number };
+    /** For custom methods (ranked, weighted, likert) — URI + hash of the schema. */
     methodSchemaUri?: string;
     methodSchemaHash?: string;
 }
@@ -88,6 +103,8 @@ export function toCip179MethodType(method: VoteMethod): string {
             return 'urn:ekklesia:poll-method:ranked-choice:v1';
         case 'weighted':
             return 'urn:ekklesia:poll-method:weighted-allocation:v1';
+        case 'likert':
+            return 'urn:ekklesia:poll-method:likert:v1';
     }
 }
 
@@ -107,6 +124,8 @@ export function fromCip179MethodType(methodType: string): VoteMethod | undefined
             return 'ranked';
         case 'urn:ekklesia:poll-method:weighted-allocation:v1':
             return 'weighted';
+        case 'urn:ekklesia:poll-method:likert:v1':
+            return 'likert';
         default:
             return undefined;
     }
@@ -124,25 +143,41 @@ function questionToCip179(q: BallotQuestion): Cip179Question {
         methodType: toCip179MethodType(q.method),
     };
 
-    // Map options (CIP-179 uses string labels, not value objects)
     if (q.options && q.options.length > 0) {
         cip.options = q.options.map((o) => o.label);
     }
 
-    if (q.method === 'multi-choice' && q.maxSelections !== undefined) {
-        cip.maxSelections = q.maxSelections;
-    }
-
-    if (q.method === 'range' && q.valueRange) {
-        cip.numericConstraints = {
-            minValue: q.valueRange.min,
-            maxValue: q.valueRange.max,
-        };
-    }
-
-    // Custom methods get schema URIs
-    if (q.method === 'ranked' || q.method === 'weighted') {
-        cip.methodSchemaUri = toCip179MethodType(q.method);
+    switch (q.method) {
+        case 'multi-choice':
+            if (q.maxSelections !== undefined) cip.maxSelections = q.maxSelections;
+            break;
+        case 'range':
+            if (q.valueRange) {
+                cip.numericConstraints = {
+                    minValue: q.valueRange.min,
+                    maxValue: q.valueRange.max,
+                    ...(q.valueRange.step !== undefined ? { step: q.valueRange.step } : {}),
+                };
+            }
+            break;
+        case 'ranked':
+            cip.methodSchemaUri = toCip179MethodType(q.method);
+            if (q.rankCount !== undefined) cip.rankCount = q.rankCount;
+            break;
+        case 'weighted':
+            cip.methodSchemaUri = toCip179MethodType(q.method);
+            if (q.budget !== undefined) cip.budget = q.budget;
+            break;
+        case 'likert':
+            cip.methodSchemaUri = toCip179MethodType(q.method);
+            if (q.ratingRange) {
+                cip.ratingRange = {
+                    min: q.ratingRange.min,
+                    max: q.ratingRange.max,
+                    ...(q.ratingRange.step !== undefined ? { step: q.ratingRange.step } : {}),
+                };
+            }
+            break;
     }
 
     return cip;
@@ -166,35 +201,65 @@ export function toBallotSurveyDetails(ballot: BallotDefinition): Cip179SurveyDet
 /**
  * Convert an Ekklesia VoteEvidence to a CIP-179 surveyResponse object.
  * Strips the `ekklesia` extension block (signatures, proofs, etc.).
+ *
+ * Requires the ballot to correctly shape each answer according to its
+ * question's method — the unified `VoteSelection.selection` field cannot
+ * disambiguate ranked vs. multi-choice or weighted vs. likert on its own.
  */
-export function toVoteResponse(evidence: VoteEvidence): Cip179SurveyResponse {
+export function toVoteResponse(
+    evidence: VoteEvidence,
+    ballot: BallotDefinition,
+): Cip179SurveyResponse {
+    const methods = new Map(ballot.questions.map((q) => [q.questionId, q.method]));
     return {
         specVersion: evidence.specVersion,
         responderRole: evidence.responderRole,
-        answers: evidence.answers.map(selectionToCip179Answer),
+        answers: evidence.answers.map((a) =>
+            selectionToCip179Answer(a, methods.get(a.questionId)),
+        ),
     };
 }
 
-/** Convert an Ekklesia VoteSelection to a CIP-179 answer. */
-function selectionToCip179Answer(sel: VoteSelection): Cip179Answer {
+/** Convert an Ekklesia VoteSelection to a CIP-179 answer, keyed on method. */
+function selectionToCip179Answer(
+    sel: VoteSelection,
+    method: VoteMethod | undefined,
+): Cip179Answer {
     const answer: Cip179Answer = { questionId: sel.questionId };
+    const raw = sel.selection;
 
-    if (sel.selection !== undefined) {
-        if (sel.selection.length === 1) {
-            // Single value — could be single-choice or range
-            answer.selection = sel.selection[0];
-        } else {
-            // Multiple values — multi-choice
-            answer.selections = sel.selection;
+    switch (method) {
+        case 'binary':
+        case 'single-choice': {
+            const values = raw as number[];
+            if (values.length === 1) answer.selection = values[0];
+            break;
         }
-    }
-
-    if (sel.ranking !== undefined) {
-        answer.customValue = { type: 'ranked', ranking: sel.ranking };
-    }
-
-    if (sel.weights !== undefined) {
-        answer.customValue = { type: 'weighted', weights: sel.weights };
+        case 'multi-choice': {
+            answer.selections = raw as number[];
+            break;
+        }
+        case 'range': {
+            const values = raw as number[];
+            if (values.length === 1) answer.numericValue = values[0];
+            break;
+        }
+        case 'ranked': {
+            answer.customValue = { type: 'ranked', ranking: raw as number[] };
+            break;
+        }
+        case 'weighted': {
+            answer.customValue = { type: 'weighted', allocations: raw };
+            break;
+        }
+        case 'likert': {
+            answer.customValue = { type: 'likert', ratings: raw };
+            break;
+        }
+        default:
+            // Unknown method — emit the raw selection so the evidence round-trip
+            // is still lossless for downstream CIP-179 consumers.
+            answer.customValue = { type: 'unknown', selection: raw };
     }
 
     return answer;
@@ -251,6 +316,23 @@ function questionFromCip179(q: Cip179Question): BallotQuestion {
         result.valueRange = {
             min: q.numericConstraints.minValue,
             max: q.numericConstraints.maxValue,
+            ...(q.numericConstraints.step !== undefined ? { step: q.numericConstraints.step } : {}),
+        };
+    }
+
+    if (q.rankCount !== undefined) {
+        result.rankCount = q.rankCount;
+    }
+
+    if (q.budget !== undefined) {
+        result.budget = q.budget;
+    }
+
+    if (q.ratingRange) {
+        result.ratingRange = {
+            min: q.ratingRange.min,
+            max: q.ratingRange.max,
+            ...(q.ratingRange.step !== undefined ? { step: q.ratingRange.step } : {}),
         };
     }
 

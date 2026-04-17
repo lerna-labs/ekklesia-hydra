@@ -7,10 +7,92 @@ import {blake2b} from 'blakejs';
 import {checkBallotModifiable, error, HYDRA_NETWORK, hydraMonitor, ipfs, success} from '../helpers.js';
 import {getCachedResultsAddress} from './lifecycle.js';
 import {toBallotSurveyDetails} from '../cip179.js';
-import type {BallotDefinition} from '../types.js';
+import type {BallotDefinition, BallotQuestion} from '../types.js';
 import {BALLOT_DEFINITION_PREFIX, BALLOT_INSTANCE_PREFIX, buildAssetName} from '../types.js';
 
 const router = Router();
+
+/**
+ * Check a single {min, max, step} grid config for a range or rating scale:
+ * all three must be integers, step must be positive, and `(max - min) % step`
+ * must be zero so `max` is actually reachable on the grid. Returns an error
+ * string or null.
+ */
+function validateGrid(
+    label: string,
+    grid: { min: number; max: number; step?: number },
+): string | null {
+    const step = grid.step ?? 1;
+    if (!Number.isInteger(grid.min) || !Number.isInteger(grid.max) || !Number.isInteger(step)) {
+        return `${label}: min, max, and step must all be integers`;
+    }
+    if (step <= 0) {
+        return `${label}: step must be a positive integer`;
+    }
+    if (grid.max < grid.min) {
+        return `${label}: max (${grid.max}) must be >= min (${grid.min})`;
+    }
+    if ((grid.max - grid.min) % step !== 0) {
+        return `${label}: (max - min) must be divisible by step — ${grid.max} - ${grid.min} is not a multiple of ${step}`;
+    }
+    return null;
+}
+
+/**
+ * Validate the questions array of a BallotDefinition before minting. Enforces
+ * method-level structural requirements so broken ballots never get locked
+ * on-chain. Returns an error message string on failure, or null on success.
+ */
+function validateBallotDefinition(ballot: BallotDefinition): string | null {
+    if (!Array.isArray(ballot.questions) || ballot.questions.length === 0) {
+        return 'Ballot must contain at least one question';
+    }
+    const ids = new Set<string>();
+    for (const q of ballot.questions as BallotQuestion[]) {
+        if (!q.questionId) return 'Every question must have a questionId';
+        if (ids.has(q.questionId)) return `Duplicate questionId: "${q.questionId}"`;
+        ids.add(q.questionId);
+
+        if (q.method === 'range') {
+            if (!q.valueRange) {
+                return `"${q.questionId}" is range but has no valueRange defined`;
+            }
+            const err = validateGrid(`"${q.questionId}" valueRange`, q.valueRange);
+            if (err) return err;
+        }
+
+        if (q.method === 'likert') {
+            if (!q.ratingRange) {
+                return `"${q.questionId}" is likert but has no ratingRange defined`;
+            }
+            if (!q.options || q.options.length === 0) {
+                return `"${q.questionId}" is likert but has no options to rate`;
+            }
+            const err = validateGrid(`"${q.questionId}" ratingRange`, q.ratingRange);
+            if (err) return err;
+        }
+
+        if (q.method === 'weighted') {
+            if (q.budget === undefined || !Number.isInteger(q.budget) || q.budget <= 0) {
+                return `"${q.questionId}" is weighted but has no positive integer budget`;
+            }
+            if (!q.options || q.options.length === 0) {
+                return `"${q.questionId}" is weighted but has no options`;
+            }
+        }
+
+        if (q.method === 'ranked') {
+            if (!q.options || q.options.length === 0) {
+                return `"${q.questionId}" is ranked but has no options`;
+            }
+            const rc = q.rankCount ?? q.options.length;
+            if (!Number.isInteger(rc) || rc < 1 || rc > q.options.length) {
+                return `"${q.questionId}" ranked: rankCount must be a positive integer no greater than options.length`;
+            }
+        }
+    }
+    return null;
+}
 
 /**
  * Convert a UTC ISO timestamp to an absolute Cardano slot number.
@@ -98,6 +180,11 @@ router.post('/prepare', async (req, res) => {
 
     if (!namespace || !ballot) {
         return error(res, 'MISSING_FIELDS', 'Missing required fields: namespace, ballot', 400);
+    }
+
+    const ballotError = validateBallotDefinition(ballot);
+    if (ballotError) {
+        return error(res, 'INVALID_INPUT', ballotError, 400);
     }
 
     try {
@@ -445,6 +532,11 @@ router.post('/prepare/update', async (req, res) => {
 
     if (!namespace || !ballot || !definitionUtxo || !instanceUtxo) {
         return error(res, 'MISSING_FIELDS', 'Missing required fields: namespace, ballot, definitionUtxo, instanceUtxo', 400);
+    }
+
+    const ballotError = validateBallotDefinition(ballot);
+    if (ballotError) {
+        return error(res, 'INVALID_INPUT', ballotError, 400);
     }
 
     try {
