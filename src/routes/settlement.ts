@@ -184,6 +184,14 @@ function asEntryArray(s: VoteSelection['selection']): SelectionEntry[] | null {
         : null;
 }
 
+/** Enumerate every integer grid position in [min, max] at `step`. */
+function gridValues(grid: { min: number; max: number; step?: number }): number[] {
+    const step = grid.step ?? 1;
+    const values: number[] = [];
+    for (let v = grid.min; v <= grid.max; v += step) values.push(v);
+    return values;
+}
+
 /** Tally binary, single-choice, multi-choice — simple {option, count} per option. */
 function tallySimple(
     method: 'binary' | 'single-choice' | 'multi-choice',
@@ -198,21 +206,34 @@ function tallySimple(
     }
     return {
         method,
-        results: Array.from(counts.entries()).map(([option, count]) => ({ option, count })),
+        results: Array.from(counts.entries())
+            .map(([option, count]) => ({ option, count }))
+            .sort((a, b) => a.option - b.option),
     };
 }
 
-/** Tally range — histogram + aggregate stats over observed values. */
-function tallyRange(answers: VoteSelection[]): MethodTally {
+/**
+ * Tally range — histogram + aggregate stats.
+ *
+ * `distribution` is zero-filled across the full valueRange grid so auditors
+ * can replay the histogram without reconstructing the grid. Stats are
+ * computed over observed values only.
+ */
+function tallyRange(
+    answers: VoteSelection[],
+    valueRange: { min: number; max: number; step?: number } | undefined,
+): MethodTally {
     const observed: number[] = [];
     for (const a of answers) {
         const values = asNumberArray(a.selection);
         if (!values || values.length !== 1) continue;
         observed.push(values[0]);
     }
-    const dist = new Map<number, number>();
-    for (const v of observed) dist.set(v, (dist.get(v) ?? 0) + 1);
-    const distribution: DistributionEntry[] = Array.from(dist.entries())
+    const counts = new Map<number, number>();
+    if (valueRange) for (const v of gridValues(valueRange)) counts.set(v, 0);
+    for (const v of observed) counts.set(v, (counts.get(v) ?? 0) + 1);
+
+    const distribution: DistributionEntry[] = Array.from(counts.entries())
         .map(([value, count]) => ({ value, count }))
         .sort((a, b) => a.value - b.value);
 
@@ -237,27 +258,25 @@ function tallyRanked(
     answers: VoteSelection[],
     options: BallotOption[] | undefined,
 ): MethodTally {
-    const firstPrefCounts = initOptionCounts(options);
-    const bordaScores = initOptionCounts(options);
-    const optionValues = options ? options.map((o) => o.value) : [];
-    const indexOf = new Map(optionValues.map((v, i) => [v, i]));
-    const matrix: number[][] = optionValues.map(() => optionValues.map(() => 0));
+    // Sort option values ascending so pairwise.options has a deterministic
+    // order independent of the ballot-authoring order.
+    const sortedValues = (options ? options.map((o) => o.value) : []).slice().sort((a, b) => a - b);
+    const firstPrefCounts = new Map<number, number>(sortedValues.map((v) => [v, 0]));
+    const bordaScores = new Map<number, number>(sortedValues.map((v) => [v, 0]));
+    const indexOf = new Map(sortedValues.map((v, i) => [v, i]));
+    const matrix: number[][] = sortedValues.map(() => sortedValues.map(() => 0));
 
     for (const a of answers) {
         const ranking = asNumberArray(a.selection);
         if (!ranking || ranking.length === 0) continue;
 
-        // First preference
         firstPrefCounts.set(ranking[0], (firstPrefCounts.get(ranking[0]) ?? 0) + 1);
 
-        // Borda: position i gets (N - 1 - i) points, where N is this ballot's rank count.
         const n = ranking.length;
         for (let i = 0; i < n; i++) {
             bordaScores.set(ranking[i], (bordaScores.get(ranking[i]) ?? 0) + (n - 1 - i));
         }
 
-        // Pairwise: for every pair (i, j) in this ranking with i before j, matrix[i][j]++.
-        // Only count pairs where both options map into the overall options list.
         for (let i = 0; i < n; i++) {
             const ai = indexOf.get(ranking[i]);
             if (ai === undefined) continue;
@@ -269,14 +288,15 @@ function tallyRanked(
         }
     }
 
-    const firstPreference: OptionCount[] = Array.from(firstPrefCounts.entries()).map(
-        ([option, count]) => ({ option, count }),
-    );
-    const borda: BordaEntry[] = Array.from(bordaScores.entries()).map(([option, score]) => ({
+    const firstPreference: OptionCount[] = sortedValues.map((option) => ({
         option,
-        score,
+        count: firstPrefCounts.get(option) ?? 0,
     }));
-    const pairwise: PairwiseMatrix = { options: optionValues, matrix };
+    const borda: BordaEntry[] = sortedValues.map((option) => ({
+        option,
+        score: bordaScores.get(option) ?? 0,
+    }));
+    const pairwise: PairwiseMatrix = { options: sortedValues, matrix };
 
     return { method: 'ranked', firstPreference, borda, pairwise };
 }
@@ -321,10 +341,19 @@ function tallyWeighted(
     return { method: 'weighted', results };
 }
 
-/** Tally likert — per-option sum/count/mean/median + full rating distribution. */
+/**
+ * Tally likert — per-option sum/count/mean/median + full rating distribution.
+ *
+ * `distribution` is zero-filled across every valid rating grid position so
+ * auditors can replay the histogram without having to reconstruct the grid.
+ * `median` uses the classical definition: for even counts it is the mean of
+ * the two middle values. Backend consumers must match this to keep numbers
+ * byte-aligned with `results.json`.
+ */
 function tallyLikert(
     answers: VoteSelection[],
     options: BallotOption[] | undefined,
+    ratingRange: { min: number; max: number; step?: number } | undefined,
 ): MethodTally {
     const perOption = new Map<number, number[]>();
     if (options) for (const o of options) perOption.set(o.value, []);
@@ -338,9 +367,12 @@ function tallyLikert(
         }
     }
 
+    const gridKeys = ratingRange ? gridValues(ratingRange) : [];
+
     const results: LikertOptionTally[] = Array.from(perOption.entries()).map(
         ([option, ratings]) => {
             const distribution: Record<number, number> = {};
+            for (const k of gridKeys) distribution[k] = 0;
             for (const r of ratings) distribution[r] = (distribution[r] ?? 0) + 1;
             return {
                 option,
@@ -356,7 +388,7 @@ function tallyLikert(
     return { method: 'likert', results };
 }
 
-/** Dispatch to the correct per-method tally. */
+/** Dispatch to the correct per-method tally. Abstain answers are filtered out by the caller. */
 function tallyForMethod(q: BallotQuestion, answers: VoteSelection[]): MethodTally {
     switch (q.method) {
         case 'binary':
@@ -364,13 +396,13 @@ function tallyForMethod(q: BallotQuestion, answers: VoteSelection[]): MethodTall
         case 'multi-choice':
             return tallySimple(q.method, answers, q.options);
         case 'range':
-            return tallyRange(answers);
+            return tallyRange(answers, q.valueRange);
         case 'ranked':
             return tallyRanked(answers, q.options);
         case 'weighted':
             return tallyWeighted(answers, q.options);
         case 'likert':
-            return tallyLikert(answers, q.options);
+            return tallyLikert(answers, q.options, q.ratingRange);
     }
 }
 
@@ -414,33 +446,70 @@ async function tallyVotes(
         votersByRole[role] = (votersByRole[role] ?? 0) + 1;
     }
 
-    // Bucket every ballot's answer by role, then dispatch to the method-
-    // specific tally helper. `raw` holds the all-roles-combined bucket.
+    // The set of roles that must appear in every QuestionTally.roleResults:
+    // every role declared on the ballot's roleWeighting, plus every role
+    // observed in evidence (safety net for mismatched authoring), plus `raw`.
+    const declaredRoles = new Set<string>(Object.keys(ballot.roleWeighting ?? {}));
+    const observedRoles = new Set<string>(Object.keys(votersByRole));
+    const allRoles = new Set<string>([...declaredRoles, ...observedRoles, 'raw']);
+
+    // Bucket every ballot's answer by role. Abstain answers go into a
+    // separate map so they show up in `abstainedByRole` but not in any
+    // MethodTally aggregate.
     const answersByQuestionRole = new Map<string, Map<string, VoteSelection[]>>();
+    const abstainByQuestionRole = new Map<string, Map<string, number>>();
     for (const q of ballot.questions) {
-        answersByQuestionRole.set(q.questionId, new Map());
+        const roleAnswers = new Map<string, VoteSelection[]>();
+        const roleAbstain = new Map<string, number>();
+        for (const r of allRoles) {
+            roleAnswers.set(r, []);
+            roleAbstain.set(r, 0);
+        }
+        answersByQuestionRole.set(q.questionId, roleAnswers);
+        abstainByQuestionRole.set(q.questionId, roleAbstain);
     }
 
     for (const evidence of evidenceList) {
         const hrp = evidence.ekklesia?.credentialHrp ?? 'drep';
         const role = HRP_TO_ROLE[hrp] ?? evidence.responderRole ?? 'Unknown';
         for (const answer of evidence.answers) {
-            const perRole = answersByQuestionRole.get(answer.questionId);
-            if (!perRole) continue;
+            const perRoleAnswers = answersByQuestionRole.get(answer.questionId);
+            const perRoleAbstain = abstainByQuestionRole.get(answer.questionId);
+            if (!perRoleAnswers || !perRoleAbstain) continue;
             for (const bucket of [role, 'raw']) {
-                if (!perRole.has(bucket)) perRole.set(bucket, []);
-                perRole.get(bucket)!.push(answer);
+                if (answer.abstain === true) {
+                    perRoleAbstain.set(bucket, (perRoleAbstain.get(bucket) ?? 0) + 1);
+                } else {
+                    if (!perRoleAnswers.has(bucket)) perRoleAnswers.set(bucket, []);
+                    perRoleAnswers.get(bucket)!.push(answer);
+                }
             }
         }
     }
 
     const tallies: QuestionTally[] = ballot.questions.map((q) => {
-        const perRole = answersByQuestionRole.get(q.questionId) ?? new Map();
+        const perRoleAnswers = answersByQuestionRole.get(q.questionId) ?? new Map();
+        const perRoleAbstain = abstainByQuestionRole.get(q.questionId) ?? new Map();
+
         const roleResults: Record<string, MethodTally> = {};
-        for (const [role, answers] of perRole) {
+        for (const [role, answers] of perRoleAnswers) {
             roleResults[role] = tallyForMethod(q, answers);
         }
-        return { questionId: q.questionId, method: q.method, roleResults };
+
+        const abstainedByRole: Record<string, number> = {};
+        for (const [role, count] of perRoleAbstain) {
+            if (count > 0) abstainedByRole[role] = count;
+        }
+
+        const tally: QuestionTally = {
+            questionId: q.questionId,
+            method: q.method,
+            roleResults,
+        };
+        if (Object.keys(abstainedByRole).length > 0) {
+            tally.abstainedByRole = abstainedByRole;
+        }
+        return tally;
     });
 
     return { tallies, votersByRole };

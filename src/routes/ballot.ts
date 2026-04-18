@@ -39,6 +39,28 @@ function validateGrid(
 }
 
 /**
+ * Validate a question's options: every value must be a non-negative integer
+ * and values must be unique within the question's options set.
+ */
+function validateOptions(
+    label: string,
+    options: BallotQuestion['options'],
+): string | null {
+    if (!options) return null;
+    const seen = new Set<number>();
+    for (const o of options) {
+        if (typeof o.value !== 'number' || !Number.isInteger(o.value) || o.value < 0) {
+            return `${label}: option values must be non-negative integers (got ${o.value})`;
+        }
+        if (seen.has(o.value)) {
+            return `${label}: duplicate option value ${o.value}`;
+        }
+        seen.add(o.value);
+    }
+    return null;
+}
+
+/**
  * Validate the questions array of a BallotDefinition before minting. Enforces
  * method-level structural requirements so broken ballots never get locked
  * on-chain. Returns an error message string on failure, or null on success.
@@ -52,6 +74,12 @@ function validateBallotDefinition(ballot: BallotDefinition): string | null {
         if (!q.questionId) return 'Every question must have a questionId';
         if (ids.has(q.questionId)) return `Duplicate questionId: "${q.questionId}"`;
         ids.add(q.questionId);
+
+        // All questions: validate option value integrity if options are present.
+        if (q.options) {
+            const optErr = validateOptions(`"${q.questionId}" options`, q.options);
+            if (optErr) return optErr;
+        }
 
         if (q.method === 'range') {
             if (!q.valueRange) {
@@ -85,9 +113,28 @@ function validateBallotDefinition(ballot: BallotDefinition): string | null {
             if (!q.options || q.options.length === 0) {
                 return `"${q.questionId}" is ranked but has no options`;
             }
-            const rc = q.rankCount ?? q.options.length;
-            if (!Number.isInteger(rc) || rc < 1 || rc > q.options.length) {
+            if (q.rankCount === undefined) {
+                return `"${q.questionId}" ranked: rankCount is required (no silent default — specify how many options must be ranked)`;
+            }
+            if (!Number.isInteger(q.rankCount) || q.rankCount < 1 || q.rankCount > q.options.length) {
                 return `"${q.questionId}" ranked: rankCount must be a positive integer no greater than options.length`;
+            }
+        }
+
+        if (q.method === 'multi-choice') {
+            if (!q.options || q.options.length === 0) {
+                return `"${q.questionId}" is multi-choice but has no options`;
+            }
+            const min = q.minSelections ?? 1;
+            const max = q.maxSelections ?? q.options.length;
+            if (!Number.isInteger(min) || min < 1) {
+                return `"${q.questionId}" multi-choice: minSelections must be a positive integer (empty selections disallowed — use abstainAllowed instead)`;
+            }
+            if (!Number.isInteger(max) || max < min) {
+                return `"${q.questionId}" multi-choice: maxSelections must be an integer >= minSelections (${min})`;
+            }
+            if (max > q.options.length) {
+                return `"${q.questionId}" multi-choice: maxSelections (${max}) exceeds options.length (${q.options.length})`;
             }
         }
     }

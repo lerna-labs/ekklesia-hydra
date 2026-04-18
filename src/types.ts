@@ -112,6 +112,16 @@ export interface BallotQuestion {
      * be integers and `(max - min) % step === 0`.
      */
     ratingRange?: { min: number; max: number; step?: number };
+    /**
+     * Whether voters may explicitly abstain on this question. When true,
+     * voters may submit `{ questionId, abstain: true }` in place of a
+     * selection. Abstainers are counted in participation (`abstainedByRole`
+     * in the tally) but contribute nothing to per-option aggregates.
+     * Defaults to false. Orthogonal to having an "Abstain" option in
+     * `options`, which is a regular selection that shows up in per-option
+     * counts.
+     */
+    abstainAllowed?: boolean;
 }
 
 /** Ekklesia-specific extension fields on the ballot definition. */
@@ -347,6 +357,13 @@ export interface QuestionTally {
     questionId: string;
     method: VoteMethod;
     roleResults: Record<string, MethodTally>;
+    /**
+     * Per-role counts of voters who explicitly abstained on this question
+     * (`abstain: true`). Abstainers do NOT contribute to any `MethodTally`
+     * aggregate. Omitted when no abstentions were recorded.
+     * The `"raw"` key aggregates across all roles.
+     */
+    abstainedByRole?: Record<string, number>;
 }
 
 /**
@@ -423,6 +440,10 @@ export interface SelectionEntry {
 /**
  * An individual answer to a ballot question.
  *
+ * Either `abstain: true` is set (voter participated but expressed no
+ * preference — question must have `abstainAllowed: true`) or `selection`
+ * is present. The two are mutually exclusive.
+ *
  * The `selection` payload shape is determined by the question's `method`:
  *   - binary / single-choice / multi-choice: number[] of chosen option values.
  *   - range:                                 number[] of length 1 — the picked value on the valueRange grid.
@@ -435,7 +456,14 @@ export interface SelectionEntry {
  */
 export interface VoteSelection {
     questionId: string;
-    selection: number[] | SelectionEntry[];
+    /**
+     * If true, the voter participated on this question but expressed no
+     * preference. `selection` must be absent. The question's
+     * `abstainAllowed` must be true.
+     */
+    abstain?: true;
+    /** Required unless `abstain === true`. Shape determined by method. */
+    selection?: number[] | SelectionEntry[];
 }
 
 /**

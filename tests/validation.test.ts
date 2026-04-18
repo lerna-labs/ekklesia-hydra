@@ -65,7 +65,8 @@ interface SelectionEntry {
 
 interface VoteSelection {
     questionId: string;
-    selection: number[] | SelectionEntry[];
+    abstain?: true;
+    selection?: number[] | SelectionEntry[];
 }
 
 interface QuestionDef {
@@ -79,6 +80,7 @@ interface QuestionDef {
     rankCount?: number;
     budget?: number;
     ratingRange?: { min: number; max: number; step?: number };
+    abstainAllowed?: boolean;
 }
 
 function asNumberArray(s: VoteSelection['selection']): number[] | null {
@@ -115,6 +117,20 @@ function validateSelections(votes: VoteSelection[], questions: QuestionDef[]): s
         const qid = sel.questionId;
         const validValues = q.options ? new Set(q.options.map((o) => o.value)) : null;
 
+        if (sel.abstain === true) {
+            if (!q.abstainAllowed) {
+                return `"${qid}" does not allow abstain (question.abstainAllowed is not true)`;
+            }
+            if (sel.selection !== undefined) {
+                return `"${qid}" abstain is mutually exclusive with selection`;
+            }
+            continue;
+        }
+
+        if (sel.selection === undefined) {
+            return `"${qid}" requires either selection or abstain: true`;
+        }
+
         switch (q.method) {
             case 'binary':
             case 'single-choice': {
@@ -131,9 +147,9 @@ function validateSelections(votes: VoteSelection[], questions: QuestionDef[]): s
             case 'multi-choice': {
                 const values = asNumberArray(sel.selection);
                 if (!values) {
-                    return `"${qid}" (multi-choice) requires a non-empty number[] selection`;
+                    return `"${qid}" (multi-choice) requires a non-empty number[] selection (use abstain:true to skip)`;
                 }
-                const min = q.minSelections ?? 0;
+                const min = Math.max(q.minSelections ?? 1, 1);
                 const max = q.maxSelections ?? (q.options?.length ?? 1);
                 if (values.length < min) {
                     return `Too few selections for "${qid}": got ${values.length}, min ${min}`;
@@ -279,6 +295,22 @@ function validateGrid(
     return null;
 }
 
+function validateOptions(
+    label: string,
+    options: QuestionDef['options'],
+): string | null {
+    if (!options) return null;
+    const seen = new Set<number>();
+    for (const o of options) {
+        if (typeof o.value !== 'number' || !Number.isInteger(o.value) || o.value < 0) {
+            return `${label}: option values must be non-negative integers (got ${o.value})`;
+        }
+        if (seen.has(o.value)) return `${label}: duplicate option value ${o.value}`;
+        seen.add(o.value);
+    }
+    return null;
+}
+
 function validateBallotQuestions(questions: QuestionDef[]): string | null {
     if (!Array.isArray(questions) || questions.length === 0) {
         return 'Ballot must contain at least one question';
@@ -288,6 +320,11 @@ function validateBallotQuestions(questions: QuestionDef[]): string | null {
         if (!q.questionId) return 'Every question must have a questionId';
         if (ids.has(q.questionId)) return `Duplicate questionId: "${q.questionId}"`;
         ids.add(q.questionId);
+
+        if (q.options) {
+            const e = validateOptions(`"${q.questionId}" options`, q.options);
+            if (e) return e;
+        }
 
         if (q.method === 'range') {
             if (!q.valueRange) return `"${q.questionId}" is range but has no valueRange defined`;
@@ -314,9 +351,27 @@ function validateBallotQuestions(questions: QuestionDef[]): string | null {
             if (!q.options || q.options.length === 0) {
                 return `"${q.questionId}" is ranked but has no options`;
             }
-            const rc = q.rankCount ?? q.options.length;
-            if (!Number.isInteger(rc) || rc < 1 || rc > q.options.length) {
+            if (q.rankCount === undefined) {
+                return `"${q.questionId}" ranked: rankCount is required (no silent default — specify how many options must be ranked)`;
+            }
+            if (!Number.isInteger(q.rankCount) || q.rankCount < 1 || q.rankCount > q.options.length) {
                 return `"${q.questionId}" ranked: rankCount must be a positive integer no greater than options.length`;
+            }
+        }
+        if (q.method === 'multi-choice') {
+            if (!q.options || q.options.length === 0) {
+                return `"${q.questionId}" is multi-choice but has no options`;
+            }
+            const min = q.minSelections ?? 1;
+            const max = q.maxSelections ?? q.options.length;
+            if (!Number.isInteger(min) || min < 1) {
+                return `"${q.questionId}" multi-choice: minSelections must be a positive integer (empty selections disallowed — use abstainAllowed instead)`;
+            }
+            if (!Number.isInteger(max) || max < min) {
+                return `"${q.questionId}" multi-choice: maxSelections must be an integer >= minSelections (${min})`;
+            }
+            if (max > q.options.length) {
+                return `"${q.questionId}" multi-choice: maxSelections (${max}) exceeds options.length (${q.options.length})`;
             }
         }
     }
@@ -356,10 +411,23 @@ const rankedQuestion: QuestionDef = {
     questionId: 'qRank',
     question: 'Rank the options',
     method: 'ranked',
+    rankCount: 3,
     options: [
         { label: 'A', value: 1 },
         { label: 'B', value: 2 },
         { label: 'C', value: 3 },
+    ],
+};
+
+const abstainableLikert: QuestionDef = {
+    questionId: 'qLA',
+    question: 'Rate the options (abstain allowed)',
+    method: 'likert',
+    abstainAllowed: true,
+    ratingRange: { min: 1, max: 5 },
+    options: [
+        { label: 'A', value: 1 },
+        { label: 'B', value: 2 },
     ],
 };
 
@@ -451,7 +519,7 @@ describe('validateSelections — binary', () => {
             [{ questionId: 'q1' } as any],
             [binaryQuestion],
         );
-        expect(err).toContain('requires exactly 1 selection');
+        expect(err).toContain('requires either selection or abstain: true');
     });
 
     it('should reject string value in selection (type confusion)', () => {
@@ -884,6 +952,140 @@ describe('validateBallotQuestions', () => {
     it('rejects an empty questions array', () => {
         const err = validateBallotQuestions([]);
         expect(err).toContain('at least one question');
+    });
+
+    it('rejects duplicate option values within a question', () => {
+        const broken: QuestionDef = {
+            questionId: 'qDup',
+            question: 'Pick one',
+            method: 'single-choice',
+            options: [
+                { label: 'A', value: 1 },
+                { label: 'B', value: 1 },
+            ],
+        };
+        const err = validateBallotQuestions([broken]);
+        expect(err).toContain('duplicate option value 1');
+    });
+
+    it('rejects a negative option value', () => {
+        const broken: QuestionDef = {
+            questionId: 'qNeg',
+            question: 'Pick one',
+            method: 'single-choice',
+            options: [{ label: 'A', value: -1 }],
+        };
+        const err = validateBallotQuestions([broken]);
+        expect(err).toContain('non-negative integers');
+    });
+
+    it('rejects a ranked question with no rankCount specified', () => {
+        const broken: QuestionDef = {
+            questionId: 'qRankNoRC',
+            question: 'Rank',
+            method: 'ranked',
+            options: [{ label: 'A', value: 1 }, { label: 'B', value: 2 }],
+        };
+        const err = validateBallotQuestions([broken]);
+        expect(err).toContain('rankCount is required');
+    });
+
+    it('rejects a multi-choice with min=0', () => {
+        const broken: QuestionDef = {
+            questionId: 'qMultiZero',
+            question: 'Pick some',
+            method: 'multi-choice',
+            minSelections: 0,
+            options: [{ label: 'A', value: 1 }, { label: 'B', value: 2 }],
+        };
+        const err = validateBallotQuestions([broken]);
+        expect(err).toContain('minSelections must be a positive integer');
+    });
+
+    it('rejects a multi-choice with max > options.length', () => {
+        const broken: QuestionDef = {
+            questionId: 'qMultiTooMany',
+            question: 'Pick some',
+            method: 'multi-choice',
+            minSelections: 1,
+            maxSelections: 5,
+            options: [{ label: 'A', value: 1 }, { label: 'B', value: 2 }],
+        };
+        const err = validateBallotQuestions([broken]);
+        expect(err).toContain('exceeds options.length');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Abstain validation
+// ---------------------------------------------------------------------------
+
+describe('validateSelections — abstain', () => {
+    it('accepts abstain: true on a question that allows it', () => {
+        expect(validateSelections(
+            [{ questionId: 'qLA', abstain: true }],
+            [abstainableLikert],
+        )).toBeNull();
+    });
+
+    it('rejects abstain on a question that does not allow it', () => {
+        const err = validateSelections(
+            [{ questionId: 'qL', abstain: true }],
+            [likertQuestion],
+        );
+        expect(err).toContain('does not allow abstain');
+    });
+
+    it('rejects abstain + selection together', () => {
+        const err = validateSelections(
+            [{
+                questionId: 'qLA',
+                abstain: true,
+                selection: [{ option: 1, value: 3 }, { option: 2, value: 4 }],
+            }],
+            [abstainableLikert],
+        );
+        expect(err).toContain('mutually exclusive');
+    });
+
+    it('rejects a vote with neither abstain nor selection', () => {
+        const err = validateSelections(
+            [{ questionId: 'qL' } as any],
+            [likertQuestion],
+        );
+        expect(err).toContain('requires either selection or abstain: true');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Multi-choice empty-selection rejection (must use abstain)
+// ---------------------------------------------------------------------------
+
+describe('validateSelections — multi-choice rejects empty selection', () => {
+    const multi: QuestionDef = {
+        questionId: 'qM',
+        question: 'Pick any',
+        method: 'multi-choice',
+        options: [
+            { label: 'A', value: 1 },
+            { label: 'B', value: 2 },
+            { label: 'C', value: 3 },
+        ],
+    };
+
+    it('rejects an empty selection', () => {
+        const err = validateSelections(
+            [{ questionId: 'qM', selection: [] }],
+            [multi],
+        );
+        expect(err).toContain('requires a non-empty number[] selection');
+    });
+
+    it('accepts a one-element selection (default min is 1)', () => {
+        expect(validateSelections(
+            [{ questionId: 'qM', selection: [1] }],
+            [multi],
+        )).toBeNull();
     });
 });
 

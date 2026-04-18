@@ -76,6 +76,21 @@ function validateSelections(votes: VoteSelection[], ballot: BallotDefinition): s
         const qid = sel.questionId;
         const validValues = q.options ? new Set(q.options.map((o) => o.value)) : null;
 
+        // Abstain short-circuits per-method shape validation.
+        if (sel.abstain === true) {
+            if (!q.abstainAllowed) {
+                return `"${qid}" does not allow abstain (question.abstainAllowed is not true)`;
+            }
+            if (sel.selection !== undefined) {
+                return `"${qid}" abstain is mutually exclusive with selection`;
+            }
+            continue;
+        }
+
+        if (sel.selection === undefined) {
+            return `"${qid}" requires either selection or abstain: true`;
+        }
+
         switch (q.method) {
             case 'binary':
             case 'single-choice': {
@@ -92,9 +107,9 @@ function validateSelections(votes: VoteSelection[], ballot: BallotDefinition): s
             case 'multi-choice': {
                 const values = asNumberArray(sel.selection);
                 if (!values) {
-                    return `"${qid}" (multi-choice) requires a non-empty number[] selection`;
+                    return `"${qid}" (multi-choice) requires a non-empty number[] selection (use abstain:true to skip)`;
                 }
-                const min = q.minSelections ?? 0;
+                const min = Math.max(q.minSelections ?? 1, 1);
                 const max = q.maxSelections ?? (q.options?.length ?? 1);
                 if (values.length < min) {
                     return `Too few selections for "${qid}": got ${values.length}, min ${min}`;
@@ -469,7 +484,7 @@ async function voteValidateAndPin(input: VotePipelineInput): Promise<VotePipelin
     if (ballot) {
         const selError = validateSelections(votes, ballot);
         if (selError) {
-            throw Object.assign(new Error(selError), { statusCode: 400, code: 'INVALID_INPUT' as const });
+            throw Object.assign(new Error(selError), { statusCode: 400, code: 'INVALID_VOTE' as const });
         }
     }
 

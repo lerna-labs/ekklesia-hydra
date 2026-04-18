@@ -262,6 +262,7 @@ export async function getVoteHistory(voterId: string): Promise<VoteHistoryEntry[
 export type ErrorCode =
     | 'MISSING_FIELDS'
     | 'INVALID_INPUT'
+    | 'INVALID_VOTE'
     | 'INVALID_VOTER_ID'
     | 'UNAUTHORIZED'
     | 'SIGNATURE_INVALID'
