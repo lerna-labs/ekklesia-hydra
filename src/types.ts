@@ -17,29 +17,36 @@ export const BALLOT_INSTANCE_PREFIX = '00259a20';
  * used in voter token asset names.
  *
  * Voter token asset name = <prefix byte><blake2b_224(bech32_decoded_data)> (29 bytes)
+ *
+ * Only `drep`, `pool`, `calidus`, `stake`, `stake_test` are accepted as
+ * voter IDs. Payment-stake composite addresses (addr / addr_test) are
+ * intentionally excluded: the signing key only verifies a particular
+ * payment address and can be spoofed against a stake credential, which
+ * is of limited use in a voting platform.
  */
 export const CREDENTIAL_PREFIX: Record<string, number> = {
     drep: 0x22,
     stake: 0xe0,
     stake_test: 0xe0,
     pool: 0x06,
-    calidus: 0x06,      // Calidus keys represent an SPO — use same prefix as pool
-    addr: 0x60,
-    addr_test: 0x60,
+    calidus: 0x06,      // Calidus hot key represents a pool — same prefix.
 };
 
 /** All recognized bech32 HRPs for voter identification. */
 export type VoterHrp = keyof typeof CREDENTIAL_PREFIX;
 
-/** Map bech32 HRP to human-readable voter role for tally grouping. */
+/**
+ * Map bech32 HRP to tally role. Roles are lowercase and form the canonical
+ * three-group voter space: `drep`, `pool`, `stake`. `stake_test` is just
+ * the testnet prefix for stake credentials and collapses into the same
+ * role. `calidus` is an SPO hot key and counts toward `pool`.
+ */
 export const HRP_TO_ROLE: Record<string, string> = {
-    drep: 'DRep',
-    pool: 'SPO',
-    calidus: 'SPO',     // Calidus is an SPO hot key — counts as SPO vote
-    stake: 'Stakeholder',
-    stake_test: 'Stakeholder',
-    addr: 'Stakeholder',
-    addr_test: 'Stakeholder',
+    drep: 'drep',
+    pool: 'pool',
+    calidus: 'pool',
+    stake: 'stake',
+    stake_test: 'stake',
 };
 
 // ---------------------------------------------------------------------------
@@ -150,13 +157,15 @@ export interface EkklesiaBallotExtension {
 
 /**
  * CIP-179 role weighting configuration.
- * Maps role names to their weighting mode.
+ * Maps role names to their weighting mode. Only `drep`, `pool`, and
+ * `stake` are recognized — the canonical three-group voter space.
+ * Earlier variants (`DRep`, `SPO`, `Stakeholder`, `CC`) are not accepted
+ * and are rejected at `/prepare` if present in a ballot definition.
  */
 export interface RoleWeighting {
-    DRep?: 'CredentialBased' | 'StakeBased';
-    SPO?: 'CredentialBased' | 'StakeBased' | 'PledgeBased';
-    CC?: 'CredentialBased';
-    Stakeholder?: 'StakeBased';
+    drep?: 'CredentialBased' | 'StakeBased';
+    pool?: 'CredentialBased' | 'StakeBased' | 'PledgeBased';
+    stake?: 'StakeBased';
 }
 
 /**
@@ -375,7 +384,7 @@ export interface FullResults {
     totalVoters: number;
     headId: string;
     finalizedAt: string;
-    /** Per-role voter counts (e.g., { DRep: 800, SPO: 200 }). */
+    /** Per-role voter counts (e.g., { drep: 800, pool: 200 }). */
     votersByRole?: Record<string, number>;
     /** Voters excluded from results — on-chain token existed but evidence could not be verified. */
     excludedVoters?: Array<{ tokenName: string; reason: string }>;

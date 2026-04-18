@@ -8,7 +8,10 @@ import {checkBallotModifiable, error, HYDRA_NETWORK, hydraMonitor, ipfs, success
 import {getCachedResultsAddress} from './lifecycle.js';
 import {toBallotSurveyDetails} from '../cip179.js';
 import type {BallotDefinition, BallotQuestion} from '../types.js';
-import {BALLOT_DEFINITION_PREFIX, BALLOT_INSTANCE_PREFIX, buildAssetName} from '../types.js';
+import {BALLOT_DEFINITION_PREFIX, BALLOT_INSTANCE_PREFIX, CREDENTIAL_PREFIX, buildAssetName} from '../types.js';
+
+/** Roles permitted in ballot.roleWeighting. Matches the HRP_TO_ROLE range. */
+const ALLOWED_ROLES = new Set(['drep', 'pool', 'stake']);
 
 const router = Router();
 
@@ -66,6 +69,28 @@ function validateOptions(
  * on-chain. Returns an error message string on failure, or null on success.
  */
 function validateBallotDefinition(ballot: BallotDefinition): string | null {
+    // Role space: only `drep`, `pool`, `stake` are recognized in roleWeighting.
+    // Reject the earlier variants loudly so upstream ballot authors migrate
+    // rather than silently producing roleWeighting entries that are ignored.
+    if (ballot.roleWeighting) {
+        for (const role of Object.keys(ballot.roleWeighting)) {
+            if (!ALLOWED_ROLES.has(role)) {
+                return `roleWeighting contains unrecognized role "${role}" — only ${Array.from(ALLOWED_ROLES).join(', ')} are accepted (earlier variants DRep/SPO/Stakeholder/CC have been dropped)`;
+            }
+        }
+    }
+
+    // acceptedCredentials must reference bech32 HRPs Hydra recognizes.
+    const accepted = ballot.ekklesia?.acceptedCredentials;
+    if (accepted && Array.isArray(accepted)) {
+        const allowedHrps = new Set(Object.keys(CREDENTIAL_PREFIX));
+        for (const hrp of accepted) {
+            if (!allowedHrps.has(hrp)) {
+                return `ekklesia.acceptedCredentials contains unrecognized HRP "${hrp}" — allowed: ${Array.from(allowedHrps).join(', ')}`;
+            }
+        }
+    }
+
     if (!Array.isArray(ballot.questions) || ballot.questions.length === 0) {
         return 'Ballot must contain at least one question';
     }
@@ -74,6 +99,13 @@ function validateBallotDefinition(ballot: BallotDefinition): string | null {
         if (!q.questionId) return 'Every question must have a questionId';
         if (ids.has(q.questionId)) return `Duplicate questionId: "${q.questionId}"`;
         ids.add(q.questionId);
+
+        // Reject the legacy opt-in abstain flag. It was replaced by
+        // `requireAnswer` (opt-out) with inverted semantics — silently
+        // honoring abstainAllowed:false would be dangerous, so fail loudly.
+        if ((q as unknown as Record<string, unknown>).abstainAllowed !== undefined) {
+            return `"${q.questionId}" uses legacy field "abstainAllowed" — replaced by "requireAnswer" with inverted semantics (abstain is now allowed by default; set requireAnswer:true only to force an answer)`;
+        }
 
         // All questions: validate option value integrity if options are present.
         if (q.options) {

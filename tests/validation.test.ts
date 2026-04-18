@@ -311,6 +311,31 @@ function validateOptions(
     return null;
 }
 
+const ALLOWED_ROLES = new Set(['drep', 'pool', 'stake']);
+const ALLOWED_HRPS = new Set(['drep', 'pool', 'calidus', 'stake', 'stake_test']);
+
+function validateBallotHeader(ballot: {
+    roleWeighting?: Record<string, string>;
+    ekklesia?: { acceptedCredentials?: string[] };
+}): string | null {
+    if (ballot.roleWeighting) {
+        for (const role of Object.keys(ballot.roleWeighting)) {
+            if (!ALLOWED_ROLES.has(role)) {
+                return `roleWeighting contains unrecognized role "${role}"`;
+            }
+        }
+    }
+    const accepted = ballot.ekklesia?.acceptedCredentials;
+    if (accepted && Array.isArray(accepted)) {
+        for (const hrp of accepted) {
+            if (!ALLOWED_HRPS.has(hrp)) {
+                return `ekklesia.acceptedCredentials contains unrecognized HRP "${hrp}"`;
+            }
+        }
+    }
+    return null;
+}
+
 function validateBallotQuestions(questions: QuestionDef[]): string | null {
     if (!Array.isArray(questions) || questions.length === 0) {
         return 'Ballot must contain at least one question';
@@ -320,6 +345,10 @@ function validateBallotQuestions(questions: QuestionDef[]): string | null {
         if (!q.questionId) return 'Every question must have a questionId';
         if (ids.has(q.questionId)) return `Duplicate questionId: "${q.questionId}"`;
         ids.add(q.questionId);
+
+        if ((q as unknown as Record<string, unknown>).abstainAllowed !== undefined) {
+            return `"${q.questionId}" uses legacy field "abstainAllowed" — replaced by "requireAnswer"`;
+        }
 
         if (q.options) {
             const e = validateOptions(`"${q.questionId}" options`, q.options);
@@ -1013,6 +1042,16 @@ describe('validateBallotQuestions', () => {
         expect(err).toContain('minSelections must be a positive integer');
     });
 
+    it('rejects a question using the legacy abstainAllowed field', () => {
+        const broken = {
+            ...binaryQuestion,
+            questionId: 'qLegacy',
+            abstainAllowed: true,
+        } as unknown as QuestionDef;
+        const err = validateBallotQuestions([broken]);
+        expect(err).toContain('legacy field "abstainAllowed"');
+    });
+
     it('rejects a multi-choice with max > options.length', () => {
         const broken: QuestionDef = {
             questionId: 'qMultiTooMany',
@@ -1024,6 +1063,47 @@ describe('validateBallotQuestions', () => {
         };
         const err = validateBallotQuestions([broken]);
         expect(err).toContain('exceeds options.length');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Ballot header (roleWeighting + acceptedCredentials) validation
+// ---------------------------------------------------------------------------
+
+describe('validateBallotHeader', () => {
+    it('accepts a ballot with lowercase roles and allowed HRPs', () => {
+        expect(validateBallotHeader({
+            roleWeighting: { drep: 'CredentialBased', pool: 'PledgeBased' },
+            ekklesia: { acceptedCredentials: ['drep', 'pool', 'stake'] },
+        })).toBeNull();
+    });
+
+    it('rejects a legacy DRep role in roleWeighting', () => {
+        const err = validateBallotHeader({
+            roleWeighting: { DRep: 'CredentialBased' },
+        });
+        expect(err).toContain('unrecognized role "DRep"');
+    });
+
+    it('rejects a CC role in roleWeighting (dropped entirely)', () => {
+        const err = validateBallotHeader({
+            roleWeighting: { CC: 'CredentialBased' } as Record<string, string>,
+        });
+        expect(err).toContain('unrecognized role "CC"');
+    });
+
+    it('rejects addr in acceptedCredentials (payment-stake composite disallowed)', () => {
+        const err = validateBallotHeader({
+            ekklesia: { acceptedCredentials: ['drep', 'addr'] },
+        });
+        expect(err).toContain('unrecognized HRP "addr"');
+    });
+
+    it('rejects a credential prefix byte (`0x22`) in acceptedCredentials', () => {
+        const err = validateBallotHeader({
+            ekklesia: { acceptedCredentials: ['0x22'] },
+        });
+        expect(err).toContain('unrecognized HRP "0x22"');
     });
 });
 

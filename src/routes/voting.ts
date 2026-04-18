@@ -502,7 +502,7 @@ async function voteValidateAndPin(input: VotePipelineInput): Promise<VotePipelin
     // Build evidence
     const evidence: VoteEvidence = {
         specVersion: '0.3.0',
-        responderRole: responderRole ?? 'DRep',
+        responderRole: responderRole ?? 'drep',
         answers: votes,
         ekklesia: {
             voterId,
@@ -690,7 +690,7 @@ router.post('/vote-and-register', (req, _res, next) => {
  *     key: string,
  *     signature: string,
  *   }
- *   responderRole?: string         — e.g., "DRep" (default: "DRep")
+ *   responderRole?: string         — e.g., "drep" (default: "drep")
  */
 /**
  * POST /vote
@@ -711,7 +711,7 @@ router.post('/vote-and-register', (req, _res, next) => {
  *   ballotId: string               — ballot identifier (ULID or tx hash)
  *   votes: VoteSelection[]         — [{questionId, selection: number[]}]
  *   signature: VoteSignatureData   — COSE_Sign1 or native script witnesses
- *   responderRole?: string         — e.g., "DRep" (default: "DRep")
+ *   responderRole?: string         — e.g., "drep" (default: "drep")
  */
 router.post('/vote', async (req, res) => {
     const {

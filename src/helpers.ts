@@ -164,7 +164,8 @@ export function voterIdToTokenName(voterId: string): string {
     const hrp = decoded.prefix;
     const prefixByte = CREDENTIAL_PREFIX[hrp];
     if (prefixByte === undefined) {
-        throw new Error(`Unrecognized bech32 prefix: "${hrp}"`);
+        const allowed = Object.keys(CREDENTIAL_PREFIX).join(', ');
+        throw new Error(`Unrecognized bech32 prefix: "${hrp}" — voter IDs must use one of: ${allowed}`);
     }
 
     const bytes = bech32.fromWords(decoded.words);
