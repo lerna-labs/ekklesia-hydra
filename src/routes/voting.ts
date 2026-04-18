@@ -76,10 +76,11 @@ function validateSelections(votes: VoteSelection[], ballot: BallotDefinition): s
         const qid = sel.questionId;
         const validValues = q.options ? new Set(q.options.map((o) => o.value)) : null;
 
-        // Abstain short-circuits per-method shape validation.
+        // Abstain short-circuits per-method shape validation. Allowed by
+        // default; rejected only on questions flagged requireAnswer.
         if (sel.abstain === true) {
-            if (!q.abstainAllowed) {
-                return `"${qid}" does not allow abstain (question.abstainAllowed is not true)`;
+            if (q.requireAnswer) {
+                return `"${qid}" requires an answer (question.requireAnswer is true) — abstain not permitted`;
             }
             if (sel.selection !== undefined) {
                 return `"${qid}" abstain is mutually exclusive with selection`;

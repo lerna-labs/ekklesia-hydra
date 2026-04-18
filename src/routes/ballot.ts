@@ -128,7 +128,7 @@ function validateBallotDefinition(ballot: BallotDefinition): string | null {
             const min = q.minSelections ?? 1;
             const max = q.maxSelections ?? q.options.length;
             if (!Number.isInteger(min) || min < 1) {
-                return `"${q.questionId}" multi-choice: minSelections must be a positive integer (empty selections disallowed — use abstainAllowed instead)`;
+                return `"${q.questionId}" multi-choice: minSelections must be a positive integer (empty selections disallowed — voters use abstain:true to skip, or set requireAnswer:true to force a pick)`;
             }
             if (!Number.isInteger(max) || max < min) {
                 return `"${q.questionId}" multi-choice: maxSelections must be an integer >= minSelections (${min})`;

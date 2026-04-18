@@ -80,7 +80,7 @@ interface QuestionDef {
     rankCount?: number;
     budget?: number;
     ratingRange?: { min: number; max: number; step?: number };
-    abstainAllowed?: boolean;
+    requireAnswer?: boolean;
 }
 
 function asNumberArray(s: VoteSelection['selection']): number[] | null {
@@ -118,8 +118,8 @@ function validateSelections(votes: VoteSelection[], questions: QuestionDef[]): s
         const validValues = q.options ? new Set(q.options.map((o) => o.value)) : null;
 
         if (sel.abstain === true) {
-            if (!q.abstainAllowed) {
-                return `"${qid}" does not allow abstain (question.abstainAllowed is not true)`;
+            if (q.requireAnswer) {
+                return `"${qid}" requires an answer (question.requireAnswer is true) — abstain not permitted`;
             }
             if (sel.selection !== undefined) {
                 return `"${qid}" abstain is mutually exclusive with selection`;
@@ -421,9 +421,20 @@ const rankedQuestion: QuestionDef = {
 
 const abstainableLikert: QuestionDef = {
     questionId: 'qLA',
-    question: 'Rate the options (abstain allowed)',
+    question: 'Rate the options (abstain allowed by default)',
     method: 'likert',
-    abstainAllowed: true,
+    ratingRange: { min: 1, max: 5 },
+    options: [
+        { label: 'A', value: 1 },
+        { label: 'B', value: 2 },
+    ],
+};
+
+const mustAnswerLikert: QuestionDef = {
+    questionId: 'qLR',
+    question: 'Rate the options (must answer)',
+    method: 'likert',
+    requireAnswer: true,
     ratingRange: { min: 1, max: 5 },
     options: [
         { label: 'A', value: 1 },
@@ -1021,19 +1032,26 @@ describe('validateBallotQuestions', () => {
 // ---------------------------------------------------------------------------
 
 describe('validateSelections — abstain', () => {
-    it('accepts abstain: true on a question that allows it', () => {
+    it('accepts abstain: true by default (no requireAnswer flag)', () => {
         expect(validateSelections(
             [{ questionId: 'qLA', abstain: true }],
             [abstainableLikert],
         )).toBeNull();
     });
 
-    it('rejects abstain on a question that does not allow it', () => {
-        const err = validateSelections(
+    it('also accepts abstain: true on the unflagged likertQuestion (default permits)', () => {
+        expect(validateSelections(
             [{ questionId: 'qL', abstain: true }],
             [likertQuestion],
+        )).toBeNull();
+    });
+
+    it('rejects abstain on a question with requireAnswer: true', () => {
+        const err = validateSelections(
+            [{ questionId: 'qLR', abstain: true }],
+            [mustAnswerLikert],
         );
-        expect(err).toContain('does not allow abstain');
+        expect(err).toContain('requires an answer');
     });
 
     it('rejects abstain + selection together', () => {

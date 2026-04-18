@@ -113,15 +113,13 @@ export interface BallotQuestion {
      */
     ratingRange?: { min: number; max: number; step?: number };
     /**
-     * Whether voters may explicitly abstain on this question. When true,
-     * voters may submit `{ questionId, abstain: true }` in place of a
-     * selection. Abstainers are counted in participation (`abstainedByRole`
-     * in the tally) but contribute nothing to per-option aggregates.
-     * Defaults to false. Orthogonal to having an "Abstain" option in
-     * `options`, which is a regular selection that shows up in per-option
-     * counts.
+     * If true, voters MUST submit a selection on this question — `abstain:
+     * true` is rejected. Default is false, meaning abstention is allowed by
+     * default and only explicitly disallowed for "must answer" questions.
+     * Orthogonal to having an "Abstain" option in `options`, which is a
+     * regular selection that shows up in per-option counts.
      */
-    abstainAllowed?: boolean;
+    requireAnswer?: boolean;
 }
 
 /** Ekklesia-specific extension fields on the ballot definition. */
@@ -441,7 +439,7 @@ export interface SelectionEntry {
  * An individual answer to a ballot question.
  *
  * Either `abstain: true` is set (voter participated but expressed no
- * preference — question must have `abstainAllowed: true`) or `selection`
+ * preference — allowed by default unless question has `requireAnswer: true`) or `selection`
  * is present. The two are mutually exclusive.
  *
  * The `selection` payload shape is determined by the question's `method`:
@@ -458,8 +456,8 @@ export interface VoteSelection {
     questionId: string;
     /**
      * If true, the voter participated on this question but expressed no
-     * preference. `selection` must be absent. The question's
-     * `abstainAllowed` must be true.
+     * preference. `selection` must be absent. Allowed by default; rejected
+     * only on questions flagged with `requireAnswer: true`.
      */
     abstain?: true;
     /** Required unless `abstain === true`. Shape determined by method. */
