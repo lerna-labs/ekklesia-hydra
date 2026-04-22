@@ -67,6 +67,16 @@ function isOnGrid(v: number, min: number, max: number, step: number): boolean {
 function validateSelections(votes: VoteSelection[], ballot: BallotDefinition): string | null {
     const questionMap = new Map(ballot.questions.map((q) => [q.questionId, q]));
 
+    // A single /vote call may not contain two entries for the same
+    // questionId — ambiguous which one is the voter's preference.
+    const seenQids = new Set<string>();
+    for (const sel of votes) {
+        if (seenQids.has(sel.questionId)) {
+            return `Duplicate questionId "${sel.questionId}" in votes[] — at most one entry per question per submission`;
+        }
+        seenQids.add(sel.questionId);
+    }
+
     for (const sel of votes) {
         const q = questionMap.get(sel.questionId);
         if (!q) {

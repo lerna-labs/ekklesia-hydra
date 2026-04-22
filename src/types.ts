@@ -127,6 +127,23 @@ export interface BallotQuestion {
      * regular selection that shows up in per-option counts.
      */
     requireAnswer?: boolean;
+    /**
+     * Optional blake2b_256 digest (64 lowercase hex chars) of the question's
+     * voter-facing content blob — per-proposal summary, rationale, authors,
+     * version, per-option descriptions / reference URLs / image URLs /
+     * metadata, etc. The backend owns the canonical byte layout and hash
+     * computation; Hydra treats this as an opaque commitment.
+     *
+     * When present, the field participates in the question's JSON-stringified
+     * merkle leaf and therefore in `ekklesia.merkleRoot`, anchoring the
+     * content on-chain via the (600) datum. When absent, the question is
+     * committed without content-hash protection.
+     *
+     * Hydra does not fetch, interpret, or pin the underlying content — it
+     * only validates the hash format (64-char lowercase hex) at
+     * ballot-prepare time.
+     */
+    contentHash?: string;
 }
 
 /** Ekklesia-specific extension fields on the ballot definition. */
@@ -165,7 +182,7 @@ export interface EkklesiaBallotExtension {
 export interface RoleWeighting {
     drep?: 'CredentialBased' | 'StakeBased';
     pool?: 'CredentialBased' | 'StakeBased' | 'PledgeBased';
-    stake?: 'StakeBased';
+    stake?: 'CredentialBased' | 'StakeBased';
 }
 
 /**

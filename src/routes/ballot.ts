@@ -13,6 +13,17 @@ import {BALLOT_DEFINITION_PREFIX, BALLOT_INSTANCE_PREFIX, CREDENTIAL_PREFIX, bui
 /** Roles permitted in ballot.roleWeighting. Matches the HRP_TO_ROLE range. */
 const ALLOWED_ROLES = new Set(['drep', 'pool', 'stake']);
 
+/**
+ * Per-role allowed power-source modes, matching the RoleWeighting type in
+ * types.ts. Each (role, mode) pair must independently satisfy this map —
+ * e.g. `stake: PledgeBased` is nonsensical and must be rejected.
+ */
+const ALLOWED_MODES_BY_ROLE: Record<string, Set<string>> = {
+    drep: new Set(['CredentialBased', 'StakeBased']),
+    pool: new Set(['CredentialBased', 'StakeBased', 'PledgeBased']),
+    stake: new Set(['CredentialBased', 'StakeBased']),
+};
+
 const router = Router();
 
 /**
@@ -70,12 +81,19 @@ function validateOptions(
  */
 function validateBallotDefinition(ballot: BallotDefinition): string | null {
     // Role space: only `drep`, `pool`, `stake` are recognized in roleWeighting.
-    // Reject the earlier variants loudly so upstream ballot authors migrate
-    // rather than silently producing roleWeighting entries that are ignored.
+    // Each (role, mode) pair must also satisfy the per-role allowed-mode set
+    // — e.g. `stake: PledgeBased` is nonsensical and is rejected here rather
+    // than silently tally'd as a StakeBased stake role downstream.
     if (ballot.roleWeighting) {
-        for (const role of Object.keys(ballot.roleWeighting)) {
+        const rw = ballot.roleWeighting as Record<string, string>;
+        for (const role of Object.keys(rw)) {
             if (!ALLOWED_ROLES.has(role)) {
                 return `roleWeighting contains unrecognized role "${role}" — only ${Array.from(ALLOWED_ROLES).join(', ')} are accepted (earlier variants DRep/SPO/Stakeholder/CC have been dropped)`;
+            }
+            const mode = rw[role];
+            const allowed = ALLOWED_MODES_BY_ROLE[role];
+            if (!allowed.has(mode)) {
+                return `roleWeighting.${role} has invalid mode "${mode}" — allowed for "${role}": ${Array.from(allowed).join(', ')}`;
             }
         }
     }
@@ -105,6 +123,18 @@ function validateBallotDefinition(ballot: BallotDefinition): string | null {
         // honoring abstainAllowed:false would be dangerous, so fail loudly.
         if ((q as unknown as Record<string, unknown>).abstainAllowed !== undefined) {
             return `"${q.questionId}" uses legacy field "abstainAllowed" — replaced by "requireAnswer" with inverted semantics (abstain is now allowed by default; set requireAnswer:true only to force an answer)`;
+        }
+
+        // Optional content-hash commitment. Hydra treats the hash as opaque
+        // bytes; we only enforce the format so invalid commitments can't
+        // sneak into the merkle root.
+        if (q.contentHash !== undefined) {
+            if (typeof q.contentHash !== 'string') {
+                return `"${q.questionId}" contentHash must be a string`;
+            }
+            if (!/^[0-9a-f]{64}$/.test(q.contentHash)) {
+                return `"${q.questionId}" contentHash must be exactly 64 lowercase hex characters (blake2b_256)`;
+            }
         }
 
         // All questions: validate option value integrity if options are present.

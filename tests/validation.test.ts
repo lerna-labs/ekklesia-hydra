@@ -81,6 +81,7 @@ interface QuestionDef {
     budget?: number;
     ratingRange?: { min: number; max: number; step?: number };
     requireAnswer?: boolean;
+    contentHash?: string;
 }
 
 function asNumberArray(s: VoteSelection['selection']): number[] | null {
@@ -109,6 +110,14 @@ function isOnGrid(v: number, min: number, max: number, step: number): boolean {
 
 function validateSelections(votes: VoteSelection[], questions: QuestionDef[]): string | null {
     const questionMap = new Map(questions.map((q) => [q.questionId, q]));
+
+    const seenQids = new Set<string>();
+    for (const sel of votes) {
+        if (seenQids.has(sel.questionId)) {
+            return `Duplicate questionId "${sel.questionId}" in votes[] — at most one entry per question per submission`;
+        }
+        seenQids.add(sel.questionId);
+    }
 
     for (const sel of votes) {
         const q = questionMap.get(sel.questionId);
@@ -313,6 +322,11 @@ function validateOptions(
 
 const ALLOWED_ROLES = new Set(['drep', 'pool', 'stake']);
 const ALLOWED_HRPS = new Set(['drep', 'pool', 'calidus', 'stake', 'stake_test']);
+const ALLOWED_MODES_BY_ROLE: Record<string, Set<string>> = {
+    drep: new Set(['CredentialBased', 'StakeBased']),
+    pool: new Set(['CredentialBased', 'StakeBased', 'PledgeBased']),
+    stake: new Set(['CredentialBased', 'StakeBased']),
+};
 
 function validateBallotHeader(ballot: {
     roleWeighting?: Record<string, string>;
@@ -322,6 +336,11 @@ function validateBallotHeader(ballot: {
         for (const role of Object.keys(ballot.roleWeighting)) {
             if (!ALLOWED_ROLES.has(role)) {
                 return `roleWeighting contains unrecognized role "${role}"`;
+            }
+            const mode = ballot.roleWeighting[role];
+            const allowed = ALLOWED_MODES_BY_ROLE[role];
+            if (!allowed.has(mode)) {
+                return `roleWeighting.${role} has invalid mode "${mode}"`;
             }
         }
     }
@@ -348,6 +367,15 @@ function validateBallotQuestions(questions: QuestionDef[]): string | null {
 
         if ((q as unknown as Record<string, unknown>).abstainAllowed !== undefined) {
             return `"${q.questionId}" uses legacy field "abstainAllowed" — replaced by "requireAnswer"`;
+        }
+
+        if (q.contentHash !== undefined) {
+            if (typeof q.contentHash !== 'string') {
+                return `"${q.questionId}" contentHash must be a string`;
+            }
+            if (!/^[0-9a-f]{64}$/.test(q.contentHash)) {
+                return `"${q.questionId}" contentHash must be exactly 64 lowercase hex characters (blake2b_256)`;
+            }
         }
 
         if (q.options) {
@@ -572,6 +600,17 @@ describe('validateSelections — binary', () => {
 
     it('should accept empty votes array', () => {
         expect(validateSelections([], [binaryQuestion])).toBeNull();
+    });
+
+    it('should reject two votes referencing the same questionId in one submission', () => {
+        const err = validateSelections(
+            [
+                { questionId: 'q1', selection: [1] },
+                { questionId: 'q1', selection: [0] },
+            ],
+            [binaryQuestion],
+        );
+        expect(err).toContain('Duplicate questionId "q1"');
     });
 });
 
@@ -1042,6 +1081,75 @@ describe('validateBallotQuestions', () => {
         expect(err).toContain('minSelections must be a positive integer');
     });
 
+    it('accepts a valid lowercase-hex contentHash on a question', () => {
+        const good: QuestionDef = {
+            ...binaryQuestion,
+            questionId: 'qCH',
+            contentHash: 'a'.repeat(64),
+        };
+        expect(validateBallotQuestions([good])).toBeNull();
+    });
+
+    it('accepts a ballot with mixed contentHash presence', () => {
+        const withHash: QuestionDef = {
+            ...binaryQuestion,
+            questionId: 'qCH1',
+            contentHash: '0123456789abcdef'.repeat(4),
+        };
+        const withoutHash: QuestionDef = { ...binaryQuestion, questionId: 'qCH2' };
+        expect(validateBallotQuestions([withHash, withoutHash])).toBeNull();
+    });
+
+    it('rejects an uppercase-hex contentHash', () => {
+        const broken: QuestionDef = {
+            ...binaryQuestion,
+            questionId: 'qCHup',
+            contentHash: 'A'.repeat(64),
+        };
+        const err = validateBallotQuestions([broken]);
+        expect(err).toContain('64 lowercase hex characters');
+    });
+
+    it('rejects a contentHash that is too short', () => {
+        const broken: QuestionDef = {
+            ...binaryQuestion,
+            questionId: 'qCHshort',
+            contentHash: 'abc123',
+        };
+        const err = validateBallotQuestions([broken]);
+        expect(err).toContain('64 lowercase hex characters');
+    });
+
+    it('rejects a contentHash that is too long', () => {
+        const broken: QuestionDef = {
+            ...binaryQuestion,
+            questionId: 'qCHlong',
+            contentHash: 'a'.repeat(65),
+        };
+        const err = validateBallotQuestions([broken]);
+        expect(err).toContain('64 lowercase hex characters');
+    });
+
+    it('rejects a contentHash that contains non-hex characters', () => {
+        const broken: QuestionDef = {
+            ...binaryQuestion,
+            questionId: 'qCHjunk',
+            contentHash: 'g'.repeat(64),
+        };
+        const err = validateBallotQuestions([broken]);
+        expect(err).toContain('64 lowercase hex characters');
+    });
+
+    it('rejects a non-string contentHash', () => {
+        const broken = {
+            ...binaryQuestion,
+            questionId: 'qCHnum',
+            contentHash: 12345,
+        } as unknown as QuestionDef;
+        const err = validateBallotQuestions([broken]);
+        expect(err).toContain('contentHash must be a string');
+    });
+
     it('rejects a question using the legacy abstainAllowed field', () => {
         const broken = {
             ...binaryQuestion,
@@ -1104,6 +1212,39 @@ describe('validateBallotHeader', () => {
             ekklesia: { acceptedCredentials: ['0x22'] },
         });
         expect(err).toContain('unrecognized HRP "0x22"');
+    });
+
+    it('accepts a multi-key roleWeighting per RSS v2 example', () => {
+        expect(validateBallotHeader({
+            roleWeighting: { drep: 'StakeBased', pool: 'PledgeBased' },
+        })).toBeNull();
+    });
+
+    it('rejects drep with PledgeBased mode', () => {
+        const err = validateBallotHeader({
+            roleWeighting: { drep: 'PledgeBased' },
+        });
+        expect(err).toContain('roleWeighting.drep has invalid mode "PledgeBased"');
+    });
+
+    it('accepts stake with CredentialBased mode (one-stake-key-one-vote)', () => {
+        expect(validateBallotHeader({
+            roleWeighting: { stake: 'CredentialBased' },
+        })).toBeNull();
+    });
+
+    it('rejects stake with PledgeBased mode (pool-only concept)', () => {
+        const err = validateBallotHeader({
+            roleWeighting: { stake: 'PledgeBased' },
+        });
+        expect(err).toContain('roleWeighting.stake has invalid mode "PledgeBased"');
+    });
+
+    it('rejects pool with a made-up mode', () => {
+        const err = validateBallotHeader({
+            roleWeighting: { pool: 'Bogus' },
+        });
+        expect(err).toContain('roleWeighting.pool has invalid mode "Bogus"');
     });
 });
 
