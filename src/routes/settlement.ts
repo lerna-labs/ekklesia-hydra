@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { createNativeScript, Wrangler } from '@lerna-labs/hydra-sdk';
 import { blake2b256, bytesToHex, computePackage } from '@lerna-labs/hydra-proof';
 import type { FileLeaf } from '@lerna-labs/hydra-proof';
-import { initialize, voterIdToTokenName, CLOSE_TOKEN, VERBOSE, IPFS_STAGING_DIR, ipfs, voteCache, success, error, debug, hydraMonitor, getHeadId, txQueue, enqueueAndWait } from '../helpers.js';
+import { initialize, voterIdToTokenName, CLOSE_TOKEN, VERBOSE, IPFS_STAGING_DIR, ipfs, voteCache, success, error, debug, hydraMonitor, getHeadId, txQueue, enqueueAndWait, driveHeadToFinal } from '../helpers.js';
 import { hydraValueToAmounts } from '../tx-builder.js';
 import { getCachedBallot, getCachedBallotId, getCachedBallotIdentity, getCachedResultsAddress } from './lifecycle.js';
 import { BALLOT_INSTANCE_PREFIX, BALLOT_DEFINITION_PREFIX, HRP_TO_ROLE } from '../types.js';
@@ -1101,45 +1101,15 @@ router.post('/settle/close', async (req, res) => {
     }
 
     try {
-        const currentStatus = hydraMonitor.headStatus;
-        debug(`[settle/close] Current status: ${currentStatus}`);
-
-        if (currentStatus === 'FINAL') {
-            return success(res, { status: 'FINAL', message: 'Head already finalized' });
-        }
-
-        if (currentStatus === 'FANOUT_POSSIBLE') {
-            hydraMonitor.ws.send({ tag: 'Fanout' });
-            await hydraMonitor.waitForStatus('FINAL', 600_000);
-            return success(res, { status: 'FINAL' });
-        }
-
-        if (currentStatus === 'CLOSED') {
-            await hydraMonitor.waitForStatus('FANOUT_POSSIBLE', 300_000);
-            hydraMonitor.ws.send({ tag: 'Fanout' });
-            await hydraMonitor.waitForStatus('FINAL', 600_000);
-            return success(res, { status: 'FINAL' });
-        }
-
-        // Head is still Open — close it
-        hydraMonitor.ws.send({ tag: 'Close' });
-
-        const onStatus = (status: string) => {
-            if (status === 'FANOUT_POSSIBLE') {
-                debug('[settle/close] Fanout possible, sending Fanout…');
-                hydraMonitor.ws.send({ tag: 'Fanout' });
-            }
-        };
-        hydraMonitor.on('status', onStatus);
-
-        try {
-            await hydraMonitor.waitForStatus('FINAL', 600_000);
-        } finally {
-            hydraMonitor.removeListener('status', onStatus);
-        }
-
-        return success(res, { status: 'FINAL' });
+        const wasAlreadyFinal = hydraMonitor.headStatus === 'FINAL';
+        await driveHeadToFinal('settle/close');
+        return success(res, wasAlreadyFinal
+            ? { status: 'FINAL', message: 'Head already finalized' }
+            : { status: 'FINAL' });
     } catch (err: any) {
+        if (err?.code === 'HEAD_NOT_CLOSEABLE') {
+            return error(res, 'CONFLICT', err.message, 409);
+        }
         console.error('[settle/close] Failed:', err);
         return error(res, 'INTERNAL_ERROR', err.message || 'Close failed', 500);
     }
@@ -1419,42 +1389,7 @@ router.post('/settle', async (req, res) => {
         await logHeadSnapshot('post-finalize', wrangler);
 
         // --- Step 4: Close head — fanout includes ballot token with finalized datum ---
-        // Use the monitor's status tracking to avoid missing events that fired
-        // before the listener was registered (race condition with shared WebSocket).
-        const currentStatus = hydraMonitor.headStatus;
-        debug(`[settle/close] Current monitor status: ${currentStatus}`);
-
-        if (currentStatus === 'FINAL') {
-            debug('[settle/close] Head already finalized');
-        } else if (currentStatus === 'FANOUT_POSSIBLE') {
-            debug('[settle/close] Fanout possible, sending Fanout…');
-            hydraMonitor.ws.send({ tag: 'Fanout' });
-            await hydraMonitor.waitForStatus('FINAL', 600_000);
-        } else if (currentStatus === 'CLOSED') {
-            debug('[settle/close] Head closed, waiting for fanout…');
-            await hydraMonitor.waitForStatus('FANOUT_POSSIBLE', 300_000);
-            hydraMonitor.ws.send({ tag: 'Fanout' });
-            await hydraMonitor.waitForStatus('FINAL', 600_000);
-        } else {
-            // Head is still Open — send Close and wait through the full lifecycle
-            debug('[settle/close] Closing head…');
-            hydraMonitor.ws.send({ tag: 'Close' });
-
-            // Listen for ReadyToFanout to send Fanout command
-            const onStatus = (status: string) => {
-                if (status === 'FANOUT_POSSIBLE') {
-                    debug('[settle/close] Fanout possible, sending Fanout…');
-                    hydraMonitor.ws.send({ tag: 'Fanout' });
-                }
-            };
-            hydraMonitor.on('status', onStatus);
-
-            try {
-                await hydraMonitor.waitForStatus('FINAL', 600_000);
-            } finally {
-                hydraMonitor.removeListener('status', onStatus);
-            }
-        }
+        await driveHeadToFinal('settle');
 
         steps.push({ step: 'close', status: 'SUCCESS' });
 

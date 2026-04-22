@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { Wrangler } from '@lerna-labs/hydra-sdk';
-import { CLOSE_TOKEN, ipfs, voteCache, IPFS_STAGING_DIR, success, error, hydraMonitor, txQueue, debug } from '../helpers.js';
+import { CLOSE_TOKEN, ipfs, voteCache, IPFS_STAGING_DIR, success, error, hydraMonitor, txQueue, driveHeadToFinal } from '../helpers.js';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import type { BallotDefinition } from '../types.js';
@@ -227,45 +227,15 @@ router.post('/close', async (req, res) => {
     }
 
     try {
-        const currentStatus = hydraMonitor.headStatus;
-        debug(`[close] Current status: ${currentStatus}`);
-
-        if (currentStatus === 'FINAL') {
-            return success(res, { status: 'FINAL', message: 'Head already finalized' });
-        }
-
-        if (currentStatus === 'FANOUT_POSSIBLE') {
-            hydraMonitor.ws.send({ tag: 'Fanout' });
-            await hydraMonitor.waitForStatus('FINAL', 600_000);
-            return success(res, { status: 'FINAL' });
-        }
-
-        if (currentStatus === 'CLOSED') {
-            await hydraMonitor.waitForStatus('FANOUT_POSSIBLE', 300_000);
-            hydraMonitor.ws.send({ tag: 'Fanout' });
-            await hydraMonitor.waitForStatus('FINAL', 600_000);
-            return success(res, { status: 'FINAL' });
-        }
-
-        // Head is still Open — send Close and drive through the full lifecycle.
-        hydraMonitor.ws.send({ tag: 'Close' });
-
-        const onStatus = (status: string) => {
-            if (status === 'FANOUT_POSSIBLE') {
-                debug('[close] Fanout possible, sending Fanout…');
-                hydraMonitor.ws.send({ tag: 'Fanout' });
-            }
-        };
-        hydraMonitor.on('status', onStatus);
-
-        try {
-            await hydraMonitor.waitForStatus('FINAL', 600_000);
-        } finally {
-            hydraMonitor.removeListener('status', onStatus);
-        }
-
-        return success(res, { status: 'FINAL' });
+        const wasAlreadyFinal = hydraMonitor.headStatus === 'FINAL';
+        await driveHeadToFinal('close');
+        return success(res, wasAlreadyFinal
+            ? { status: 'FINAL', message: 'Head already finalized' }
+            : { status: 'FINAL' });
     } catch (err: any) {
+        if (err?.code === 'HEAD_NOT_CLOSEABLE') {
+            return error(res, 'CONFLICT', err.message, 409);
+        }
         console.error('Failed to close head?', err);
         return error(res, 'INTERNAL_ERROR', err.message || 'Failed to close head', 500);
     }

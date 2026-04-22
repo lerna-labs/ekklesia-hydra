@@ -348,3 +348,91 @@ export function checkBallotModifiable(args: ModifyCheckArgs): ModifyCheckResult 
 
     return { ok: true };
 }
+
+/**
+ * Drive the shared HydraMonitor through the Close → FanoutPossible → Fanout
+ * → Final lifecycle, starting from whatever the current status is.
+ *
+ * Idempotent: short-circuits on FINAL, picks up mid-sequence from CLOSED or
+ * FANOUT_POSSIBLE. Safe to re-invoke after a transient error.
+ *
+ * Fails fast (instead of hanging 10 minutes on waitForStatus) when:
+ *   - the head is in a non-closeable state (IDLE / INITIALIZING / UNKNOWN)
+ *   - Hydra responds CommandFailed to the Close or Fanout command we send
+ *
+ * Replaces the per-route close ladder that used to live in /close,
+ * /settle/close, and /settle's final step.
+ *
+ * @param label - Short identifier for debug logs (e.g. "settle/close").
+ */
+export async function driveHeadToFinal(label: string): Promise<void> {
+    const currentStatus = hydraMonitor.headStatus;
+    debug(`[${label}] Current status: ${currentStatus}`);
+
+    if (currentStatus === 'FINAL') return;
+
+    if (currentStatus !== 'OPEN'
+        && currentStatus !== 'CLOSED'
+        && currentStatus !== 'FANOUT_POSSIBLE') {
+        const e = new Error(
+            `Cannot close head: status is "${currentStatus}" — expected OPEN, CLOSED, FANOUT_POSSIBLE, or FINAL. ` +
+            `The head must be fully open (post-/start) before it can be closed.`,
+        ) as Error & { code?: string };
+        e.code = 'HEAD_NOT_CLOSEABLE';
+        throw e;
+    }
+
+    // Surface Hydra's CommandFailed rejections on Close/Fanout as a thrown
+    // error so we don't silently wait out the full timeout on a rejected
+    // command. Filter by clientInput.tag to ignore unrelated command
+    // failures that might fire concurrently (e.g., from the tx worker).
+    let commandFailure: Error | null = null;
+    const onCommandFailed = (msg: any) => {
+        const failedTag = msg?.clientInput?.tag;
+        if (failedTag === 'Close' || failedTag === 'Fanout') {
+            commandFailure = new Error(
+                `Hydra rejected ${failedTag}: ${JSON.stringify(msg)}`,
+            );
+        }
+    };
+    hydraMonitor.on('error:command', onCommandFailed);
+
+    try {
+        if (currentStatus === 'FANOUT_POSSIBLE') {
+            hydraMonitor.ws.send({ tag: 'Fanout' });
+            await hydraMonitor.waitForStatus('FINAL', 600_000);
+            if (commandFailure) throw commandFailure;
+            return;
+        }
+
+        if (currentStatus === 'CLOSED') {
+            await hydraMonitor.waitForStatus('FANOUT_POSSIBLE', 300_000);
+            if (commandFailure) throw commandFailure;
+            hydraMonitor.ws.send({ tag: 'Fanout' });
+            await hydraMonitor.waitForStatus('FINAL', 600_000);
+            if (commandFailure) throw commandFailure;
+            return;
+        }
+
+        // currentStatus === 'OPEN' — send Close and drive the full lifecycle.
+        hydraMonitor.ws.send({ tag: 'Close' });
+
+        const onStatus = (status: string) => {
+            if (status === 'FANOUT_POSSIBLE') {
+                debug(`[${label}] Fanout possible, sending Fanout…`);
+                hydraMonitor.ws.send({ tag: 'Fanout' });
+            }
+        };
+        hydraMonitor.on('status', onStatus);
+
+        try {
+            await hydraMonitor.waitForStatus('FINAL', 600_000);
+        } finally {
+            hydraMonitor.removeListener('status', onStatus);
+        }
+
+        if (commandFailure) throw commandFailure;
+    } finally {
+        hydraMonitor.removeListener('error:command', onCommandFailed);
+    }
+}
