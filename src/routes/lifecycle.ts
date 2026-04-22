@@ -102,6 +102,14 @@ router.get('/head-info', async (_, res) => {
  *       Defaults to the 28-byte fingerprint (the 56-hex-char suffix of ballotToken).
  *   resultsAddress?: string
  *     — destination for the (601) token after finalize (defaults to admin).
+ *
+ * Recovery / idempotency:
+ *   If the head is already Open when this is called, the handler skips the
+ *   cache wipe and the open-wait and simply seeds the identity/ballot cache
+ *   from the body. This handles the case where a previous /start timed out
+ *   on the middleware side but the underlying Hydra open succeeded on L1 —
+ *   re-calling /start with the same body rebuilds the in-memory caches
+ *   without disturbing any in-head state. Response includes `alreadyOpen: true`.
  */
 router.post('/start', async (req, res) => {
     const wrangler = new Wrangler(process.env.HYDRA_API_URL, undefined, hydraMonitor);
@@ -123,29 +131,43 @@ router.post('/start', async (req, res) => {
     }
 
     try {
-        // Flush stale vote cache from any previous head session.
-        // DiskCache doesn't expose clear(), so wipe disk dirs + rehydrate (loads 0 entries).
-        cachedBallot = null;
-        cachedBallotPolicy = null;
-        cachedBallotToken = null;
-        cachedBallotId = null;
-        cachedResultsAddress = null;
-        const votesDir = path.join(IPFS_STAGING_DIR, 'votes');
-        const latestDir = path.join(IPFS_STAGING_DIR, 'latest');
-        const historyDir = path.join(IPFS_STAGING_DIR, 'history');
-        for (const dir of [votesDir, latestDir, historyDir]) {
-            try { await fs.rm(dir, { recursive: true, force: true }); } catch { /* ignore */ }
-        }
-        // Remove stale pre-burn ledger from previous session
-        try { await fs.rm(path.join(IPFS_STAGING_DIR, 'pre-burn-ledger.json'), { force: true }); } catch { /* ignore */ }
-        await voteCache.rehydrate(); // rebuilds in-memory map from now-empty latest/
-        await txQueue.clear(); // clear stale queue entries from previous session
-        console.log('Vote cache, history, and ballot cache cleared for new head session.');
+        // If the head is already Open, treat this as a cache-seeding call and
+        // skip both the cache wipe and the open-wait. The SDK's waitForHeadOpen
+        // only resolves on a HeadIsOpen transition event — if the head is
+        // already Open, the Greetings replay logs "Open → already ready,
+        // proceeding" but never resolves, so the call would otherwise hang
+        // for the full 10-minute timeout. This path recovers a stuck session
+        // (e.g. L1 commit succeeded on the Hydra side after the original
+        // /start timed out) without disturbing any in-head state.
+        const alreadyOpen = hydraMonitor.headStatus === 'OPEN';
 
-        // Simple commit — single UTxO (ballot token + gas ADA).
-        // The SDK fetches UTxO details from Blockfrost and builds the commit
-        // automatically for single-UTxO commits (no blueprint needed).
-        await wrangler.waitForHeadOpen({ utxos }, 600000); // 10 min — init + L1 commit can be slow
+        if (!alreadyOpen) {
+            // Flush stale vote cache from any previous head session.
+            // DiskCache doesn't expose clear(), so wipe disk dirs + rehydrate (loads 0 entries).
+            cachedBallot = null;
+            cachedBallotPolicy = null;
+            cachedBallotToken = null;
+            cachedBallotId = null;
+            cachedResultsAddress = null;
+            const votesDir = path.join(IPFS_STAGING_DIR, 'votes');
+            const latestDir = path.join(IPFS_STAGING_DIR, 'latest');
+            const historyDir = path.join(IPFS_STAGING_DIR, 'history');
+            for (const dir of [votesDir, latestDir, historyDir]) {
+                try { await fs.rm(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+            }
+            // Remove stale pre-burn ledger from previous session
+            try { await fs.rm(path.join(IPFS_STAGING_DIR, 'pre-burn-ledger.json'), { force: true }); } catch { /* ignore */ }
+            await voteCache.rehydrate(); // rebuilds in-memory map from now-empty latest/
+            await txQueue.clear(); // clear stale queue entries from previous session
+            console.log('Vote cache, history, and ballot cache cleared for new head session.');
+
+            // Simple commit — single UTxO (ballot token + gas ADA).
+            // The SDK fetches UTxO details from Blockfrost and builds the commit
+            // automatically for single-UTxO commits (no blueprint needed).
+            await wrangler.waitForHeadOpen({ utxos }, 600000); // 10 min — init + L1 commit can be slow
+        } else {
+            console.log('/start called against an already-Open head — seeding identity/ballot cache without wiping existing state.');
+        }
 
         // Cache the ballot definition from IPFS if CID was provided
         if (ballotIpfsCid) {
@@ -177,6 +199,7 @@ router.post('/start', async (req, res) => {
         return success(res, {
             ballotCached: cachedBallot !== null,
             ballotId: cachedBallotId,
+            alreadyOpen,
         });
     } catch (err: any) {
         console.error('Failed to start head:', err);
