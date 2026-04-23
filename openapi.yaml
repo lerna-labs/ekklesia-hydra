@@ -385,6 +385,19 @@ paths:
         for the head to reach Open status. Optionally fetches and caches the
         ballot definition from IPFS. Caches ballot identity (policy/token) for
         voting routes.
+
+        **Refuses with 409 CONFLICT** when `finalize-response.json` is
+        already present in `IPFS_STAGING_DIR` — that file marks a finalized
+        ballot whose audit artifacts (evidence files, merkle proofs, history
+        chains, pinned results.json) are still on local disk. Opening a new
+        head against that directory would clobber the record, and Ekklesia
+        never reuses a head for a second ballot. Archive the staging
+        directory (or set `IPFS_STAGING_DIR` to a fresh path) before
+        retrying.
+
+        An aborted prior session with no finalize-response.json is safe to
+        overwrite: /start wipes the session-scoped dirs (`votes/`,
+        `latest/`, `history/`, `pre-burn-ledger.json`) and proceeds.
       requestBody:
         required: true
         content:
@@ -443,6 +456,7 @@ paths:
                             type: string
                             description: The effective cached ballotId (either the value supplied in the request body or the fingerprint fallback).
         '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
         '500': { $ref: '#/components/responses/InternalError' }
 
   /close:
@@ -718,6 +732,66 @@ paths:
               schema:
                 $ref: '#/components/schemas/FinalizeResponse'
         '400': { $ref: '#/components/responses/BadRequest' }
+
+  /results:
+    get:
+      tags: [Settlement]
+      summary: Re-fetch the last finalize response for this head session
+      description: |
+        Returns the full envelope persisted by the most recent
+        `/finalize`, `/settle/finalize`, or `/settle` call — identical to
+        the response body those endpoints emitted, plus a `persistedAt`
+        timestamp.
+
+        Intended as a safety net for dropped connections: if the HTTP
+        client lost the original finalize response (client timeout, proxy
+        500, gateway restart), re-running `/finalize` is not an option
+        once the head has closed. Call `GET /results` instead and you'll
+        receive the same payload — `tallies`, `resultsHash`, `resultsCid`,
+        `evidenceDirectoryCid`, `excludedVoters`, etc.
+
+        Returns `404 NOT_FOUND` when no finalize has run since the last
+        `/start` (which wipes the persisted envelope).
+
+        Available in any head status. The response survives head close,
+        fanout, and node restart as long as `IPFS_STAGING_DIR` is
+        persistent across restarts.
+      responses:
+        '200':
+          description: Previously-finalized response envelope
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [txHash, resultsHash, evidenceDirectoryCid, resultsCid, evidenceMerkleRoot, totalVoters, tallies, persistedAt]
+                        properties:
+                          txHash: { type: string }
+                          resultsHash: { type: string }
+                          evidenceDirectoryCid: { type: string }
+                          resultsCid: { type: string }
+                          evidenceMerkleRoot: { type: string }
+                          totalVoters: { type: integer }
+                          tallies:
+                            type: object
+                            additionalProperties: { $ref: '#/components/schemas/BackendTally' }
+                          excludedVoters:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                tokenName: { type: string }
+                                reason: { type: string }
+                          persistedAt:
+                            type: string
+                            format: date-time
+                            description: ISO-8601 timestamp when the envelope was written to disk.
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /settle/close:
     post:
@@ -1087,6 +1161,7 @@ components:
             - INVALID_VOTER_ID
             - SIGNATURE_INVALID
             - CONFLICT
+            - NOT_FOUND
             - NO_BALLOT_CACHED
             - WALLET_INIT_FAILED
             - CLIENT_INIT_FAILED
@@ -1409,6 +1484,133 @@ components:
         timestamp: { type: integer }
 
     # ---------- Settlement ----------
+    BackendOptionResult:
+      type: object
+      required: [id, count, votingPower]
+      properties:
+        id:
+          type: string
+          description: Option value rendered as a string, or the literal `"abstain"`.
+        label: { type: string }
+        count: { type: integer }
+        votingPower:
+          type: integer
+          enum: [0]
+          description: Always `0` — Hydra emits raw counts; stake-weighting is post-hoc.
+
+    BackendGroupTally:
+      type: object
+      required: [totalVotes, results]
+      properties:
+        totalVotes:
+          type: integer
+          description: Distinct voter count for this question in this role (includes abstainers).
+        results:
+          type: array
+          items: { $ref: '#/components/schemas/BackendOptionResult' }
+        scale:
+          type: object
+          description: |
+            Range method extension — per-value histogram only. Zero-filled
+            across the full `valueRange` grid. Summary stats (mean, median,
+            min, max, stdDev) are the consumer's responsibility.
+          required: [distribution]
+          properties:
+            distribution:
+              type: array
+              items:
+                type: object
+                required: [value, count]
+                properties:
+                  value: { type: integer }
+                  count: { type: integer }
+        ranked:
+          type: object
+          description: |
+            Ranked method extension — first-preference counts plus the full
+            pairwise preference matrix. Condorcet, Borda, Schulze, Ranked
+            Pairs and IRV (with chosen tie-break) are all computable from
+            these raw counts by the consumer.
+          required: [firstPreference, pairwise]
+          properties:
+            firstPreference:
+              type: array
+              items:
+                type: object
+                required: [option, count]
+                properties:
+                  option: { type: integer }
+                  count: { type: integer }
+            pairwise:
+              type: object
+              required: [options, matrix]
+              properties:
+                options:
+                  type: array
+                  description: Option values in ascending order — matrix rows/cols follow this order.
+                  items: { type: integer }
+                matrix:
+                  type: array
+                  description: |
+                    `matrix[i][j]` = number of ballots ranking `options[i]` above
+                    `options[j]`. `matrix[i][i]` is always 0.
+                  items:
+                    type: array
+                    items: { type: integer }
+        likert:
+          type: object
+          description: |
+            Likert method extension — per-option rater count and per-rating
+            distribution. Sums, means, medians, majority judgment and every
+            other summary metric are the consumer's responsibility.
+          required: [results]
+          properties:
+            results:
+              type: array
+              items:
+                type: object
+                required: [option, count, distribution]
+                properties:
+                  option: { type: integer }
+                  count:
+                    type: integer
+                    description: Number of ballots that rated this option.
+                  distribution:
+                    type: object
+                    description: Histogram `{ rating: count }`, zero-filled across `ratingRange`.
+                    additionalProperties: { type: integer }
+        weighted:
+          type: object
+          description: |
+            Weighted-allocation extension — per-option raw aggregates only.
+            `totalPoints` is the direct arithmetic sum of voter-submitted
+            allocations. Means / stdDev / normalized scores are the
+            consumer's responsibility.
+          required: [results]
+          properties:
+            results:
+              type: array
+              items:
+                type: object
+                required: [option, totalPoints, voterCount]
+                properties:
+                  option: { type: integer }
+                  totalPoints: { type: integer }
+                  voterCount: { type: integer }
+
+    BackendTally:
+      type: object
+      required: [results, resultsByGroup]
+      properties:
+        results:
+          type: array
+          description: Aggregated per-option counts across all roles (the `"raw"` bucket).
+          items: { $ref: '#/components/schemas/BackendOptionResult' }
+        resultsByGroup:
+          type: object
+          description: Same `results` breakdown bucketed by role.
+          additionalProperties: { $ref: '#/components/schemas/BackendGroupTally' }
+
     FinalizeResponse:
       allOf:
         - $ref: '#/components/schemas/SuccessEnvelope'
@@ -1416,13 +1618,32 @@ components:
           properties:
             data:
               type: object
+              required: [txHash, resultsHash, evidenceDirectoryCid, resultsCid, evidenceMerkleRoot, totalVoters, tallies]
               properties:
                 txHash: { type: string }
-                resultsHash: { type: string }
-                evidenceDirectoryCid: { type: string }
-                resultsCid: { type: string }
+                resultsHash:
+                  type: string
+                  description: blake2b_256 of the canonical bytes of the pinned results.json — anchored on the (601) datum.
+                evidenceDirectoryCid:
+                  type: string
+                  description: IPFS CID of the wrapping evidence directory (results.json, proofs/, history/, etc.).
+                resultsCid:
+                  type: string
+                  description: |
+                    IPFS CID of the standalone pinned `results.json`. Bytes hash to
+                    `resultsHash` so an auditor can verify the on-chain commitment from
+                    just this single file without walking the evidence directory.
                 evidenceMerkleRoot: { type: string }
                 totalVoters: { type: integer }
+                tallies:
+                  type: object
+                  description: |
+                    Per-question tally, keyed by `questionId`. The Ekklesia backend
+                    persists each entry's `results` and `resultsByGroup` directly onto
+                    the `Result` document. Method-specific extension fields
+                    (`scale` / `ranked` / `likert` / `weighted`) hang off each
+                    `resultsByGroup[role]` bucket.
+                  additionalProperties: { $ref: '#/components/schemas/BackendTally' }
                 excludedVoters:
                   type: array
                   items:

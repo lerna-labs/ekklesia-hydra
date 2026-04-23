@@ -142,8 +142,37 @@ router.post('/start', async (req, res) => {
         const alreadyOpen = hydraMonitor.headStatus === 'OPEN';
 
         if (!alreadyOpen) {
-            // Flush stale vote cache from any previous head session.
-            // DiskCache doesn't expose clear(), so wipe disk dirs + rehydrate (loads 0 entries).
+            // Refuse to open a new head while a finalized head's artifacts are
+            // still sitting in the staging directory. Once `finalize-response.json`
+            // exists the staging directory holds the complete, audit-grade
+            // record of a completed ballot (evidence files, per-voter merkle
+            // proofs, history chains, pre-burn ledger, pinned results.json). A
+            // fresh /start that clobbers any of that would silently destroy
+            // the local copy of that audit record — and because Ekklesia
+            // never reuses a head for a second ballot, there is no legitimate
+            // reason to reopen this directory. Operators should archive the
+            // staging directory (or point IPFS_STAGING_DIR at a fresh path)
+            // before starting the next head.
+            const finalizeResponsePath = path.join(IPFS_STAGING_DIR, 'finalize-response.json');
+            try {
+                await fs.access(finalizeResponsePath);
+                return error(
+                    res,
+                    'CONFLICT',
+                    `Refusing to /start: ${finalizeResponsePath} already exists, which means this staging directory still holds a finalized ballot's audit record. Archive the staging directory (or set IPFS_STAGING_DIR to a fresh path) and retry.`,
+                    409,
+                );
+            } catch {
+                // finalize-response.json absent — a prior session either
+                // never ran or aborted before finalize. Safe to wipe its
+                // session-scoped artifacts and start fresh.
+            }
+
+            // Flush stale vote cache from an aborted previous head session.
+            // Only reached when no finalize-response.json is present — i.e.
+            // the prior session never produced a committed audit record.
+            // DiskCache doesn't expose clear(), so wipe disk dirs + rehydrate
+            // (loads 0 entries).
             cachedBallot = null;
             cachedBallotPolicy = null;
             cachedBallotToken = null;
@@ -155,7 +184,9 @@ router.post('/start', async (req, res) => {
             for (const dir of [votesDir, latestDir, historyDir]) {
                 try { await fs.rm(dir, { recursive: true, force: true }); } catch { /* ignore */ }
             }
-            // Remove stale pre-burn ledger from previous session
+            // Remove stale pre-burn ledger from an aborted prior session —
+            // no finalize-response.json is present so any pre-burn snapshot
+            // here is orphaned intermediate state.
             try { await fs.rm(path.join(IPFS_STAGING_DIR, 'pre-burn-ledger.json'), { force: true }); } catch { /* ignore */ }
             await voteCache.rehydrate(); // rebuilds in-memory map from now-empty latest/
             await txQueue.clear(); // clear stale queue entries from previous session

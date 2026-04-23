@@ -308,54 +308,46 @@ export interface DistributionEntry {
     count: number;
 }
 
-/** Aggregate statistics over a set of integer votes (range question). */
-export interface RangeStats {
-    n: number;
-    mean: number;
-    median: number;
-    min: number;
-    max: number;
-    stdDev: number;
-}
-
-/** One option's Borda score — sum of rank-position points across ballots. */
-export interface BordaEntry {
-    option: number;
-    score: number;
-}
-
 /**
  * Pairwise preference matrix for ranked questions. `matrix[i][j]` is the
  * number of ballots on which `options[i]` was ranked above `options[j]`.
- * `matrix[i][i]` is always 0. Sufficient for Condorcet, Copeland, Schulze,
- * Ranked Pairs and other pairwise-family methods without re-reading evidence.
+ * `matrix[i][i]` is always 0. Raw pairwise preference counts — Condorcet,
+ * Copeland, Schulze, Ranked Pairs, Borda and every other pairwise-family
+ * method are computable from this without re-reading evidence.
  */
 export interface PairwiseMatrix {
     options: number[];
     matrix: number[][];
 }
 
-/** Per-option aggregate for a weighted-allocation question. */
+/**
+ * Per-option aggregate for a weighted-allocation question.
+ *
+ * Only raw quantities: `totalPoints` is the direct arithmetic sum of
+ * voter-submitted allocations, `voterCount` is the count of ballots with
+ * a non-zero allocation. Mean / stdDev / normalized scores are up to
+ * downstream consumers.
+ */
 export interface WeightedOptionTally {
     option: number;
     /** Sum of points allocated to this option across all ballots. */
     totalPoints: number;
     /** Number of ballots that allocated a non-zero amount to this option. */
     voterCount: number;
-    /** Mean points per ballot that answered this question. */
-    mean: number;
-    stdDev: number;
 }
 
-/** Per-option aggregate for a likert-rated question. */
+/**
+ * Per-option aggregate for a likert-rated question.
+ *
+ * Only raw quantities: `count` is the number of ballots that rated this
+ * option, `distribution` is the per-rating histogram zero-filled across
+ * the full `ratingRange` grid. Mean / median / mode are up to downstream
+ * consumers.
+ */
 export interface LikertOptionTally {
     option: number;
-    /** Sum of all ratings on this option. */
-    sum: number;
     /** Number of ballots that rated this option (equals n for valid ballots). */
     count: number;
-    mean: number;
-    median: number;
     /** Histogram of rating → number of voters who assigned it. */
     distribution: Record<number, number>;
 }
@@ -363,13 +355,19 @@ export interface LikertOptionTally {
 /**
  * Method-shaped tally payload for a single role on a single question.
  * Discriminated on `method`; consumers narrow before reading method-specific
- * fields. All values are deterministic functions of the evidence set —
- * auditors can replay the exact computation from the IPFS evidence directory.
+ * fields.
+ *
+ * Only raw cryptographic counts are emitted — per-option counts, per-value
+ * histograms, first-preference counts, pairwise preference matrices,
+ * per-option point totals. Statistical aggregations (mean, median, mode,
+ * stdDev, Borda scores, etc.) are deliberately omitted: any such summary
+ * is an opinionated interpretation of which option "won" and belongs to
+ * downstream consumers/auditors, not to Hydra.
  */
 export type MethodTally =
     | { method: 'binary' | 'single-choice' | 'multi-choice'; results: OptionCount[] }
-    | { method: 'range'; distribution: DistributionEntry[]; stats: RangeStats }
-    | { method: 'ranked'; firstPreference: OptionCount[]; borda: BordaEntry[]; pairwise: PairwiseMatrix }
+    | { method: 'range'; distribution: DistributionEntry[] }
+    | { method: 'ranked'; firstPreference: OptionCount[]; pairwise: PairwiseMatrix }
     | { method: 'weighted'; results: WeightedOptionTally[] }
     | { method: 'likert'; results: LikertOptionTally[] };
 
@@ -391,13 +389,70 @@ export interface QuestionTally {
 }
 
 /**
+ * One entry on a backend `results[]` array — the wire shape consumed by
+ * `Result.results` and `Result.resultsByGroup[role].results` on the backend.
+ *
+ * `id` is the option value rendered as a string, or the literal `"abstain"`.
+ * `votingPower` is always 0 — Hydra emits raw counts only and leaves
+ * stake-weighting to the voting authority's post-hoc adjustment document.
+ */
+export interface BackendOptionResult {
+    id: string;
+    label?: string;
+    count: number;
+    votingPower: 0;
+}
+
+/** Per-group bucket on `BackendTally.resultsByGroup` — mirrors backend cron output. */
+export interface BackendGroupTally {
+    /** Distinct voter count for this question in this role (includes abstainers). */
+    totalVotes: number;
+    /** Per-option count rows. Empty for `range` (consult `scale.distribution`). */
+    results: BackendOptionResult[];
+    /** Range histogram. Present only when question method is `range`. */
+    scale?: { distribution: DistributionEntry[] };
+    /** Ranked-method extension. Present only when question method is `ranked`. */
+    ranked?: { firstPreference: OptionCount[]; pairwise: PairwiseMatrix };
+    /** Likert-method extension. Present only when question method is `likert`. */
+    likert?: { results: LikertOptionTally[] };
+    /** Weighted-method extension. Present only when question method is `weighted`. */
+    weighted?: { results: WeightedOptionTally[] };
+}
+
+/**
+ * Backend-shaped tally for one question — the value type of
+ * `FinalizeResponse.tallies[questionId]`.
+ *
+ * `results` aggregates across every role (the `"raw"` bucket internally);
+ * `resultsByGroup` contains one entry per role declared on the ballot or
+ * observed in evidence. Method-specific extension fields hang off each
+ * group bucket.
+ */
+export interface BackendTally {
+    results: BackendOptionResult[];
+    resultsByGroup: Record<string, BackendGroupTally>;
+}
+
+/**
  * Complete results object stored on IPFS.
  * Hash of this (blake2b_256 of canonical JSON) = on-chain resultsHash.
+ *
+ * Two parallel tally views are emitted:
+ *   - `tallies` is the wire shape consumed by the Ekklesia backend
+ *     (`writeFinalResult` in the 10-min aggregate cron) — keyed by
+ *     `questionId`, with method-specific extension fields per role.
+ *   - `questionTallies` is the canonical auditor shape: discriminated
+ *     union per method, fully zero-filled, deterministic. Auditors who
+ *     replay the tally from the evidence directory must match this
+ *     shape byte-for-byte.
  */
 export interface FullResults {
     specVersion: string;
     ballotId: string;
-    tallies: QuestionTally[];
+    /** Backend wire shape — keyed by questionId. */
+    tallies: Record<string, BackendTally>;
+    /** Canonical auditor breakdown — discriminated by method, role-bucketed. */
+    questionTallies: QuestionTally[];
     totalVoters: number;
     headId: string;
     finalizedAt: string;

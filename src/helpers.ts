@@ -268,6 +268,7 @@ export type ErrorCode =
     | 'UNAUTHORIZED'
     | 'SIGNATURE_INVALID'
     | 'CONFLICT'
+    | 'NOT_FOUND'
     | 'WALLET_INIT_FAILED'
     | 'CLIENT_INIT_FAILED'
     | 'IPFS_UNAVAILABLE'

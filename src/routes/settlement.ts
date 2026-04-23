@@ -7,10 +7,12 @@ import { hydraValueToAmounts } from '../tx-builder.js';
 import { getCachedBallot, getCachedBallotId, getCachedBallotIdentity, getCachedResultsAddress } from './lifecycle.js';
 import { BALLOT_INSTANCE_PREFIX, BALLOT_DEFINITION_PREFIX, HRP_TO_ROLE } from '../types.js';
 import type {
+    BackendGroupTally,
+    BackendOptionResult,
+    BackendTally,
     BallotDefinition,
     BallotOption,
     BallotQuestion,
-    BordaEntry,
     DistributionEntry,
     FullResults,
     LikertOptionTally,
@@ -18,7 +20,6 @@ import type {
     OptionCount,
     PairwiseMatrix,
     QuestionTally,
-    RangeStats,
     SelectionEntry,
     VoteCacheEntry,
     VoteEvidence,
@@ -28,6 +29,39 @@ import type {
 } from '../types.js';
 
 const router = Router();
+
+// ---------------------------------------------------------------------------
+// Finalize-response persistence — write the full response envelope to disk
+// at finalize time so `GET /results` can re-serve it even after the head
+// has closed (dropped connection, client timeout, head fanned out, etc.).
+// ---------------------------------------------------------------------------
+
+const FINALIZE_RESPONSE_FILENAME = 'finalize-response.json';
+
+interface FinalizeResponseEnvelope {
+    txHash: string;
+    resultsHash: string;
+    evidenceDirectoryCid: string;
+    resultsCid: string;
+    evidenceMerkleRoot: string;
+    totalVoters: number;
+    tallies: Record<string, BackendTally>;
+    excludedVoters?: Array<{ tokenName: string; reason: string }>;
+    /** ISO-8601 timestamp of when this envelope was written. */
+    persistedAt: string;
+}
+
+async function saveFinalizeResponse(envelope: Omit<FinalizeResponseEnvelope, 'persistedAt'>): Promise<FinalizeResponseEnvelope> {
+    const fs = await import('node:fs/promises');
+    const pathMod = await import('node:path');
+    const persisted: FinalizeResponseEnvelope = { ...envelope, persistedAt: new Date().toISOString() };
+    await fs.mkdir(IPFS_STAGING_DIR, { recursive: true });
+    await fs.writeFile(
+        pathMod.join(IPFS_STAGING_DIR, FINALIZE_RESPONSE_FILENAME),
+        JSON.stringify(persisted, null, 2),
+    );
+    return persisted;
+}
 
 // ---------------------------------------------------------------------------
 // Diagnostic: log head UTxO snapshot
@@ -137,29 +171,12 @@ interface VoterRef {
 }
 
 // ---------------------------------------------------------------------------
-// Per-method tally helpers — all deterministic functions of the evidence.
+// Per-method tally helpers — raw cryptographic counts only. Hydra deliberately
+// does NOT compute mean / median / mode / stdDev / Borda / other statistical
+// summaries: any such aggregate is an opinionated interpretation of which
+// option "won", which belongs to downstream consumers and auditors, not to
+// the root-of-trust middleware.
 // ---------------------------------------------------------------------------
-
-function mean(xs: number[]): number {
-    return xs.length === 0 ? 0 : xs.reduce((s, x) => s + x, 0) / xs.length;
-}
-
-function median(xs: number[]): number {
-    if (xs.length === 0) return 0;
-    const sorted = [...xs].sort((a, b) => a - b);
-    const mid = Math.floor(sorted.length / 2);
-    return sorted.length % 2 === 0
-        ? (sorted[mid - 1] + sorted[mid]) / 2
-        : sorted[mid];
-}
-
-/** Population standard deviation. */
-function stdDev(xs: number[]): number {
-    if (xs.length === 0) return 0;
-    const m = mean(xs);
-    const variance = xs.reduce((s, x) => s + (x - m) * (x - m), 0) / xs.length;
-    return Math.sqrt(variance);
-}
 
 function initOptionCounts(options: BallotOption[] | undefined): Map<number, number> {
     const counts = new Map<number, number>();
@@ -213,11 +230,10 @@ function tallySimple(
 }
 
 /**
- * Tally range — histogram + aggregate stats.
- *
- * `distribution` is zero-filled across the full valueRange grid so auditors
- * can replay the histogram without reconstructing the grid. Stats are
- * computed over observed values only.
+ * Tally range — per-value histogram only, zero-filled across the full
+ * `valueRange` grid so downstream consumers can iterate without having to
+ * reconstruct the grid themselves. Summary statistics (mean / median /
+ * min / max / stdDev) are the consumer's responsibility.
  */
 function tallyRange(
     answers: VoteSelection[],
@@ -237,22 +253,17 @@ function tallyRange(
         .map(([value, count]) => ({ value, count }))
         .sort((a, b) => a.value - b.value);
 
-    const stats: RangeStats = {
-        n: observed.length,
-        mean: mean(observed),
-        median: median(observed),
-        min: observed.length ? Math.min(...observed) : 0,
-        max: observed.length ? Math.max(...observed) : 0,
-        stdDev: stdDev(observed),
-    };
-    return { method: 'range', distribution, stats };
+    return { method: 'range', distribution };
 }
 
 /**
- * Tally ranked — first-preference counts, Borda scores, and pairwise matrix.
- * Borda convention: with N ranked positions, position 0 (1st place) gets N-1
- * points, position 1 gets N-2, …, position N-1 gets 0. Deterministic —
- * Hydra does not compute IRV since tie-break rules are not canonical.
+ * Tally ranked — first-preference counts + pairwise preference matrix.
+ *
+ * The pairwise matrix is complete: `matrix[i][j]` is the number of ballots
+ * ranking `options[i]` above `options[j]`. Borda, Condorcet, Copeland,
+ * Schulze, Ranked Pairs, IRV (with chosen tie-break) are all computable
+ * from it — Hydra emits only the raw counts and leaves the choice of
+ * winner-selection method to the consumer.
  */
 function tallyRanked(
     answers: VoteSelection[],
@@ -262,7 +273,6 @@ function tallyRanked(
     // order independent of the ballot-authoring order.
     const sortedValues = (options ? options.map((o) => o.value) : []).slice().sort((a, b) => a - b);
     const firstPrefCounts = new Map<number, number>(sortedValues.map((v) => [v, 0]));
-    const bordaScores = new Map<number, number>(sortedValues.map((v) => [v, 0]));
     const indexOf = new Map(sortedValues.map((v, i) => [v, i]));
     const matrix: number[][] = sortedValues.map(() => sortedValues.map(() => 0));
 
@@ -273,10 +283,6 @@ function tallyRanked(
         firstPrefCounts.set(ranking[0], (firstPrefCounts.get(ranking[0]) ?? 0) + 1);
 
         const n = ranking.length;
-        for (let i = 0; i < n; i++) {
-            bordaScores.set(ranking[i], (bordaScores.get(ranking[i]) ?? 0) + (n - 1 - i));
-        }
-
         for (let i = 0; i < n; i++) {
             const ai = indexOf.get(ranking[i]);
             if (ai === undefined) continue;
@@ -292,16 +298,16 @@ function tallyRanked(
         option,
         count: firstPrefCounts.get(option) ?? 0,
     }));
-    const borda: BordaEntry[] = sortedValues.map((option) => ({
-        option,
-        score: bordaScores.get(option) ?? 0,
-    }));
     const pairwise: PairwiseMatrix = { options: sortedValues, matrix };
 
-    return { method: 'ranked', firstPreference, borda, pairwise };
+    return { method: 'ranked', firstPreference, pairwise };
 }
 
-/** Tally weighted — per-option totalPoints, voterCount, mean, stdDev. */
+/**
+ * Tally weighted — per-option `totalPoints` (direct arithmetic sum of
+ * voter-submitted allocations) and `voterCount` (ballots with a non-zero
+ * allocation). Mean / stdDev / normalized scores are left to consumers.
+ */
 function tallyWeighted(
     answers: VoteSelection[],
     options: BallotOption[] | undefined,
@@ -309,11 +315,9 @@ function tallyWeighted(
     const perOption = new Map<number, number[]>();
     if (options) for (const o of options) perOption.set(o.value, []);
 
-    let answeringBallots = 0;
     for (const a of answers) {
         const entries = asEntryArray(a.selection);
         if (!entries) continue;
-        answeringBallots += 1;
         // Record each allocation, filling zeros for options this ballot didn't mention.
         const mentioned = new Set<number>();
         for (const e of entries) {
@@ -333,8 +337,6 @@ function tallyWeighted(
             option,
             totalPoints: values.reduce((s, v) => s + v, 0),
             voterCount: values.filter((v) => v > 0).length,
-            mean: answeringBallots === 0 ? 0 : values.reduce((s, v) => s + v, 0) / answeringBallots,
-            stdDev: stdDev(values),
         }),
     );
 
@@ -342,13 +344,10 @@ function tallyWeighted(
 }
 
 /**
- * Tally likert — per-option sum/count/mean/median + full rating distribution.
- *
- * `distribution` is zero-filled across every valid rating grid position so
- * auditors can replay the histogram without having to reconstruct the grid.
- * `median` uses the classical definition: for even counts it is the mean of
- * the two middle values. Backend consumers must match this to keep numbers
- * byte-aligned with `results.json`.
+ * Tally likert — per-option rater `count` and per-rating `distribution`,
+ * zero-filled across the full `ratingRange` grid. Sums, means, medians,
+ * majority judgment and every other summary metric are the consumer's
+ * responsibility.
  */
 function tallyLikert(
     answers: VoteSelection[],
@@ -376,10 +375,7 @@ function tallyLikert(
             for (const r of ratings) distribution[r] = (distribution[r] ?? 0) + 1;
             return {
                 option,
-                sum: ratings.reduce((s, v) => s + v, 0),
                 count: ratings.length,
-                mean: mean(ratings),
-                median: median(ratings),
                 distribution,
             };
         },
@@ -423,7 +419,12 @@ async function tallyVotes(
     ballot: BallotDefinition,
     voters: VoterRef[],
     evidenceDir: string,
-): Promise<{ tallies: QuestionTally[]; votersByRole: Record<string, number> }> {
+): Promise<{
+    tallies: QuestionTally[];
+    votersByRole: Record<string, number>;
+    /** Distinct voter count per question per role (includes abstainers). */
+    votersByQuestionRole: Record<string, Record<string, number>>;
+}> {
     const fs = await import('node:fs/promises');
     const path = await import('node:path');
 
@@ -487,6 +488,8 @@ async function tallyVotes(
         }
     }
 
+    const votersByQuestionRole: Record<string, Record<string, number>> = {};
+
     const tallies: QuestionTally[] = ballot.questions.map((q) => {
         const perRoleAnswers = answersByQuestionRole.get(q.questionId) ?? new Map();
         const perRoleAbstain = abstainByQuestionRole.get(q.questionId) ?? new Map();
@@ -501,6 +504,19 @@ async function tallyVotes(
             if (count > 0) abstainedByRole[role] = count;
         }
 
+        // Distinct voter count per role for this question = answer count +
+        // abstain count. Each evidence file contributes at most one entry
+        // per question, so this counts unique voters even for multi-choice
+        // / weighted / likert where a single voter contributes multiple
+        // option-level rows to the underlying tally.
+        const perRoleVoters: Record<string, number> = {};
+        for (const [role, answers] of perRoleAnswers) {
+            const ab = perRoleAbstain.get(role) ?? 0;
+            const total = (answers as VoteSelection[]).length + ab;
+            if (total > 0) perRoleVoters[role] = total;
+        }
+        votersByQuestionRole[q.questionId] = perRoleVoters;
+
         const tally: QuestionTally = {
             questionId: q.questionId,
             method: q.method,
@@ -512,7 +528,156 @@ async function tallyVotes(
         return tally;
     });
 
-    return { tallies, votersByRole };
+    return { tallies, votersByRole, votersByQuestionRole };
+}
+
+// ---------------------------------------------------------------------------
+// Backend wire-shape transform — turn auditor-canonical QuestionTally into
+// the `tallies[questionId] = { results, resultsByGroup }` object the
+// Ekklesia backend's `writeFinalResult` consumes verbatim.
+// ---------------------------------------------------------------------------
+
+function labelFor(options: BallotOption[] | undefined, value: number): string | undefined {
+    return options?.find((o) => o.value === value)?.label;
+}
+
+/**
+ * Turn one role's `MethodTally` into the backend's per-group bucket — a
+ * `results[]` row list plus the appropriate method-specific extension
+ * field (`scale` / `ranked` / `likert` / `weighted`).
+ *
+ * For methods where the per-option count is not the headline figure
+ * (range, weighted), `results` is populated with the most useful
+ * single-number summary so the backend's display path has something
+ * to show without having to crack open the extension object.
+ */
+function methodTallyToGroup(
+    tally: MethodTally,
+    options: BallotOption[] | undefined,
+    abstainCount: number,
+    totalVotes: number,
+): BackendGroupTally {
+    const results: BackendOptionResult[] = [];
+    const group: BackendGroupTally = { totalVotes, results };
+
+    switch (tally.method) {
+        case 'binary':
+        case 'single-choice':
+        case 'multi-choice': {
+            for (const r of tally.results) {
+                results.push({
+                    id: String(r.option),
+                    label: labelFor(options, r.option),
+                    count: r.count,
+                    votingPower: 0,
+                });
+            }
+            break;
+        }
+        case 'range': {
+            // No per-option count — surface the histogram via the `scale`
+            // extension. Leave `results` empty.
+            group.scale = { distribution: tally.distribution };
+            break;
+        }
+        case 'ranked': {
+            // First-preference counts double as the headline `results` row
+            // so consumers can render a top-line breakdown without parsing
+            // the full pairwise matrix.
+            for (const r of tally.firstPreference) {
+                results.push({
+                    id: String(r.option),
+                    label: labelFor(options, r.option),
+                    count: r.count,
+                    votingPower: 0,
+                });
+            }
+            group.ranked = {
+                firstPreference: tally.firstPreference,
+                pairwise: tally.pairwise,
+            };
+            break;
+        }
+        case 'weighted': {
+            // `count` carries totalPoints — the single best summary number
+            // for a weighted-allocation question.
+            for (const r of tally.results) {
+                results.push({
+                    id: String(r.option),
+                    label: labelFor(options, r.option),
+                    count: r.totalPoints,
+                    votingPower: 0,
+                });
+            }
+            group.weighted = { results: tally.results };
+            break;
+        }
+        case 'likert': {
+            // `count` carries number of voters who rated this option.
+            for (const r of tally.results) {
+                results.push({
+                    id: String(r.option),
+                    label: labelFor(options, r.option),
+                    count: r.count,
+                    votingPower: 0,
+                });
+            }
+            group.likert = { results: tally.results };
+            break;
+        }
+    }
+
+    if (abstainCount > 0) {
+        results.push({ id: 'abstain', label: 'Abstain', count: abstainCount, votingPower: 0 });
+    }
+
+    return group;
+}
+
+/**
+ * Build the backend-wire `tallies` object from the auditor-canonical
+ * per-question breakdown. The `"raw"` aggregate becomes the top-level
+ * `results`; every non-`raw` role becomes one `resultsByGroup` entry.
+ */
+function buildBackendTallies(
+    ballot: BallotDefinition,
+    questionTallies: QuestionTally[],
+    votersByQuestionRole: Record<string, Record<string, number>>,
+): Record<string, BackendTally> {
+    const out: Record<string, BackendTally> = {};
+    const questionByIdOptions = new Map(ballot.questions.map((q) => [q.questionId, q.options]));
+
+    for (const qt of questionTallies) {
+        const options = questionByIdOptions.get(qt.questionId);
+        const perRoleVoters = votersByQuestionRole[qt.questionId] ?? {};
+        const abstainByRole = qt.abstainedByRole ?? {};
+
+        const rawTally = qt.roleResults['raw'];
+        const rawVoters = perRoleVoters['raw'] ?? 0;
+        const rawAbstain = abstainByRole['raw'] ?? 0;
+        const rawGroup = rawTally
+            ? methodTallyToGroup(rawTally, options, rawAbstain, rawVoters)
+            : { totalVotes: 0, results: [] as BackendOptionResult[] };
+
+        const resultsByGroup: Record<string, BackendGroupTally> = {};
+        for (const [role, methodTally] of Object.entries(qt.roleResults)) {
+            if (role === 'raw') continue;
+            const totalVotes = perRoleVoters[role] ?? 0;
+            const abstain = abstainByRole[role] ?? 0;
+            // Suppress entirely-empty role buckets — a role declared on the
+            // ballot but with no participants and no abstainers contributes
+            // nothing the UI can display.
+            if (totalVotes === 0) continue;
+            resultsByGroup[role] = methodTallyToGroup(methodTally, options, abstain, totalVotes);
+        }
+
+        out[qt.questionId] = {
+            results: rawGroup.results,
+            resultsByGroup,
+        };
+    }
+
+    return out;
 }
 
 /**
@@ -584,13 +749,16 @@ router.post('/finalize', async (_req, res) => {
         const evidenceMerkleRoot = proofPackage?.rootHex ?? '';
 
         // --- 3. Tally ---
-        const { tallies, votersByRole } = await tallyVotes(ballot, voterRefs, voteCache.getDocumentsDir());
+        const { tallies: questionTallies, votersByRole, votersByQuestionRole } =
+            await tallyVotes(ballot, voterRefs, voteCache.getDocumentsDir());
+        const tallies = buildBackendTallies(ballot, questionTallies, votersByQuestionRole);
 
         // --- 4. Build full results object ---
         const fullResults: FullResults = {
             specVersion: '0.3.0',
             ballotId,
             tallies,
+            questionTallies,
             totalVoters: allVotes.length,
             votersByRole,
             headId: getHeadId() ?? '',
@@ -637,7 +805,10 @@ router.post('/finalize', async (_req, res) => {
         }
 
         // --- 6. Write results + proof package into evidence dir and pin ---
-        // Serialize once — on-chain resultsHash hashes the exact bytes written to disk.
+        // Serialize once — on-chain resultsHash hashes the exact bytes
+        // written to disk AND pinned standalone as `resultsCid`. The Kubo
+        // pinJson helper uses the same JSON.stringify(..., null, 2)
+        // serialization, so the pinned CID hashes the same bytes.
         const resultsJson = JSON.stringify(fullResults, null, 2);
         await fs.writeFile(pathMod.join(evidenceDir, 'results.json'), resultsJson);
         if (proofPackage) {
@@ -647,6 +818,7 @@ router.post('/finalize', async (_req, res) => {
             );
         }
         const { cid: evidenceDirectoryCid } = await ipfs.pinDirectory(evidenceDir);
+        const { cid: resultsCid } = await ipfs.pinJson('results.json', fullResults);
         const resultsHash = bytesToHex(blake2b256(resultsJson));
 
         // --- 7. Update (601) datum via TRP + queue worker ---
@@ -668,12 +840,24 @@ router.post('/finalize', async (_req, res) => {
             signedCborHex: signedFinalizeTx,
         });
 
+        await saveFinalizeResponse({
+            txHash,
+            resultsHash,
+            evidenceDirectoryCid,
+            resultsCid,
+            evidenceMerkleRoot,
+            totalVoters: allVotes.length,
+            tallies,
+        });
+
         return success(res, {
             txHash,
             resultsHash,
             evidenceDirectoryCid,
+            resultsCid,
             evidenceMerkleRoot,
             totalVoters: allVotes.length,
+            tallies,
         });
     } catch (err: any) {
         console.error('Failed to finalize ballot:', err);
@@ -992,12 +1176,15 @@ router.post('/settle/finalize', async (_req, res) => {
             ? computePackage(fileLeaves, 'content+path')
             : null;
         const evidenceMerkleRoot = proofPackage?.rootHex ?? '';
-        const { tallies, votersByRole } = await tallyVotes(ballot, verifiedVoters, evidenceDir);
+        const { tallies: questionTallies, votersByRole, votersByQuestionRole } =
+            await tallyVotes(ballot, verifiedVoters, evidenceDir);
+        const tallies = buildBackendTallies(ballot, questionTallies, votersByQuestionRole);
 
         const fullResults: FullResults = {
             specVersion: '0.3.0',
             ballotId,
             tallies,
+            questionTallies,
             totalVoters: verifiedVoters.length,
             votersByRole,
             headId: getHeadId() ?? '',
@@ -1040,7 +1227,10 @@ router.post('/settle/finalize', async (_req, res) => {
         }
 
         // Write results + proof package into evidence dir, then pin.
-        // On-chain resultsHash hashes the exact bytes written to disk.
+        // On-chain resultsHash hashes the exact bytes written to disk AND
+        // pinned standalone as `resultsCid` — Kubo's pinJson uses the same
+        // JSON.stringify(..., null, 2) serialization, so the pinned CID
+        // hashes the same bytes.
         const resultsJson = JSON.stringify(fullResults, null, 2);
         await fs.writeFile(pathMod.join(evidenceDir, 'results.json'), resultsJson);
         if (proofPackage) {
@@ -1050,6 +1240,7 @@ router.post('/settle/finalize', async (_req, res) => {
             );
         }
         const { cid: evidenceDirectoryCid } = await ipfs.pinDirectory(evidenceDir);
+        const { cid: resultsCid } = await ipfs.pinJson('results.json', fullResults);
         const resultsHash = bytesToHex(blake2b256(resultsJson));
 
         // Finalize ballot datum in-head — TRP resolves, worker dispatches.
@@ -1071,17 +1262,68 @@ router.post('/settle/finalize', async (_req, res) => {
             signedCborHex: signedFinalizeTx,
         });
 
+        await saveFinalizeResponse({
+            txHash: finalizeTxHash,
+            resultsHash,
+            evidenceDirectoryCid,
+            resultsCid,
+            evidenceMerkleRoot,
+            totalVoters: verifiedVoters.length,
+            tallies,
+            excludedVoters: excludedVoters.length > 0 ? excludedVoters : undefined,
+        });
+
         return success(res, {
             txHash: finalizeTxHash,
             resultsHash,
             evidenceDirectoryCid,
+            resultsCid,
             evidenceMerkleRoot,
             totalVoters: verifiedVoters.length,
+            tallies,
             excludedVoters: excludedVoters.length > 0 ? excludedVoters : undefined,
         });
     } catch (err: any) {
         console.error('[settle/finalize] Failed:', err);
         return error(res, 'INTERNAL_ERROR', err.message || 'Finalize failed', 500);
+    }
+});
+
+/**
+ * GET /results
+ *
+ * Return the last persisted finalize response for this head session.
+ *
+ * Both `/finalize` and `/settle/finalize` (and the deprecated monolithic
+ * `/settle`) write their full response envelope to
+ * `$IPFS_STAGING_DIR/finalize-response.json` the moment the in-head
+ * finalize tx is accepted. If the HTTP client lost the original response
+ * (connection dropped, proxy timeout, gateway restarted) the envelope is
+ * still here — re-fetch it from this endpoint instead of re-running
+ * `/finalize`, which can no longer execute after the head has closed.
+ *
+ * Returns 404 when no finalize has run this session — /start wipes the
+ * file when it opens a fresh head.
+ */
+router.get('/results', async (_req, res) => {
+    try {
+        const fs = await import('node:fs/promises');
+        const pathMod = await import('node:path');
+        const responsePath = pathMod.join(IPFS_STAGING_DIR, FINALIZE_RESPONSE_FILENAME);
+        let raw: string;
+        try {
+            raw = await fs.readFile(responsePath, 'utf-8');
+        } catch (err: any) {
+            if (err?.code === 'ENOENT') {
+                return error(res, 'NOT_FOUND', 'No finalize response on disk — finalize has not run since the last /start.', 404);
+            }
+            throw err;
+        }
+        const envelope = JSON.parse(raw) as FinalizeResponseEnvelope;
+        return success(res, envelope);
+    } catch (err: any) {
+        console.error('[GET /results] Failed:', err);
+        return error(res, 'INTERNAL_ERROR', err.message || 'Failed to read finalize response', 500);
     }
 });
 
@@ -1287,12 +1529,15 @@ router.post('/settle', async (req, res) => {
             ? computePackage(fileLeaves, 'content+path')
             : null;
         const evidenceMerkleRoot = proofPackage?.rootHex ?? '';
-        const { tallies, votersByRole } = await tallyVotes(ballot, verifiedVoters, evidenceDir);
+        const { tallies: questionTallies, votersByRole, votersByQuestionRole } =
+            await tallyVotes(ballot, verifiedVoters, evidenceDir);
+        const tallies = buildBackendTallies(ballot, questionTallies, votersByQuestionRole);
 
         const fullResults: FullResults = {
             specVersion: '0.3.0',
             ballotId,
             tallies,
+            questionTallies,
             totalVoters: verifiedVoters.length,
             votersByRole,
             headId: getHeadId() ?? '',
@@ -1347,7 +1592,10 @@ router.post('/settle', async (req, res) => {
         }
 
         // Write results + proof package into evidence dir, then pin.
-        // On-chain resultsHash hashes the exact bytes written to disk.
+        // On-chain resultsHash hashes the exact bytes written to disk AND
+        // pinned standalone as `resultsCid` — Kubo's pinJson uses the same
+        // JSON.stringify(..., null, 2) serialization, so the pinned CID
+        // hashes the same bytes.
         const resultsJson = JSON.stringify(fullResults, null, 2);
         await fs.writeFile(pathMod.join(evidenceDir, 'results.json'), resultsJson);
         if (proofPackage) {
@@ -1357,6 +1605,7 @@ router.post('/settle', async (req, res) => {
             );
         }
         const { cid: evidenceDirectoryCid } = await ipfs.pinDirectory(evidenceDir);
+        const { cid: resultsCid } = await ipfs.pinJson('results.json', fullResults);
         const resultsHash = bytesToHex(blake2b256(resultsJson));
 
         await logHeadSnapshot('post-burn', wrangler);
@@ -1380,10 +1629,21 @@ router.post('/settle', async (req, res) => {
             signedCborHex: signedFinalizeTx,
         });
 
+        await saveFinalizeResponse({
+            txHash: finalizeTxHash,
+            resultsHash,
+            evidenceDirectoryCid,
+            resultsCid,
+            evidenceMerkleRoot,
+            totalVoters: headVoters.length,
+            tallies,
+            excludedVoters: excludedVoters.length > 0 ? excludedVoters : undefined,
+        });
+
         steps.push({
             step: 'finalize',
             status: 'SUCCESS',
-            data: { txHash: finalizeTxHash, resultsHash, evidenceDirectoryCid, totalVoters: headVoters.length },
+            data: { txHash: finalizeTxHash, resultsHash, evidenceDirectoryCid, resultsCid, totalVoters: headVoters.length },
         });
 
         await logHeadSnapshot('post-finalize', wrangler);
@@ -1397,8 +1657,10 @@ router.post('/settle', async (req, res) => {
             steps,
             resultsHash,
             evidenceDirectoryCid,
+            resultsCid,
             evidenceMerkleRoot,
             totalVoters: headVoters.length,
+            tallies,
         });
     } catch (err: any) {
         console.error('Settlement failed:', err?.message, err?.stack);
