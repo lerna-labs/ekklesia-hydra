@@ -132,13 +132,9 @@ router.post('/start', async (req, res) => {
 
     try {
         // If the head is already Open, treat this as a cache-seeding call and
-        // skip both the cache wipe and the open-wait. The SDK's waitForHeadOpen
-        // only resolves on a HeadIsOpen transition event — if the head is
-        // already Open, the Greetings replay logs "Open → already ready,
-        // proceeding" but never resolves, so the call would otherwise hang
-        // for the full 10-minute timeout. This path recovers a stuck session
+        // skip both the cache wipe and the open-wait. Recovers a stuck session
         // (e.g. L1 commit succeeded on the Hydra side after the original
-        // /start timed out) without disturbing any in-head state.
+        // /start timed out client-side) without disturbing any in-head state.
         const alreadyOpen = hydraMonitor.headStatus === 'OPEN';
 
         if (!alreadyOpen) {
