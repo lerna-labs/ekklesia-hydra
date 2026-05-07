@@ -357,7 +357,7 @@ paths:
                       data:
                         type: object
                         properties:
-                          headStatus: { type: string, example: Open }
+                          headStatus: { type: string, example: OPEN, description: "Hydra head status (uppercase): UNKNOWN, IDLE, INITIALIZING, OPEN, CLOSED, FANOUT_POSSIBLE, FINAL." }
                           headId: { type: string, nullable: true }
                           nodeVersion: { type: string, nullable: true }
                           connected: { type: boolean }
@@ -455,6 +455,14 @@ paths:
                           ballotId:
                             type: string
                             description: The effective cached ballotId (either the value supplied in the request body or the fingerprint fallback).
+                          alreadyOpen:
+                            type: boolean
+                            description: |
+                              True when /start was called against an already-Open head. In that
+                              case the cache wipe and open-wait are skipped and the body is used
+                              only to seed the in-memory ballot/identity caches — useful for
+                              recovering from a /start that timed out client-side after the
+                              underlying Hydra open succeeded.
         '400': { $ref: '#/components/responses/BadRequest' }
         '409': { $ref: '#/components/responses/Conflict' }
         '500': { $ref: '#/components/responses/InternalError' }
@@ -555,7 +563,10 @@ paths:
               properties:
                 voterId:
                   type: string
-                  description: Bech32 voter ID (drep1…, stake1…, pool1…, addr1…, calidus1…).
+                  description: |
+                    Bech32 voter ID. Accepted HRPs: `drep`, `pool`, `calidus`,
+                    `stake`, `stake_test`. Payment-address credentials
+                    (`addr` / `addr_test`) and CC are NOT accepted.
       responses:
         '200':
           description: Voter registered
@@ -1158,6 +1169,7 @@ components:
             - UNAUTHORIZED
             - MISSING_FIELDS
             - INVALID_INPUT
+            - INVALID_VOTE
             - INVALID_VOTER_ID
             - SIGNATURE_INVALID
             - CONFLICT
@@ -1188,29 +1200,85 @@ components:
         description: { type: string }
         method:
           type: string
-          enum: [binary, single-choice, multi-choice, range, ranked, weighted]
+          enum: [binary, single-choice, multi-choice, range, ranked, weighted, likert]
         options:
           type: array
           items: { $ref: '#/components/schemas/BallotOption' }
-        minSelections: { type: integer }
-        maxSelections: { type: integer }
+        minSelections:
+          type: integer
+          minimum: 1
+          description: |
+            Minimum selections required for `multi-choice` (must be >= 1; empty
+            selections are disallowed — voters skip a question with `abstain: true`).
+            Defaults to 1.
+        maxSelections:
+          type: integer
+          description: |
+            Maximum selections allowed for `multi-choice`. Defaults to options.length.
         valueRange:
           type: object
+          description: |
+            For `range` questions — the integer grid the voter picks from.
+            Valid values are `{ min, min+step, …, max }` (step defaults to 1).
+            All three fields must be integers and `(max - min) % step === 0`.
+          required: [min, max]
           properties:
             min: { type: integer }
             max: { type: integer }
-        rankCount: { type: integer }
+            step: { type: integer, default: 1 }
+        rankCount:
+          type: integer
+          minimum: 1
+          description: |
+            For `ranked` questions — how many options must be ranked.
+            REQUIRED for ranked questions (no silent default). Must be a
+            positive integer no greater than options.length.
         budget:
           type: integer
-          description: For weighted questions — voter's total point allocation.
+          description: |
+            For `weighted` questions — voter's total point allocation.
+            Submitted weights must sum to exactly this value.
+        ratingRange:
+          type: object
+          description: |
+            For `likert` questions — the integer grid each option is rated on.
+            Same shape and constraints as `valueRange`.
+          required: [min, max]
+          properties:
+            min: { type: integer }
+            max: { type: integer }
+            step: { type: integer, default: 1 }
+        requireAnswer:
+          type: boolean
+          default: false
+          description: |
+            If true, voters MUST submit a selection on this question — `abstain:
+            true` is rejected. Default is false (abstention allowed). Orthogonal
+            to having an "Abstain" option in `options`, which is a regular
+            selection that shows up in per-option counts.
+        contentHash:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: |
+            Optional 64-char lowercase hex blake2b_256 digest of the question's
+            voter-facing content blob (backend-authored). Hydra treats it as
+            opaque — validates format only and passes it through into the
+            pinned ballot JSON (and therefore into `ekklesia.merkleRoot`).
+            Anchors off-chain proposal content on-chain without Hydra ever
+            dereferencing it.
 
     RoleWeighting:
       type: object
+      description: |
+        Per-role power-source mode. Only the canonical three-group voter
+        space `drep`, `pool`, `stake` is recognized — earlier variants
+        (`DRep`, `SPO`, `Stakeholder`, `CC`) are explicitly rejected at
+        `/prepare`. Multi-key combinations are accepted (e.g.
+        `{ drep: StakeBased, pool: PledgeBased }` for the RSS v2 pattern).
       properties:
-        DRep: { type: string, enum: [CredentialBased, StakeBased] }
-        SPO: { type: string, enum: [CredentialBased, StakeBased, PledgeBased] }
-        CC: { type: string, enum: [CredentialBased] }
-        Stakeholder: { type: string, enum: [StakeBased] }
+        drep: { type: string, enum: [CredentialBased, StakeBased] }
+        pool: { type: string, enum: [CredentialBased, StakeBased, PledgeBased] }
+        stake: { type: string, enum: [CredentialBased, StakeBased] }
 
     EkklesiaBallotExtension:
       type: object
@@ -1221,7 +1289,13 @@ components:
         context: { type: string, enum: [hydra-head] }
         acceptedCredentials:
           type: array
-          items: { type: string }
+          description: |
+            Bech32 HRPs permitted to register on this ballot. `/prepare`
+            rejects any HRP outside the recognized set: `drep`, `pool`,
+            `calidus`, `stake`, `stake_test`.
+          items:
+            type: string
+            enum: [drep, pool, calidus, stake, stake_test]
         merkleRoot: { type: string }
         ballotIpfsCid: { type: string }
         votingWindow:
@@ -1254,6 +1328,12 @@ components:
               type: object
               properties:
                 txHash: { type: string }
+                updated:
+                  type: boolean
+                  description: |
+                    Present (and `true`) only on `/prepare/update` responses —
+                    indicates the (600)+(601) UTxOs were respent with a refreshed
+                    inline datum (schema version 2). Absent on the initial `/prepare`.
                 policyId: { type: string, description: Hex policy ID of the timelocked native script. }
                 fingerprint: { type: string, description: 28-byte blake2b_224 of namespace (hex). }
                 definitionAssetName: { type: string, description: Full (600) asset name hex (prefix + fingerprint). }
@@ -1266,7 +1346,11 @@ components:
                 resultsAddress: { type: string, description: Echoed resultsAddress (defaults to admin if not supplied). }
                 commitUtxos:
                   type: array
-                  description: UTxOs to commit into the head via /start.
+                  description: |
+                    UTxOs to commit into the head via /start. Currently a
+                    single entry: outputIndex 1 = the (601) instance token +
+                    gas ADA. Output 0 carries the (600) definition (stays on
+                    L1); output 2 is admin collateral (not committed).
                   items:
                     type: object
                     properties:
@@ -1275,33 +1359,51 @@ components:
                       description: { type: string }
 
     # ---------- Vote types ----------
-    WeightedEntry:
+    SelectionEntry:
       type: object
-      required: [option, weight]
+      description: |
+        A per-option scalar entry — used by `weighted` (value = points
+        allocated) and `likert` (value = rating on the ratingRange grid).
+      required: [option, value]
       properties:
         option: { type: integer }
-        weight: { type: integer, minimum: 0 }
+        value: { type: integer, minimum: 0 }
 
     VoteSelection:
       type: object
       required: [questionId]
       description: |
-        Exactly one of `selection`, `ranking`, or `weights` must be present,
-        depending on the question's method:
-          - binary / single-choice / multi-choice / range → selection
-          - ranked → ranking
-          - weighted → weights (must sum to the question's budget)
+        An individual answer to a ballot question. Either `abstain: true` is
+        set (voter participated but expressed no preference — allowed by
+        default unless the question has `requireAnswer: true`) or `selection`
+        is present. The two are mutually exclusive.
+
+        The `selection` payload shape is determined by the question's `method`:
+          - binary / single-choice:    number[] of length 1
+          - multi-choice:              number[] sized within [minSelections, maxSelections]
+          - range:                     number[] of length 1 — value on the valueRange grid
+          - ranked:                    number[] of option values in preference order (length === rankCount)
+          - weighted:                  SelectionEntry[] — `value` is points allocated, must sum to budget
+          - likert:                    SelectionEntry[] — one entry per option, `value` is rating on the ratingRange grid
+
+        At most one entry per `questionId` is permitted in a single submission;
+        duplicates return `400 INVALID_VOTE`.
       properties:
         questionId: { type: string }
+        abstain:
+          type: boolean
+          enum: [true]
+          description: |
+            If true, the voter participated on this question but expressed no
+            preference. `selection` MUST be absent. Allowed by default; rejected
+            only on questions flagged with `requireAnswer: true`.
         selection:
-          type: array
-          items: { type: integer }
-        ranking:
-          type: array
-          items: { type: integer }
-        weights:
-          type: array
-          items: { $ref: '#/components/schemas/WeightedEntry' }
+          description: Required unless `abstain === true`. Shape determined by method.
+          oneOf:
+            - type: array
+              items: { type: integer }
+            - type: array
+              items: { $ref: '#/components/schemas/SelectionEntry' }
 
     CoseWitness:
       type: object
@@ -1400,12 +1502,15 @@ components:
 
     VoteEvidence:
       type: object
-      required: [specVersion, surveyTxId, responderRole, answers, ekklesia]
+      required: [specVersion, responderRole, answers, ekklesia]
       description: Full vote evidence as pinned to IPFS. blake2b_256 of canonical JSON == on-chain voteHash.
       properties:
-        specVersion: { type: string }
-        surveyTxId: { type: string }
-        responderRole: { type: string }
+        specVersion: { type: string, example: "0.3.0" }
+        responderRole:
+          type: string
+          description: |
+            One of the canonical lowercase roles `drep`, `pool`, `stake`.
+            Defaults to `drep` when not supplied at /vote.
         answers:
           type: array
           items: { $ref: '#/components/schemas/VoteSelection' }
@@ -1417,7 +1522,10 @@ components:
       properties:
         voterId:
           type: string
-          description: Bech32 voter ID (drep1… / stake1… / pool1… / addr1… / calidus1…).
+          description: |
+            Bech32 voter ID. Accepted HRPs: `drep`, `pool`, `calidus`, `stake`,
+            `stake_test`. Payment-address credentials (`addr` / `addr_test`) and
+            CC are NOT accepted.
         nonce:
           type: integer
           description: |
@@ -1430,7 +1538,10 @@ components:
         signature: { $ref: '#/components/schemas/VoteSignatureData' }
         responderRole:
           type: string
-          description: e.g., "DRep", "SPO", "Stakeholder". Defaults to "DRep".
+          description: |
+            Canonical lowercase role: `drep`, `pool`, or `stake`. Defaults to
+            `drep`. Earlier mixed-case variants (`DRep`, `SPO`, `Stakeholder`)
+            are no longer accepted.
 
     VoteResponse:
       allOf:
@@ -1577,7 +1688,7 @@ components:
                     description: Number of ballots that rated this option.
                   distribution:
                     type: object
-                    description: Histogram `{ rating: count }`, zero-filled across `ratingRange`.
+                    description: 'Histogram keyed by rating value (`{ rating: count }`), zero-filled across `ratingRange`.'
                     additionalProperties: { type: integer }
         weighted:
           type: object
