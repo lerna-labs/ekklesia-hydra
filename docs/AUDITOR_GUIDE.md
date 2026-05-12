@@ -123,7 +123,7 @@ contains:
 {
   "specVersion": "0.3.0",
   "surveyTxId": "<(600) mint tx hash>",
-  "responderRole": "DRep",
+  "responderRole": "drep",
   "answers": [{ "questionId": "q1", "selection": [0, 2] }],
   "ekklesia": {
     "voterId": "drep1...",

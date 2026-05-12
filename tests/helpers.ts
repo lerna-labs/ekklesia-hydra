@@ -44,7 +44,6 @@ export interface DRepKeys {
     secretKey: string;
     publicKey: string;
     drepId: string;         // bech32 voter ID (drep1..., pool1..., stake_test1...)
-    role: string;           // 'DRep' | 'SPO' | 'Stakeholder'
     /** For CIP-151 calidus-based SPO votes: the calidus bech32 ID (calidus1...). */
     calidusId?: string;
 }
@@ -70,7 +69,7 @@ export interface ApiResponse {
 export function generateDRepKeys(): DRepKeys {
     const raw = execSync('cardano-signer keygen --path drep --json-extended', { encoding: 'utf-8' });
     const json = JSON.parse(raw);
-    return { secretKey: json.secretKey, publicKey: json.publicKey, drepId: json.drepIdBech, role: 'DRep' };
+    return { secretKey: json.secretKey, publicKey: json.publicKey, drepId: json.drepIdBech };
 }
 
 /**
@@ -87,7 +86,7 @@ export async function generateDRepKeysBatch(count: number, concurrency = 50): Pr
                 execAsync('cardano-signer keygen --path drep --json-extended')
                     .then(({ stdout }) => {
                         const json = JSON.parse(stdout);
-                        return { secretKey: json.secretKey, publicKey: json.publicKey, drepId: json.drepIdBech, role: 'DRep' } as DRepKeys;
+                        return { secretKey: json.secretKey, publicKey: json.publicKey, drepId: json.drepIdBech } as DRepKeys;
                     })
             ),
         );
@@ -109,7 +108,7 @@ export async function generateSPOKeysBatch(count: number, concurrency = 50): Pro
                 execAsync('cardano-signer keygen --path pool --json-extended')
                     .then(({ stdout }) => {
                         const json = JSON.parse(stdout);
-                        return { secretKey: json.secretKey, publicKey: json.publicKey, drepId: json.poolIdBech, role: 'SPO' } as DRepKeys;
+                        return { secretKey: json.secretKey, publicKey: json.publicKey, drepId: json.poolIdBech } as DRepKeys;
                     })
             ),
         );
@@ -140,7 +139,6 @@ export async function generateCalidusSPOKeysBatch(count: number, concurrency = 5
                     secretKey: calidusJson.secretKey,      // sign with calidus key
                     publicKey: calidusJson.publicKey,
                     drepId: poolJson.poolIdBech,            // voter ID is the pool
-                    role: 'SPO',
                     calidusId: calidusJson.calidusIdBech,   // for evidence
                 } as DRepKeys;
             })
@@ -173,7 +171,7 @@ export async function generateStakeKeysBatch(count: number, concurrency = 50): P
                         const addrBytes = Buffer.concat([Buffer.from([0xe0]), Buffer.from(keyHash)]);
                         const words = bech32.toWords(addrBytes);
                         const stakeAddr = bech32.encode('stake_test', words);
-                        return { secretKey: json.secretKey, publicKey: json.publicKey, drepId: stakeAddr, role: 'Stakeholder' } as DRepKeys;
+                        return { secretKey: json.secretKey, publicKey: json.publicKey, drepId: stakeAddr } as DRepKeys;
                     })
             ),
         );
