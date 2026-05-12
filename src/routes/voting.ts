@@ -17,6 +17,7 @@ import {
     enqueueAndWait,
 } from '../helpers.js';
 import {getCachedBallot, getCachedBallotIdentity} from './lifecycle.js';
+import {HRP_TO_ROLE} from '../types.js';
 import type {
     BallotDefinition,
     CoseWitness,
@@ -468,7 +469,6 @@ interface VotePipelineInput {
     ballotId: string;
     votes: VoteSelection[];
     signature: VoteSignatureData;
-    responderRole?: string;
     prevTxHash?: string;
 }
 
@@ -488,7 +488,7 @@ interface VotePipelineResult {
  * error message prefixed with the HTTP status code for the caller to use.
  */
 async function voteValidateAndPin(input: VotePipelineInput): Promise<VotePipelineResult> {
-    const { voterId, tokenName, credentialHrp, nonce, ballotId, votes, signature, responderRole } = input;
+    const { voterId, tokenName, credentialHrp, nonce, ballotId, votes, signature } = input;
 
     // Validate votes against ballot
     const ballot = getCachedBallot();
@@ -509,10 +509,13 @@ async function voteValidateAndPin(input: VotePipelineInput): Promise<VotePipelin
         throw Object.assign(new Error(sigError), { statusCode: 401, code: 'SIGNATURE_INVALID' as const });
     }
 
-    // Build evidence
+    // Build evidence. responderRole is derived from credentialHrp — the client
+    // does not get to pick. Any HRP that reaches this point already passed
+    // CREDENTIAL_PREFIX validation in voterIdToTokenName, so HRP_TO_ROLE is
+    // guaranteed to have a mapping; the fallback is defensive.
     const evidence: VoteEvidence = {
         specVersion: '0.3.0',
-        responderRole: responderRole ?? 'drep',
+        responderRole: HRP_TO_ROLE[credentialHrp] ?? 'drep',
         answers: votes,
         ekklesia: {
             voterId,
@@ -700,7 +703,6 @@ router.post('/vote-and-register', (req, _res, next) => {
  *     key: string,
  *     signature: string,
  *   }
- *   responderRole?: string         — e.g., "drep" (default: "drep")
  */
 /**
  * POST /vote
@@ -721,7 +723,9 @@ router.post('/vote-and-register', (req, _res, next) => {
  *   ballotId: string               — ballot identifier (ULID or tx hash)
  *   votes: VoteSelection[]         — [{questionId, selection: number[]}]
  *   signature: VoteSignatureData   — COSE_Sign1 or native script witnesses
- *   responderRole?: string         — e.g., "drep" (default: "drep")
+ *
+ * responderRole is intentionally NOT accepted on the wire. It is derived
+ * server-side from the bech32 HRP of voterId before evidence is hashed.
  */
 router.post('/vote', async (req, res) => {
     const {
@@ -729,14 +733,12 @@ router.post('/vote', async (req, res) => {
         ballotId,
         votes,
         signature,
-        responderRole,
     } = req.body as {
         voterId: string;
         nonce?: number;
         ballotId: string;
         votes: VoteSelection[];
         signature: VoteSignatureData;
-        responderRole?: string;
     };
 
     if (!voterId || !ballotId || !votes || !signature) {
@@ -781,7 +783,7 @@ router.post('/vote', async (req, res) => {
 
             // --- Shared pipeline: validate → hash → verify sig → IPFS ---
             const { merkleRoot, voteHash, ipfsCid, evidence } = await voteValidateAndPin({
-                voterId, tokenName, credentialHrp, nonce, ballotId, votes, signature, responderRole,
+                voterId, tokenName, credentialHrp, nonce, ballotId, votes, signature,
             });
 
             let txHash: string;

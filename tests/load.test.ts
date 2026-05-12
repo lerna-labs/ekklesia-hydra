@@ -325,7 +325,6 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
                 ballotId: prepareTxHash,
                 votes,
                 signature,
-                responderRole: voter.role,
             });
 
             const utxoCount = 1 + (i + 1); // ballot token + i voter tokens
@@ -369,7 +368,6 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
                 ballotId: prepareTxHash,
                 votes,
                 signature,
-                responderRole: voter.role,
             });
 
             const utxoCount = 1 + VOTER_COUNT; // stable count during updates
@@ -429,7 +427,6 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
                     ballotId: prepareTxHash,
                     votes,
                     signature,
-                    responderRole: voter.role,
                 });
                 return { index: i, status, durationMs, message: json.message?.slice(0, 80), code: json.code };
             } catch (err: any) {
@@ -499,7 +496,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
                 const signature = buildVoteSignature(voter, merkleRoot);
 
                 const { status } = await api('POST', '/vote', {
-                    voterId: voter.drepId, nonce: retryNonce, ballotId: prepareTxHash, votes, signature, responderRole: voter.role,
+                    voterId: voter.drepId, nonce: retryNonce, ballotId: prepareTxHash, votes, signature,
                 });
                 if (status === 200) retried++;
             }
@@ -544,7 +541,6 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
                     ballotId: prepareTxHash,
                     votes,
                     signature,
-                    responderRole: voter.role,
                 });
                 return { index: i, status, durationMs, message: json.message?.slice(0, 80), code: json.code };
             } catch (err: any) {
@@ -607,7 +603,7 @@ describe(`Ekklesia Hydra Load Test — ${VOTER_COUNT} voters`, () => {
                 const signature = buildVoteSignature(voter, merkleRoot);
 
                 const { status } = await api('POST', '/vote', {
-                    voterId: voter.drepId, nonce: retryNonce, ballotId: prepareTxHash, votes, signature, responderRole: voter.role,
+                    voterId: voter.drepId, nonce: retryNonce, ballotId: prepareTxHash, votes, signature,
                 });
                 if (status === 200) retried++;
             }

@@ -1510,7 +1510,9 @@ components:
           type: string
           description: |
             One of the canonical lowercase roles `drep`, `pool`, `stake`.
-            Defaults to `drep` when not supplied at /vote.
+            Server-derived from the bech32 HRP of `voterId` (`calidus` collapses
+            to `pool`, `stake_test` collapses to `stake`). Clients cannot set
+            this — any value supplied on `POST /vote` is ignored.
         answers:
           type: array
           items: { $ref: '#/components/schemas/VoteSelection' }
@@ -1536,12 +1538,6 @@ components:
           type: array
           items: { $ref: '#/components/schemas/VoteSelection' }
         signature: { $ref: '#/components/schemas/VoteSignatureData' }
-        responderRole:
-          type: string
-          description: |
-            Canonical lowercase role: `drep`, `pool`, or `stake`. Defaults to
-            `drep`. Earlier mixed-case variants (`DRep`, `SPO`, `Stakeholder`)
-            are no longer accepted.
 
     VoteResponse:
       allOf:
