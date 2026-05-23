@@ -25,7 +25,7 @@ import settlementRoutes from './routes/settlement.js';
 import queryRoutes from './routes/query.js';
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 app.use(authHeaderMiddleware);
 
 // Mount route modules
