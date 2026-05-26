@@ -16,6 +16,41 @@ let cachedBallotPolicy: string | null = null;
 let cachedBallotToken: string | null = null;
 let cachedBallotId: string | null = null;
 let cachedResultsAddress: string | null = null;
+let cachedBallotIpfsCid: string | null = null;
+
+/**
+ * Path of the on-disk ballot session record. Written on /start (atomic
+ * tmp + rename), read at boot by rehydrateBallotSession(), and wiped only
+ * by the fresh-start cleanup branch of /start. The file is the single
+ * source of truth that lets the middleware survive process restarts
+ * against a live Hydra head without operators having to re-call /start.
+ */
+const BALLOT_SESSION_PATH = path.join(IPFS_STAGING_DIR, 'ballot-session.json');
+
+interface BallotSessionFile {
+    ballotIpfsCid: string | null;
+    ballotPolicy: string;
+    ballotToken: string;
+    ballotId: string;
+    resultsAddress: string | null;
+}
+
+async function writeBallotSession(session: BallotSessionFile): Promise<void> {
+    await fs.mkdir(path.dirname(BALLOT_SESSION_PATH), { recursive: true });
+    const tmpPath = `${BALLOT_SESSION_PATH}.tmp`;
+    await fs.writeFile(tmpPath, JSON.stringify(session, null, 2));
+    await fs.rename(tmpPath, BALLOT_SESSION_PATH);
+}
+
+async function readBallotSession(): Promise<BallotSessionFile | null> {
+    try {
+        const raw = await fs.readFile(BALLOT_SESSION_PATH, 'utf-8');
+        return JSON.parse(raw) as BallotSessionFile;
+    } catch (err: any) {
+        if (err?.code === 'ENOENT') return null;
+        throw err;
+    }
+}
 
 /** Get the cached ballot definition (used by other routes). */
 export function getCachedBallot(): BallotDefinition | null {
@@ -45,6 +80,60 @@ export function getCachedBallotId(): string | null {
 export function getCachedResultsAddress(): string | null {
     return cachedResultsAddress;
 }
+
+/**
+ * Rehydrate the in-memory ballot session from disk. Called once at boot
+ * by index.ts before app.listen(), so callers hitting /vote, /register,
+ * /finalize, etc. immediately after a restart see the same cached identity
+ * the previous process had.
+ *
+ * Returns true when a session file was found and the identity cache was
+ * populated; false when the file is absent (first boot or post-archive).
+ * IPFS unavailability on boot is non-fatal — the identity is still seeded;
+ * only `cachedBallot` (the definition body) is left null and can be
+ * re-fetched lazily.
+ */
+export async function rehydrateBallotSession(): Promise<{
+    rehydrated: boolean;
+    ballotFetched: boolean;
+}> {
+    const session = await readBallotSession();
+    if (!session) return { rehydrated: false, ballotFetched: false };
+
+    cachedBallotPolicy = session.ballotPolicy;
+    cachedBallotToken = session.ballotToken;
+    cachedBallotId = session.ballotId;
+    cachedResultsAddress = session.resultsAddress;
+    cachedBallotIpfsCid = session.ballotIpfsCid;
+
+    let ballotFetched = false;
+    if (session.ballotIpfsCid) {
+        try {
+            cachedBallot = await ipfs.fetchJson<BallotDefinition>(session.ballotIpfsCid);
+            ballotFetched = true;
+        } catch (err: any) {
+            console.warn(
+                `[rehydrate] Could not fetch ballot definition from IPFS (${session.ballotIpfsCid}): ${err?.message ?? err}. ` +
+                `Identity is restored; ballot body will be re-fetched on next /start or remains null.`,
+            );
+        }
+    }
+
+    return { rehydrated: true, ballotFetched };
+}
+
+/** Test-only: reset all in-memory ballot session state. Not exported via public surface. */
+export function __resetBallotSessionForTests(): void {
+    cachedBallot = null;
+    cachedBallotPolicy = null;
+    cachedBallotToken = null;
+    cachedBallotId = null;
+    cachedResultsAddress = null;
+    cachedBallotIpfsCid = null;
+}
+
+/** Test-only: path of the ballot session file. */
+export const __BALLOT_SESSION_PATH_FOR_TESTS = BALLOT_SESSION_PATH;
 
 router.get('/health', async (_, res) => {
     try {
@@ -174,6 +263,7 @@ router.post('/start', async (req, res) => {
             cachedBallotToken = null;
             cachedBallotId = null;
             cachedResultsAddress = null;
+            cachedBallotIpfsCid = null;
             const votesDir = path.join(IPFS_STAGING_DIR, 'votes');
             const latestDir = path.join(IPFS_STAGING_DIR, 'latest');
             const historyDir = path.join(IPFS_STAGING_DIR, 'history');
@@ -184,6 +274,10 @@ router.post('/start', async (req, res) => {
             // no finalize-response.json is present so any pre-burn snapshot
             // here is orphaned intermediate state.
             try { await fs.rm(path.join(IPFS_STAGING_DIR, 'pre-burn-ledger.json'), { force: true }); } catch { /* ignore */ }
+            // Remove stale ballot session file — a fresh head gets a fresh
+            // identity, and leaving the previous one would let the boot
+            // rehydrator load wrong values on the next restart.
+            try { await fs.rm(BALLOT_SESSION_PATH, { force: true }); } catch { /* ignore */ }
             await voteCache.rehydrate(); // rebuilds in-memory map from now-empty latest/
             await txQueue.clear(); // clear stale queue entries from previous session
             console.log('Vote cache, history, and ballot cache cleared for new head session.');
@@ -198,6 +292,7 @@ router.post('/start', async (req, res) => {
 
         // Cache the ballot definition from IPFS if CID was provided
         if (ballotIpfsCid) {
+            cachedBallotIpfsCid = ballotIpfsCid;
             try {
                 cachedBallot = await ipfs.fetchJson<BallotDefinition>(ballotIpfsCid);
                 console.log(`Ballot definition cached from IPFS: ${ballotIpfsCid}`);
@@ -221,6 +316,26 @@ router.post('/start', async (req, res) => {
         if (resultsAddress) {
             cachedResultsAddress = resultsAddress;
             console.log(`Results address cached: ${resultsAddress}`);
+        }
+
+        // Persist the ballot session to disk so a process restart against
+        // a live head can rehydrate the in-memory cache without operators
+        // having to re-call /start. Only write when we have full identity —
+        // a partial session is worse than no session at boot.
+        if (cachedBallotPolicy && cachedBallotToken && cachedBallotId) {
+            try {
+                await writeBallotSession({
+                    ballotIpfsCid: cachedBallotIpfsCid,
+                    ballotPolicy: cachedBallotPolicy,
+                    ballotToken: cachedBallotToken,
+                    ballotId: cachedBallotId,
+                    resultsAddress: cachedResultsAddress,
+                });
+            } catch (writeErr: any) {
+                // Don't fail /start if persistence fails — head is open, voting
+                // works for this process. Restart resilience just degrades.
+                console.warn(`Warning: Failed to persist ballot session to disk: ${writeErr?.message ?? writeErr}`);
+            }
         }
 
         return success(res, {
