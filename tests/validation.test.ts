@@ -321,7 +321,7 @@ function validateOptions(
 }
 
 const ALLOWED_ROLES = new Set(['drep', 'pool', 'stake']);
-const ALLOWED_HRPS = new Set(['drep', 'pool', 'calidus', 'stake', 'stake_test']);
+const ALLOWED_HRPS = new Set(['drep', 'pool', 'stake', 'stake_test']);
 const ALLOWED_MODES_BY_ROLE: Record<string, Set<string>> = {
     drep: new Set(['CredentialBased', 'StakeBased']),
     pool: new Set(['CredentialBased', 'StakeBased', 'PledgeBased']),
