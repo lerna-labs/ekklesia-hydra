@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { createNativeScript, Wrangler } from '@lerna-labs/hydra-sdk';
 import { blake2b256, bytesToHex, computePackage } from '@lerna-labs/hydra-proof';
 import type { FileLeaf } from '@lerna-labs/hydra-proof';
-import { initialize, voterIdToTokenName, CLOSE_TOKEN, VERBOSE, IPFS_STAGING_DIR, ipfs, voteCache, success, error, debug, hydraMonitor, getHeadId, txQueue, enqueueAndWait, driveHeadToFinal } from '../helpers.js';
+import { initialize, voterIdToTokenName, CLOSE_TOKEN, VERBOSE, IPFS_STAGING_DIR, ipfs, voteCache, success, error, debug, hydraMonitor, getHeadId, txQueue, enqueueAndWait, driveHeadToFinal, mapWithConcurrency, TRP_RESOLVE_CONCURRENCY } from '../helpers.js';
 import { hydraValueToAmounts } from '../tx-builder.js';
 import { getCachedBallot, getCachedBallotId, getCachedBallotIdentity, getCachedResultsAddress } from './lifecycle.js';
 import { BALLOT_INSTANCE_PREFIX, BALLOT_DEFINITION_PREFIX, HRP_TO_ROLE } from '../types.js';
@@ -898,8 +898,9 @@ router.post('/count', async (req, res) => {
 
         // Resolve + sign + enqueue every burn, then wait for the worker to
         // dispatch them all. Burns are non-contending so the worker pipelines
-        // them up to MAX_IN_FLIGHT in parallel.
-        const results = await Promise.allSettled(allVotes.map(async (vote) => {
+        // them up to MAX_IN_FLIGHT in parallel. The TRP resolve phase is
+        // capped at TRP_RESOLVE_CONCURRENCY to avoid 429-flooding the gateway.
+        const results = await mapWithConcurrency(allVotes, TRP_RESOLVE_CONCURRENCY, async (vote) => {
             const tokenName = voterIdToTokenName(vote.voterId);
             const { tx: unsignedTx } = await client.countVoteTx({
                 votingAuthority: admin_payment_address,
@@ -915,7 +916,7 @@ router.post('/count', async (req, res) => {
                 signedCborHex: signedTx,
             });
             return { voterId: vote.voterId, txHash };
-        }));
+        });
 
         const detailed = results.map((r, i) => {
             if (r.status === 'fulfilled') return r.value;
@@ -1018,7 +1019,7 @@ router.post('/settle/burn', async (_req, res) => {
         // the WAL (e.g., from a previous /settle/burn call), enqueueing
         // again with the same id overwrites the prior state — but we'd
         // also re-await its acceptance, so retries Just Work.
-        const burnResults = await Promise.allSettled(headVoters.map(async (voter) => {
+        const burnResults = await mapWithConcurrency(headVoters, TRP_RESOLVE_CONCURRENCY, async (voter) => {
             const { tx: unsignedTx } = await client.countVoteTx({
                 votingAuthority: admin_payment_address,
                 mintingScript: Buffer.from(TOKEN_SCRIPT as string, 'hex'),
@@ -1032,7 +1033,7 @@ router.post('/settle/burn', async (_req, res) => {
                 unsignedCborHex: unsignedTx,
                 signedCborHex: signedTx,
             });
-        }));
+        });
 
         let burned = 0;
         let burnFailed = 0;
@@ -1106,23 +1107,46 @@ router.post('/settle/finalize', async (_req, res) => {
         // This is the authoritative record of every voter's on-chain state
         // at the moment settlement began — the source of truth for the evidence package.
         //
-        // If the snapshot is missing but the head also has zero voter tokens,
-        // we treat that as an empty-ballot finalize and synthesize an empty
-        // snapshot on the fly. This keeps /settle/finalize usable in the
-        // unusual case where /settle/burn was never called (e.g. ballots
-        // that had no voter activity and skipped straight to finalize).
+        // If the snapshot is missing we fall back to the vote cache. Two
+        // sub-cases, distinguished by whether the cache holds any voters:
+        //
+        //  - Cache empty   → genuinely an empty ballot (no voter activity, or
+        //                    /settle/burn was skipped on a head that never had
+        //                    votes). Synthesize an empty snapshot; the result
+        //                    reflects a zero-voter ballot.
+        //
+        //  - Cache populated → voter tokens were burned OUTSIDE the /settle/burn
+        //                    path (e.g. a stray /count call), so the snapshot
+        //                    that step normally writes was never created, yet
+        //                    real votes exist locally. Reconstruct the snapshot
+        //                    from the cache rather than silently finalizing an
+        //                    empty datum. Every reconstructed voter still passes
+        //                    the evidence-hash verification below, so only votes
+        //                    whose evidence reproduces the recorded voteHash are
+        //                    counted. NOTE: with the on-chain voter tokens gone,
+        //                    the integrity anchor shifts from the burned head
+        //                    datum to the local cache/evidence — only valid when
+        //                    that evidence has been independently reconciled
+        //                    (e.g. via /audit/full).
         const ledgerSnapshotPath = pathMod.join(IPFS_STAGING_DIR, 'pre-burn-ledger.json');
         let ledgerVoters: Array<{ tokenName: string; version: number; voteHash: string; ipfsCid: string }>;
         try {
             const raw = await fs.readFile(ledgerSnapshotPath, 'utf-8');
             ledgerVoters = JSON.parse(raw);
         } catch {
-            // We already confirmed remainingVoters.length === 0 above, so the
-            // head genuinely has no voter tokens. Write an empty snapshot and
-            // continue — the finalized results will reflect a zero-voter ballot.
-            ledgerVoters = [];
+            const cached = voteCache.getAll();
+            ledgerVoters = cached.map(v => ({
+                tokenName: voterIdToTokenName(v.voterId),
+                version: v.version,
+                voteHash: v.voteHash,
+                ipfsCid: v.ipfsCid,
+            }));
             await fs.writeFile(ledgerSnapshotPath, JSON.stringify(ledgerVoters, null, 2));
-            debug(`[settle/finalize] No pre-burn snapshot found AND head has no voter tokens — synthesized empty snapshot at ${ledgerSnapshotPath}`);
+            if (ledgerVoters.length === 0) {
+                debug(`[settle/finalize] No pre-burn snapshot AND empty cache — synthesized empty snapshot at ${ledgerSnapshotPath}`);
+            } else {
+                console.warn(`[settle/finalize] No pre-burn snapshot found, but cache holds ${ledgerVoters.length} voter(s). Reconstructed snapshot from cache — voter tokens were burned outside /settle/burn. Evidence-hash verification still applies.`);
+            }
         }
 
         debug(`[settle/finalize] Loaded pre-burn ledger: ${ledgerVoters.length} voters`);
@@ -1428,7 +1452,7 @@ router.post('/settle', async (req, res) => {
         // WebSocket up to MAX_IN_FLIGHT in parallel. Each burn spends a
         // unique voter UTxO so there's no contention. The worker handles
         // retries on transient errors.
-        const burnResults = await Promise.allSettled(headVoters.map(async (voter) => {
+        const burnResults = await mapWithConcurrency(headVoters, TRP_RESOLVE_CONCURRENCY, async (voter) => {
             const { tx: unsignedTx } = await client.countVoteTx({
                 votingAuthority: admin_payment_address,
                 mintingScript: Buffer.from(TOKEN_SCRIPT as string, 'hex'),
@@ -1442,7 +1466,7 @@ router.post('/settle', async (req, res) => {
                 unsignedCborHex: unsignedTx,
                 signedCborHex: signedTx,
             });
-        }));
+        });
 
         let burned = 0;
         let burnFailed = 0;

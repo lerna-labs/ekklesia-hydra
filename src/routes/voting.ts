@@ -61,6 +61,37 @@ function isOnGrid(v: number, min: number, max: number, step: number): boolean {
 }
 
 /**
+ * Check that a voter's bech32 HRP is permitted by the ballot.
+ *
+ * Source of truth (in priority order):
+ *   1. ballot.ekklesia.acceptedCredentials — explicit HRP allowlist
+ *   2. ballot.roleWeighting keys — mapped to HRPs via HRP_TO_ROLE
+ *
+ * Ballots with neither populated are treated as open (no gate), preserving
+ * behavior for ballots authored before this check existed. Returns null on
+ * success or a human-readable error string on rejection.
+ */
+function checkVoterEligibility(credentialHrp: string, ballot: BallotDefinition): string | null {
+    const accepted = ballot.ekklesia?.acceptedCredentials;
+    if (Array.isArray(accepted) && accepted.length > 0) {
+        if (!accepted.includes(credentialHrp)) {
+            return `Voter credential "${credentialHrp}" is not accepted by this ballot (acceptedCredentials: ${accepted.join(', ')})`;
+        }
+        return null;
+    }
+
+    const declaredRoles = ballot.roleWeighting ? Object.keys(ballot.roleWeighting) : [];
+    if (declaredRoles.length > 0) {
+        const role = HRP_TO_ROLE[credentialHrp];
+        if (!role || !declaredRoles.includes(role)) {
+            return `Voter role "${role ?? credentialHrp}" is not declared in ballot.roleWeighting (${declaredRoles.join(', ')})`;
+        }
+    }
+
+    return null;
+}
+
+/**
  * Validate voter selections against the cached ballot definition.
  * Dispatches to method-specific validation based on question.method.
  * Returns an error message string on failure, or null on success.
@@ -614,10 +645,21 @@ router.post('/register', async (req, res) => {
     }
 
     let tokenName: string;
+    let credentialHrp: string;
     try {
         tokenName = voterIdToTokenName(voterId);
+        credentialHrp = voterIdHrp(voterId);
     } catch (e: any) {
         return error(res, 'INVALID_VOTER_ID', `Invalid voter ID: ${e.message}`, 400);
+    }
+
+    // Reject voters whose credential type isn't permitted by the ballot.
+    const ballot = getCachedBallot();
+    if (ballot) {
+        const eligErr = checkVoterEligibility(credentialHrp, ballot);
+        if (eligErr) {
+            return error(res, 'INELIGIBLE_VOTER', eligErr, 403);
+        }
     }
 
     // Prevent duplicate registration — voter token already exists in head
@@ -752,6 +794,15 @@ router.post('/vote', async (req, res) => {
         credentialHrp = voterIdHrp(voterId);
     } catch (e: any) {
         return error(res, 'INVALID_VOTER_ID', `Invalid voter ID: ${e.message}`, 400);
+    }
+
+    // Reject voters whose credential type isn't permitted by the ballot.
+    const ballot = getCachedBallot();
+    if (ballot) {
+        const eligErr = checkVoterEligibility(credentialHrp, ballot);
+        if (eligErr) {
+            return error(res, 'INELIGIBLE_VOTER', eligErr, 403);
+        }
     }
 
     // Per-voter lock: only one request per voter at a time

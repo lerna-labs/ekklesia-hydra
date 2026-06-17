@@ -582,6 +582,7 @@ paths:
                           txHash: { type: string }
                           tokenName: { type: string }
         '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/IneligibleVoter' }
         '409': { $ref: '#/components/responses/Conflict' }
 
   /vote:
@@ -613,6 +614,7 @@ paths:
                 $ref: '#/components/schemas/VoteResponse'
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/SignatureInvalid' }
+        '403': { $ref: '#/components/responses/IneligibleVoter' }
         '409': { $ref: '#/components/responses/Conflict' }
         '503': { $ref: '#/components/responses/Unavailable' }
 
@@ -1137,6 +1139,14 @@ components:
       content:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    IneligibleVoter:
+      description: |
+        Voter's credential type is not permitted by the cached ballot.
+        The ballot's `ekklesia.acceptedCredentials` (or `roleWeighting` as
+        fallback) does not include this voter's bech32 HRP / derived role.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
     InternalError:
       description: Internal error
       content:
@@ -1171,6 +1181,7 @@ components:
             - INVALID_INPUT
             - INVALID_VOTE
             - INVALID_VOTER_ID
+            - INELIGIBLE_VOTER
             - SIGNATURE_INVALID
             - CONFLICT
             - NOT_FOUND
