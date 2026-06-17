@@ -13,6 +13,7 @@ import {
     voteCache,
     voterIdHrp,
     voterIdToTokenName,
+    extractScriptCredentialHash,
     debug,
     enqueueAndWait,
 } from '../helpers.js';
@@ -404,17 +405,22 @@ function verifyVoteSignatures(
         const decoded = bech32.decode(voterId);
         const bytes = bech32.fromWords(decoded.words);
 
-        // CIP-129: first byte is credential type (0x22=key, 0x23=script), rest is hash
-        let credentialHash: string;
-        if (decoded.prefix === 'drep' && bytes[0] === 0x23) {
-            credentialHash = Buffer.from(bytes.slice(1)).toString('hex');
-        } else {
-            credentialHash = Buffer.from(bytes).toString('hex');
+        // Strip the CIP-129 (drep) / CIP-19 (stake) header byte to recover the
+        // 28-byte credential hash. Returns null if the credential is not a
+        // script type — a native script can only satisfy a script credential,
+        // never a key credential (or a prefix-less pool ID).
+        const credentialHash = extractScriptCredentialHash(decoded.prefix, bytes);
+        if (credentialHash === null) {
+            return {
+                error: `Credential ${voterId} (${decoded.prefix}) is not a script-based credential — ` +
+                    `native script witnesses require a script DRep (0x23) or script stake (0xf…) credential`,
+                witnesses: [],
+            };
         }
 
         if (scriptHash !== credentialHash) {
             return {
-                error: `Native script hash ${scriptHash} does not match DRep credential ${credentialHash}`,
+                error: `Native script hash ${scriptHash} does not match credential ${credentialHash}`,
                 witnesses: [],
             };
         }

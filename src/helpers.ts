@@ -238,6 +238,38 @@ export function voterIdHrp(voterId: string): string {
     return decoded.prefix;
 }
 
+/**
+ * Extract the 28-byte credential hash from a script-capable voter ID, for
+ * matching against a native-script hash (`resolveNativeScriptHash`).
+ *
+ * Only script-based credentials can be satisfied by a native script:
+ *   - drep   — CIP-129 governance credential, 1-byte kind prefix + 28-byte hash.
+ *              `0x22` = key hash, `0x23` = script hash. Only `0x23` is a script.
+ *   - stake  — CIP-19 reward address, 1-byte header + 28-byte hash. The header's
+ *     /stake_test high nibble is the address type: `0xe?` = key hash, `0xf?` = script hash.
+ *              Only `0xf?` is a script.
+ *
+ * pool IDs are a raw 28-byte hash with no header byte and are never script-based
+ * (an SPO signs with its cold key), so they have no entry here. `calidus` is a
+ * signing witness, not a voter identity (F-001), and likewise never appears.
+ *
+ * Returns the 28-byte hash as lowercase hex, or null if `bytes` is not a
+ * recognized *script* credential for `hrp` (caller should reject — a native
+ * script cannot stand in for a key credential).
+ */
+export function extractScriptCredentialHash(hrp: string, bytes: Uint8Array | number[]): string | null {
+    // Every script credential here is a 1-byte header + 28-byte blake2b-224 hash.
+    if (bytes.length !== 29) return null;
+
+    const header = bytes[0];
+    const isScript =
+        (hrp === 'drep' && header === 0x23) ||
+        ((hrp === 'stake' || hrp === 'stake_test') && (header >> 4) === 0xf);
+
+    if (!isScript) return null;
+    return Buffer.from(Array.from(bytes).slice(1)).toString('hex');
+}
+
 export type InitializePayload = {
     admin_wallet?: MeshWallet;
     address?: string;
