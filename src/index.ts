@@ -19,7 +19,7 @@ import { HYDRA_NETWORK, VERBOSE, voteCache, hydraMonitor, txQueue, queueWorker }
 
 import auditRoutes from './routes/audit.js';
 import ballotRoutes from './routes/ballot.js';
-import lifecycleRoutes from './routes/lifecycle.js';
+import lifecycleRoutes, { rehydrateBallotSession } from './routes/lifecycle.js';
 import votingRoutes from './routes/voting.js';
 import settlementRoutes from './routes/settlement.js';
 import queryRoutes from './routes/query.js';
@@ -77,6 +77,21 @@ async function start() {
     const queueStatus = txQueue.status();
     if (queueStatus.total > 0) {
         console.log(`TX queue loaded: ${JSON.stringify(queueStatus)}`);
+    }
+
+    // Rehydrate ballot session (policy, token, ballotId, resultsAddress,
+    // and the ballot definition body via IPFS) so /vote, /register,
+    // /finalize, and /settle/* keep working after a process restart against
+    // a live head — no operator re-/start required.
+    try {
+        const { rehydrated, ballotFetched } = await rehydrateBallotSession();
+        if (rehydrated) {
+            console.log(`Ballot session rehydrated from disk (ballot definition ${ballotFetched ? 'fetched from IPFS' : 'NOT available — IPFS unreachable or no CID'})`);
+        } else {
+            console.log('No prior ballot session found on disk (fresh boot).');
+        }
+    } catch (err: any) {
+        console.warn(`Ballot session rehydration failed (continuing): ${err?.message ?? err}`);
     }
 
     // Log every raw Hydra WebSocket message for diagnostics.
