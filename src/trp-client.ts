@@ -58,6 +58,34 @@ function dumpError(label: string, obj: unknown): void {
     }
 }
 
+/** Number of times a 429-throttled TRP resolve is retried before giving up. */
+const MAX_TRP_RETRIES = 5;
+
+/** True for HTTP 429 (Too Many Requests) thrown by the TRP gateway. */
+function isRateLimited(err: any): boolean {
+    const status = err?.statusCode ?? err?.status;
+    return status === 429 || (err?.name === 'StatusCodeError' && status === 429);
+}
+
+/**
+ * Retry `fn` on HTTP 429 with exponential backoff + jitter. Only 429 is
+ * retried — it is a pure "slow down" signal. Other errors (including
+ * "input not resolved", which means the token genuinely isn't in the head)
+ * fail fast so callers don't spin on permanent conditions.
+ */
+async function withTrpRetry<T>(label: string, fn: () => Promise<T>): Promise<T> {
+    for (let attempt = 0; ; attempt++) {
+        try {
+            return await fn();
+        } catch (err) {
+            if (!isRateLimited(err) || attempt >= MAX_TRP_RETRIES) throw err;
+            const backoff = Math.min(2_000, 100 * 2 ** attempt) + Math.floor(Math.random() * 100);
+            debug(`[TRP] ${label} throttled (429), retry ${attempt + 1}/${MAX_TRP_RETRIES} in ${backoff}ms`);
+            await new Promise((r) => setTimeout(r, backoff));
+        }
+    }
+}
+
 export class TRPClientLogged {
     private readonly inner: GeneratedClient;
 
@@ -105,7 +133,7 @@ export class TRPClientLogged {
     async countVoteTx(args: CountVoteParams): Promise<ResolveResponse> {
         dump('countVoteTx args', args);
         try {
-            const result = await this.inner.countVoteTx(args);
+            const result = await withTrpRetry('countVoteTx', () => this.inner.countVoteTx(args));
             dump('countVoteTx result', { txLength: result.tx?.length ?? null });
             return result;
         } catch (err) {

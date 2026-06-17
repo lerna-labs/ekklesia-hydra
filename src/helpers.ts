@@ -21,6 +21,18 @@ export const IPFS_API_URL = process.env.IPFS_API_URL || 'http://localhost:5001';
 export const IPFS_STAGING_DIR = process.env.IPFS_STAGING_DIR || '/ipfs-staging';
 export const VERBOSE = process.env.VERBOSE === '1' || process.env.VERBOSE === 'true';
 
+/**
+ * Cap on how many TRP resolve calls run concurrently during bulk settlement
+ * (the burn fan-out). Resolving one countVoteTx per voter all at once
+ * overwhelms the TRP gateway (HTTP 429) and its backing Hydra UTxO lookups
+ * ("input not resolved: voter_token"). The queue worker's in-flight throttle
+ * only governs dispatch, not this resolve phase, so it is bounded here.
+ */
+export const TRP_RESOLVE_CONCURRENCY = Math.max(
+    1,
+    parseInt(process.env.TRP_RESOLVE_CONCURRENCY || '12', 10),
+);
+
 /** Log only when VERBOSE mode is enabled. Errors always log regardless. */
 export function debug(...args: unknown[]): void {
     if (VERBOSE) console.log(...args);
@@ -147,6 +159,35 @@ export function sanitizeBigInts(obj: any): any {
 }
 
 /**
+ * Drop-in replacement for `Promise.allSettled(items.map(fn))` that caps the
+ * number of `fn` invocations in flight at `limit`. Results preserve input
+ * order so callers can index back into `items` for per-item error reporting.
+ *
+ * Used to throttle the TRP resolve fan-out during settlement — see
+ * {@link TRP_RESOLVE_CONCURRENCY}.
+ */
+export async function mapWithConcurrency<T, R>(
+    items: readonly T[],
+    limit: number,
+    fn: (item: T, index: number) => Promise<R>,
+): Promise<PromiseSettledResult<R>[]> {
+    const results: PromiseSettledResult<R>[] = new Array(items.length);
+    let next = 0;
+    const workerCount = Math.max(1, Math.min(limit, items.length));
+    const workers = Array.from({ length: workerCount }, async () => {
+        for (let i = next++; i < items.length; i = next++) {
+            try {
+                results[i] = { status: 'fulfilled', value: await fn(items[i], i) };
+            } catch (reason) {
+                results[i] = { status: 'rejected', reason };
+            }
+        }
+    });
+    await Promise.all(workers);
+    return results;
+}
+
+/**
  * Parse a bech32 voter ID into the credential prefix byte and 28-byte hash
  * used as the voter token asset name (29 bytes total).
  *
@@ -266,6 +307,7 @@ export type ErrorCode =
     | 'INVALID_VOTE'
     | 'INVALID_VOTER_ID'
     | 'UNAUTHORIZED'
+    | 'INELIGIBLE_VOTER'
     | 'SIGNATURE_INVALID'
     | 'CONFLICT'
     | 'NOT_FOUND'
