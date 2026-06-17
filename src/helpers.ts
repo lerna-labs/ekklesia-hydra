@@ -203,6 +203,16 @@ export function voterIdToTokenName(voterId: string): string {
 
     const decoded = bech32.decode(voterId);
     const hrp = decoded.prefix;
+
+    // A calidus key is a signing witness, not a voter identity. Minting a token
+    // for `calidus1...` would give an SPO a second voter token alongside their
+    // pool token (a double vote). SPOs vote as the pool with a calidusDeclaration.
+    if (hrp === 'calidus') {
+        throw new Error(
+            'Calidus keys are signing witnesses, not voter identities — submit voterId as the pool (pool1...) with a calidusDeclaration in the signature.',
+        );
+    }
+
     const prefixByte = CREDENTIAL_PREFIX[hrp];
     if (prefixByte === undefined) {
         const allowed = Object.keys(CREDENTIAL_PREFIX).join(', ');

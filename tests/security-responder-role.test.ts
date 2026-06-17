@@ -35,8 +35,11 @@ describe('issue #1 — responderRole is derived, not client-supplied', () => {
             expect(HRP_TO_ROLE.pool).toBe('pool');
         });
 
-        it('maps calidus -> pool (HRP collapse)', () => {
-            expect(HRP_TO_ROLE.calidus).toBe('pool');
+        it('has no calidus entry — calidus is a signing witness, not a voter identity (F-001)', () => {
+            // An SPO voting with a calidus hot key submits voterId as the pool
+            // (pool1...), so credentialHrp is already `pool`; calidus is never a
+            // voter HRP and must not be tokenized independently.
+            expect(HRP_TO_ROLE.calidus).toBeUndefined();
         });
 
         it('maps stake -> stake', () => {

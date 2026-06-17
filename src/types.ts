@@ -40,18 +40,25 @@ export const PROTOCOL_VERSION = 'ekklesia/2.0';
  *
  * Voter token asset name = <prefix byte><blake2b_224(bech32_decoded_data)> (29 bytes)
  *
- * Only `drep`, `pool`, `calidus`, `stake`, `stake_test` are accepted as
- * voter IDs. Payment-stake composite addresses (addr / addr_test) are
- * intentionally excluded: the signing key only verifies a particular
- * payment address and can be spoofed against a stake credential, which
- * is of limited use in a voting platform.
+ * Only `drep`, `pool`, `stake`, `stake_test` are accepted as voter IDs.
+ * Payment-stake composite addresses (addr / addr_test) are intentionally
+ * excluded: the signing key only verifies a particular payment address and can
+ * be spoofed against a stake credential, which is of limited use in a voting
+ * platform.
+ *
+ * `calidus` is deliberately NOT a voter identity. A calidus key is an SPO hot
+ * key authorized for a pool's cold key; an SPO voting with it submits `voterId`
+ * as the pool (`pool1...`) and supplies the calidus key only as a signing
+ * witness (`calidusDeclaration`). Tokenizing `calidus1...` separately would give
+ * one operator two distinct voter tokens — one under the pool ID and one under
+ * the calidus key hash — both tallying as `pool`, i.e. a double vote. The pool
+ * ID is the single canonical SPO identity.
  */
 export const CREDENTIAL_PREFIX: Record<string, number> = {
     drep: 0x22,
     stake: 0xe0,
     stake_test: 0xe0,
     pool: 0x06,
-    calidus: 0x06,      // Calidus hot key represents a pool — same prefix.
 };
 
 /** All recognized bech32 HRPs for voter identification. */
@@ -61,12 +68,13 @@ export type VoterHrp = keyof typeof CREDENTIAL_PREFIX;
  * Map bech32 HRP to tally role. Roles are lowercase and form the canonical
  * three-group voter space: `drep`, `pool`, `stake`. `stake_test` is just
  * the testnet prefix for stake credentials and collapses into the same
- * role. `calidus` is an SPO hot key and counts toward `pool`.
+ * role. There is no `calidus` entry: an SPO voting with a calidus hot key
+ * submits as the pool (`voterId = pool1...`), so its `credentialHrp` is
+ * already `pool` and it tallies under `pool` without a separate mapping.
  */
 export const HRP_TO_ROLE: Record<string, string> = {
     drep: 'drep',
     pool: 'pool',
-    calidus: 'pool',
     stake: 'stake',
     stake_test: 'stake',
 };
