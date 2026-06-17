@@ -17,7 +17,7 @@ import {
     enqueueAndWait,
 } from '../helpers.js';
 import {getCachedBallot, getCachedBallotIdentity} from './lifecycle.js';
-import {HRP_TO_ROLE} from '../types.js';
+import {HRP_TO_ROLE, PROTOCOL_VERSION} from '../types.js';
 import type {
     BallotDefinition,
     CoseWitness,
@@ -545,7 +545,8 @@ async function voteValidateAndPin(input: VotePipelineInput): Promise<VotePipelin
     // CREDENTIAL_PREFIX validation in voterIdToTokenName, so HRP_TO_ROLE is
     // guaranteed to have a mapping; the fallback is defensive.
     const evidence: VoteEvidence = {
-        specVersion: '0.3.0',
+        specVersion: PROTOCOL_VERSION,
+        surveyTxId: ballotId,
         responderRole: HRP_TO_ROLE[credentialHrp] ?? 'drep',
         answers: votes,
         ekklesia: {
@@ -554,8 +555,11 @@ async function voteValidateAndPin(input: VotePipelineInput): Promise<VotePipelin
             nonce,
             signedPayload,
             witnesses,
-            nativeScript: signature.nativeScript,
-            calidusDeclaration: signature.calidusDeclaration,
+            // nativeScript / calidusDeclaration appear only for the credential
+            // types that use them (script-based and calidus voters), matching
+            // the backend producer's conditional inclusion (audit finding F-007).
+            ...(signature.nativeScript ? { nativeScript: signature.nativeScript } : {}),
+            ...(signature.calidusDeclaration ? { calidusDeclaration: signature.calidusDeclaration } : {}),
             merkleProof: { root: '', steps: [] },
         },
     };

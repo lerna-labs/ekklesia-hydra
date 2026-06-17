@@ -9,6 +9,28 @@ export const BALLOT_DEFINITION_PREFIX = '00258a50';
 export const BALLOT_INSTANCE_PREFIX = '00259a20';
 
 // ---------------------------------------------------------------------------
+// Protocol version
+// ---------------------------------------------------------------------------
+
+/**
+ * Evidence/results protocol version stamped into every vote-evidence bundle
+ * (`VoteEvidence.specVersion`) and results object (`FullResults.specVersion`)
+ * this middleware produces. This is the *protocol* version of the on-disk /
+ * IPFS artifact shape and hashing contract — distinct from
+ * `BallotDefinition.specVersion`, which is the ballot author's own version.
+ *
+ * Versioning contract: changes to how a vote is represented, hashed, encoded,
+ * or identified ship as a NEW protocol version, never as an in-place mutation.
+ * Two ballots have already settled under the previous versions (hydra `'0.3.0'`
+ * and backend `'ekklesia/1.0'`); those artifacts must remain verifiable
+ * byte-for-byte by replay tooling keyed off their declared version. This
+ * middleware always produces the current version (one head, one ballot — no old
+ * artifact is ever re-minted here); old-version replay lives in external audit
+ * tooling.
+ */
+export const PROTOCOL_VERSION = 'ekklesia/2.0';
+
+// ---------------------------------------------------------------------------
 // Bech32 HRP → Credential Prefix Byte Mapping
 // ---------------------------------------------------------------------------
 
@@ -649,6 +671,12 @@ export interface EkklesiaVoteExtension {
 export interface VoteEvidence {
     // CIP-179 core
     specVersion: string;
+    /**
+     * The L1 transaction that anchors this ballot (defaults to `ballotId`).
+     * Present in every bundle so the hydra and backend evidence producers emit
+     * the same top-level shape (audit finding F-007).
+     */
+    surveyTxId: string;
     responderRole: string;
     answers: VoteSelection[];
 
