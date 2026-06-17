@@ -5,7 +5,7 @@ import type { FileLeaf } from '@lerna-labs/hydra-proof';
 import { initialize, voterIdToTokenName, CLOSE_TOKEN, VERBOSE, IPFS_STAGING_DIR, ipfs, voteCache, success, error, debug, hydraMonitor, getHeadId, txQueue, enqueueAndWait, driveHeadToFinal, mapWithConcurrency, TRP_RESOLVE_CONCURRENCY } from '../helpers.js';
 import { hydraValueToAmounts } from '../tx-builder.js';
 import { getCachedBallot, getCachedBallotId, getCachedBallotIdentity, getCachedResultsAddress } from './lifecycle.js';
-import { BALLOT_INSTANCE_PREFIX, BALLOT_DEFINITION_PREFIX, HRP_TO_ROLE } from '../types.js';
+import { BALLOT_INSTANCE_PREFIX, BALLOT_DEFINITION_PREFIX, HRP_TO_ROLE, PROTOCOL_VERSION } from '../types.js';
 import type {
     BackendGroupTally,
     BackendOptionResult,
@@ -755,7 +755,7 @@ router.post('/finalize', async (_req, res) => {
 
         // --- 4. Build full results object ---
         const fullResults: FullResults = {
-            specVersion: '0.3.0',
+            specVersion: PROTOCOL_VERSION,
             ballotId,
             tallies,
             questionTallies,
@@ -1205,7 +1205,7 @@ router.post('/settle/finalize', async (_req, res) => {
         const tallies = buildBackendTallies(ballot, questionTallies, votersByQuestionRole);
 
         const fullResults: FullResults = {
-            specVersion: '0.3.0',
+            specVersion: PROTOCOL_VERSION,
             ballotId,
             tallies,
             questionTallies,
@@ -1558,7 +1558,7 @@ router.post('/settle', async (req, res) => {
         const tallies = buildBackendTallies(ballot, questionTallies, votersByQuestionRole);
 
         const fullResults: FullResults = {
-            specVersion: '0.3.0',
+            specVersion: PROTOCOL_VERSION,
             ballotId,
             tallies,
             questionTallies,
