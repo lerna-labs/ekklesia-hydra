@@ -6,6 +6,7 @@ import { initialize, voterIdToTokenName, CLOSE_TOKEN, VERBOSE, IPFS_STAGING_DIR,
 import { hydraValueToAmounts } from '../tx-builder.js';
 import { getCachedBallot, getCachedBallotId, getCachedBallotIdentity, getCachedResultsAddress } from './lifecycle.js';
 import { BALLOT_INSTANCE_PREFIX, BALLOT_DEFINITION_PREFIX, resolveRole, PROTOCOL_VERSION } from '../types.js';
+import { canonicalBytes } from '@lerna-labs/ekklesia-helpers/json';
 import type {
     BackendGroupTally,
     BackendOptionResult,
@@ -1198,7 +1199,11 @@ router.post('/settle/finalize', async (_req, res) => {
             try {
                 const raw = await fs.readFile(evidencePath, 'utf-8');
                 const evidence = JSON.parse(raw);
-                const fileHash = bytesToHex(blake2b256(JSON.stringify(evidence)));
+                // Re-hash with canonical JSON to match the on-chain voteHash the
+                // producer wrote via `canonicalBytes(evidence)` (F-006). Parsing
+                // then canonicalizing reproduces the producer's hash regardless of
+                // the on-disk byte order.
+                const fileHash = bytesToHex(blake2b256(canonicalBytes(evidence)));
                 if (fileHash === voter.voteHash) {
                     verifiedVoters.push({
                         tokenName: voter.tokenName,
@@ -1565,7 +1570,11 @@ router.post('/settle', async (req, res) => {
             try {
                 const raw = await fs.readFile(evidencePath, 'utf-8');
                 const evidence = JSON.parse(raw);
-                const fileHash = bytesToHex(blake2b256(JSON.stringify(evidence)));
+                // Re-hash with canonical JSON to match the on-chain voteHash the
+                // producer wrote via `canonicalBytes(evidence)` (F-006). Parsing
+                // then canonicalizing reproduces the producer's hash regardless of
+                // the on-disk byte order.
+                const fileHash = bytesToHex(blake2b256(canonicalBytes(evidence)));
                 if (fileHash === voter.voteHash) {
                     verifiedVoters.push(voter);
                     debug(`[settle] Recovered evidence for ${voter.tokenName} v${voter.version} from disk`);
