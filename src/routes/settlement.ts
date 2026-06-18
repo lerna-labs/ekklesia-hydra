@@ -282,7 +282,7 @@ function tallyRange(
  * from it — Hydra emits only the raw counts and leaves the choice of
  * winner-selection method to the consumer.
  */
-function tallyRanked(
+export function tallyRanked(
     answers: VoteSelection[],
     options: BallotOption[] | undefined,
 ): MethodTally {
@@ -294,8 +294,16 @@ function tallyRanked(
     const matrix: number[][] = sortedValues.map(() => sortedValues.map(() => 0));
 
     for (const a of answers) {
-        const ranking = asNumberArray(a.selection);
-        if (!ranking || ranking.length === 0) continue;
+        const raw = asNumberArray(a.selection);
+        if (!raw || raw.length === 0) continue;
+
+        // Dedupe defensively, preserving first-occurrence order. /vote rejects
+        // duplicate rankings at the API boundary, but evidence pinned out-of-band
+        // to IPFS can reach the tally directly. A duplicate would make the
+        // pairwise loop write the diagonal (matrix[i][i] — an option preferring
+        // itself), which is semantically nonsense and corrupts every method
+        // derived from the matrix (Borda, Condorcet, …). (audit finding F-005)
+        const ranking = Array.from(new Set(raw));
 
         firstPrefCounts.set(ranking[0], (firstPrefCounts.get(ranking[0]) ?? 0) + 1);
 
