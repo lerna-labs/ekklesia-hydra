@@ -79,6 +79,26 @@ export const HRP_TO_ROLE: Record<string, string> = {
     stake_test: 'stake',
 };
 
+/**
+ * Resolve a bech32 HRP to its canonical tally role, or `null` if the HRP is not
+ * a recognized voter credential.
+ *
+ * Callers must fail closed on `null` rather than coercing to a default role.
+ * Silently mapping a missing or unrecognized HRP to a real role (the old
+ * `?? 'drep'`) miscounts the role-weighted tally, and trusting an
+ * evidence-supplied `responderRole` (the old `?? evidence.responderRole`) lets
+ * out-of-band evidence pick its own bucket (audit findings F-010/F-011).
+ *
+ * Note there is intentionally no `drep_test` / `calidus_test`: CIP-129 governance
+ * credentials use the `drep` HRP on every network (no testnet variant); only
+ * CIP-19 stake reward addresses are network-tagged, and `stake_test` is already
+ * mapped above.
+ */
+export function resolveRole(hrp: string | undefined | null): string | null {
+    if (!hrp) return null;
+    return HRP_TO_ROLE[hrp] ?? null;
+}
+
 // ---------------------------------------------------------------------------
 // Ballot Definition — (600) token datum, immutable on L1
 // ---------------------------------------------------------------------------

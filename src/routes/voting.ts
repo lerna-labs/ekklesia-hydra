@@ -18,7 +18,7 @@ import {
     enqueueAndWait,
 } from '../helpers.js';
 import {getCachedBallot, getCachedBallotIdentity} from './lifecycle.js';
-import {HRP_TO_ROLE, PROTOCOL_VERSION} from '../types.js';
+import {HRP_TO_ROLE, PROTOCOL_VERSION, resolveRole} from '../types.js';
 import type {
     BallotDefinition,
     CoseWitness,
@@ -547,13 +547,20 @@ async function voteValidateAndPin(input: VotePipelineInput): Promise<VotePipelin
     }
 
     // Build evidence. responderRole is derived from credentialHrp — the client
-    // does not get to pick. Any HRP that reaches this point already passed
-    // CREDENTIAL_PREFIX validation in voterIdToTokenName, so HRP_TO_ROLE is
-    // guaranteed to have a mapping; the fallback is defensive.
+    // does not get to pick. The HRP already passed CREDENTIAL_PREFIX validation
+    // in voterIdToTokenName, so this resolves; fail closed rather than coercing
+    // to a default role if that invariant ever changes (F-010).
+    const responderRole = resolveRole(credentialHrp);
+    if (!responderRole) {
+        throw Object.assign(
+            new Error(`Unrecognized credential HRP "${credentialHrp}"`),
+            { statusCode: 400, code: 'INVALID_VOTE' as const },
+        );
+    }
     const evidence: VoteEvidence = {
         specVersion: PROTOCOL_VERSION,
         surveyTxId: ballotId,
-        responderRole: HRP_TO_ROLE[credentialHrp] ?? 'drep',
+        responderRole,
         answers: votes,
         ekklesia: {
             voterId,

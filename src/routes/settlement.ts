@@ -5,7 +5,7 @@ import type { FileLeaf } from '@lerna-labs/hydra-proof';
 import { initialize, voterIdToTokenName, CLOSE_TOKEN, VERBOSE, IPFS_STAGING_DIR, ipfs, voteCache, success, error, debug, hydraMonitor, getHeadId, txQueue, enqueueAndWait, driveHeadToFinal, mapWithConcurrency, TRP_RESOLVE_CONCURRENCY } from '../helpers.js';
 import { hydraValueToAmounts } from '../tx-builder.js';
 import { getCachedBallot, getCachedBallotId, getCachedBallotIdentity, getCachedResultsAddress } from './lifecycle.js';
-import { BALLOT_INSTANCE_PREFIX, BALLOT_DEFINITION_PREFIX, HRP_TO_ROLE, PROTOCOL_VERSION } from '../types.js';
+import { BALLOT_INSTANCE_PREFIX, BALLOT_DEFINITION_PREFIX, resolveRole, PROTOCOL_VERSION } from '../types.js';
 import type {
     BackendGroupTally,
     BackendOptionResult,
@@ -467,8 +467,10 @@ async function tallyVotes(
     // Count voters per role
     const votersByRole: Record<string, number> = {};
     for (const evidence of evidenceList) {
-        const hrp = evidence.ekklesia?.credentialHrp ?? 'drep';
-        const role = HRP_TO_ROLE[hrp] ?? evidence.responderRole ?? 'Unknown';
+        // Fail closed: an evidence file with a missing or unrecognized
+        // credentialHrp lands in an explicit `unknown` bucket (and `raw`), never
+        // silently in a real role or a self-declared `responderRole` (F-010).
+        const role = resolveRole(evidence.ekklesia?.credentialHrp) ?? 'unknown';
         votersByRole[role] = (votersByRole[role] ?? 0) + 1;
     }
 
@@ -496,8 +498,10 @@ async function tallyVotes(
     }
 
     for (const evidence of evidenceList) {
-        const hrp = evidence.ekklesia?.credentialHrp ?? 'drep';
-        const role = HRP_TO_ROLE[hrp] ?? evidence.responderRole ?? 'Unknown';
+        // Fail closed: an evidence file with a missing or unrecognized
+        // credentialHrp lands in an explicit `unknown` bucket (and `raw`), never
+        // silently in a real role or a self-declared `responderRole` (F-010).
+        const role = resolveRole(evidence.ekklesia?.credentialHrp) ?? 'unknown';
         for (const answer of evidence.answers) {
             const perRoleAnswers = answersByQuestionRole.get(answer.questionId);
             const perRoleAbstain = abstainByQuestionRole.get(answer.questionId);

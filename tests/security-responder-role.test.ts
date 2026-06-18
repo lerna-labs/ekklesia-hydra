@@ -79,10 +79,12 @@ describe('issue #1 — responderRole is derived, not client-supplied', () => {
             expect(source).not.toMatch(/\bresponderRole\??\s*:\s*string/);
         });
 
-        it('derives responderRole from credentialHrp via HRP_TO_ROLE', () => {
+        it('derives responderRole from credentialHrp via resolveRole', () => {
             // The actual fix. Pinned so a future edit that hard-codes "drep"
-            // or accepts a client value will fail this test.
-            expect(source).toMatch(/responderRole:\s*HRP_TO_ROLE\[credentialHrp\]/);
+            // or accepts a client value will fail this test. resolveRole is the
+            // fail-closed resolver introduced for F-010 (returns null on an
+            // unrecognized HRP rather than coercing to a default role).
+            expect(source).toMatch(/responderRole\s*=\s*resolveRole\(credentialHrp\)/);
         });
     });
 });
