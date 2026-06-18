@@ -2,6 +2,7 @@ import {Router} from 'express';
 import {createNativeScript, verifySignature} from '@lerna-labs/hydra-sdk';
 import {resolveNativeScriptHash} from '@meshsdk/core';
 import {blake2b256, bytesToHex} from '@lerna-labs/hydra-proof';
+import {canonicalBytes} from '@lerna-labs/ekklesia-helpers/json';
 import {bech32} from 'bech32';
 import {blake2b} from 'blakejs';
 import {
@@ -536,7 +537,14 @@ async function voteValidateAndPin(input: VotePipelineInput): Promise<VotePipelin
         }
     }
 
-    // Build signed payload + compute hashes
+    // Build signed payload + compute hashes.
+    //
+    // merkleRoot is the value the VOTER SIGNS, so its byte encoding is a fixed
+    // signing contract shared with the backend broker and the wallet client:
+    // plain `JSON.stringify` over `{ ballotId, nonce, votes }` insertion order
+    // (ekklesia-backend/helper/voteBroker.js does the same). It is intentionally
+    // NOT canonicalized — switching it would invalidate every signature produced
+    // against the current contract. Only voteHash (below) moves to canonical JSON.
     const signedPayload: SignedVotePayload = { ballotId, nonce, votes };
     const merkleRoot = bytesToHex(blake2b256(JSON.stringify(signedPayload)));
 
@@ -577,7 +585,13 @@ async function voteValidateAndPin(input: VotePipelineInput): Promise<VotePipelin
         },
     };
 
-    const voteHash = bytesToHex(blake2b256(JSON.stringify(evidence)));
+    // voteHash is the on-chain commitment over the full evidence bundle. It is
+    // hashed over the canonical (RFC-8785) JSON of the evidence so the same
+    // logical bundle always yields the same hash regardless of key order — and
+    // byte-for-byte matches the backend's `blake2b256(canonicalBytes(evidence))`
+    // (ekklesia-backend/helper/voteBroker.js). Was `JSON.stringify(evidence)`
+    // (insertion order), which diverged from the backend (audit finding F-006).
+    const voteHash = bytesToHex(blake2b256(canonicalBytes(evidence)));
 
     // Pin to IPFS
     const { cid: ipfsCid } = await ipfs.pinJson(
