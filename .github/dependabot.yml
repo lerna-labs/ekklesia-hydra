@@ -1,0 +1,55 @@
+# Dependabot version-update configuration.
+#
+# `cooldown` enforces a minimum age on version updates so we never auto-bump to a
+# brand-new release — a guard against zero-day supply-chain compromise in freshly
+# published packages. Packages must be at least 7 days old (majors 14) before
+# Dependabot will open an update PR.
+#
+# Note: Dependabot *security* updates are managed separately (GitHub repo
+# settings) and are intentionally not subject to this cooldown — a published CVE
+# fix should land promptly.
+version: 2
+updates:
+  # --- Node dependencies (package.json / package-lock.json) ---
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+      semver-minor-days: 7
+      semver-patch-days: 7
+    groups:
+      # Batch low-risk minor/patch bumps into a single PR to cut review noise;
+      # majors stay individual so each gets its own (14-day-aged) review.
+      npm-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+    commit-message:
+      prefix: "chore(deps)"
+      prefix-development: "chore(dev-deps)"
+
+  # --- GitHub Actions (.github/workflows/*.yml) ---
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+    commit-message:
+      prefix: "chore(ci)"
+
+  # --- Docker base images (Dockerfile, Dockerfile.dev) ---
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+    commit-message:
+      prefix: "chore(docker)"
