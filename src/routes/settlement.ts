@@ -862,12 +862,17 @@ router.post('/finalize', async (_req, res) => {
             resultsAddress: getCachedResultsAddress() ?? admin_payment_address,
         });
         const signedFinalizeTx = await admin_wallet.signTx(unsignedFinalizeTx);
+        const finalizeId = `finalize:${ballotName}`;
         const { txHash } = await enqueueAndWait({
-            id: `finalize:${ballotName}`,
+            id: finalizeId,
             type: 'finalize',
             unsignedCborHex: unsignedFinalizeTx,
             signedCborHex: signedFinalizeTx,
         });
+        // F-015: block until the finalize datum write is in a confirmed snapshot,
+        // so any subsequent close (e.g. /settle/close) fans out the finalized
+        // (601) datum rather than a stale one.
+        await txQueue.waitForApplied(finalizeId);
 
         await saveFinalizeResponse({
             txHash,
@@ -1308,12 +1313,18 @@ router.post('/settle/finalize', async (_req, res) => {
             resultsAddress: getCachedResultsAddress() ?? admin_payment_address,
         });
         const signedFinalizeTx = await admin_wallet.signTx(unsignedFinalizeTx);
+        const finalizeId = `finalize:${ballotName}`;
         const { txHash: finalizeTxHash } = await enqueueAndWait({
-            id: `finalize:${ballotName}`,
+            id: finalizeId,
             type: 'finalize',
             unsignedCborHex: unsignedFinalizeTx,
             signedCborHex: signedFinalizeTx,
         });
+        // F-015: the finalize datum write must reach a confirmed snapshot before
+        // the head is closed, or Close would post the prior confirmed snapshot to
+        // L1 and fan out a stale (601) BallotResult datum. Block on
+        // SnapshotConfirmed (APPLIED), not merely TxValid (ACCEPTED).
+        await txQueue.waitForApplied(finalizeId);
 
         await saveFinalizeResponse({
             txHash: finalizeTxHash,
@@ -1675,12 +1686,18 @@ router.post('/settle', async (req, res) => {
             resultsAddress: getCachedResultsAddress() ?? admin_payment_address,
         });
         const signedFinalizeTx = await admin_wallet.signTx(unsignedFinalizeTx);
+        const finalizeId = `finalize:${ballotName}`;
         const { txHash: finalizeTxHash } = await enqueueAndWait({
-            id: `finalize:${ballotName}`,
+            id: finalizeId,
             type: 'finalize',
             unsignedCborHex: unsignedFinalizeTx,
             signedCborHex: signedFinalizeTx,
         });
+        // F-015: the finalize datum write must reach a confirmed snapshot before
+        // the head is closed, or Close would post the prior confirmed snapshot to
+        // L1 and fan out a stale (601) BallotResult datum. Block on
+        // SnapshotConfirmed (APPLIED), not merely TxValid (ACCEPTED).
+        await txQueue.waitForApplied(finalizeId);
 
         await saveFinalizeResponse({
             txHash: finalizeTxHash,
