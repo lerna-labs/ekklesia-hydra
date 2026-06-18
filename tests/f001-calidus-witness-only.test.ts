@@ -15,7 +15,7 @@
  * via the hash of different key material regardless of prefix.
  *
  * Resolution: `calidus` is removed as a voter identity entirely (dropped from
- * `CREDENTIAL_PREFIX` and `HRP_TO_ROLE`); `voterIdToTokenName` rejects it. SPOs
+ * `ROLE_TOKEN_TAG` and `HRP_TO_ROLE`); `voterIdToTokenName` rejects it. SPOs
  * vote as the pool with a calidusDeclaration, so one operator can only ever hold
  * one voter token. This intentionally diverges from the audit's `0xa1`
  * recommendation (P71) — see the remediation log.
@@ -24,7 +24,7 @@
 import { describe, it, expect } from 'vitest';
 import { bech32 } from 'bech32';
 import { blake2b } from 'blakejs';
-import { CREDENTIAL_PREFIX, HRP_TO_ROLE } from '../src/types.js';
+import { ROLE_TOKEN_TAG, HRP_TO_ROLE } from '../src/types.js';
 import { voterIdToTokenName } from '../src/helpers.js';
 
 // 28-byte hashes → syntactically valid bech32 ids.
@@ -35,8 +35,8 @@ const calidusId = bech32.encode('calidus', bech32.toWords(calidusKeyHash));
 
 describe('F-001 — calidus is a signing witness, not a voter identity', () => {
     describe('credential maps exclude calidus', () => {
-        it('CREDENTIAL_PREFIX has no calidus entry', () => {
-            expect(CREDENTIAL_PREFIX.calidus).toBeUndefined();
+        it('ROLE_TOKEN_TAG has no calidus entry', () => {
+            expect(ROLE_TOKEN_TAG.calidus).toBeUndefined();
         });
 
         it('HRP_TO_ROLE has no calidus entry', () => {
@@ -44,7 +44,7 @@ describe('F-001 — calidus is a signing witness, not a voter identity', () => {
         });
 
         it('pool stays the canonical SPO identity (0x06)', () => {
-            expect(CREDENTIAL_PREFIX.pool).toBe(0x06);
+            expect(ROLE_TOKEN_TAG.pool).toBe(0x06);
             expect(HRP_TO_ROLE.pool).toBe('pool');
         });
     });

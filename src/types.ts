@@ -31,14 +31,18 @@ export const BALLOT_INSTANCE_PREFIX = '00259a20';
 export const PROTOCOL_VERSION = 'ekklesia/2.0';
 
 // ---------------------------------------------------------------------------
-// Bech32 HRP → Credential Prefix Byte Mapping
+// Bech32 HRP → Voter-Token Role Tag
 // ---------------------------------------------------------------------------
 
 /**
- * Maps bech32 human-readable prefixes to the 1-byte credential prefix
- * used in voter token asset names.
+ * Maps a bech32 voter HRP to the 1-byte tag prepended to its voter-token asset
+ * name. This is an internal Ekklesia role tag, NOT a literal CIP bech32 first
+ * byte — e.g. `stake` and `stake_test` deliberately share `0xe0` because they
+ * are the same tally role (a real CIP-19 mainnet reward address starts `0xe1`,
+ * which is irrelevant here). Renamed from `CREDENTIAL_PREFIX` to make that
+ * explicit (audit finding F-012).
  *
- * Voter token asset name = <prefix byte><blake2b_224(bech32_decoded_data)> (29 bytes)
+ * Voter token asset name = <tag byte><blake2b_224(bech32_decoded_data)> (29 bytes)
  *
  * Only `drep`, `pool`, `stake`, `stake_test` are accepted as voter IDs.
  * Payment-stake composite addresses (addr / addr_test) are intentionally
@@ -54,7 +58,7 @@ export const PROTOCOL_VERSION = 'ekklesia/2.0';
  * the calidus key hash — both tallying as `pool`, i.e. a double vote. The pool
  * ID is the single canonical SPO identity.
  */
-export const CREDENTIAL_PREFIX: Record<string, number> = {
+export const ROLE_TOKEN_TAG: Record<string, number> = {
     drep: 0x22,
     stake: 0xe0,
     stake_test: 0xe0,
@@ -62,7 +66,7 @@ export const CREDENTIAL_PREFIX: Record<string, number> = {
 };
 
 /** All recognized bech32 HRPs for voter identification. */
-export type VoterHrp = keyof typeof CREDENTIAL_PREFIX;
+export type VoterHrp = keyof typeof ROLE_TOKEN_TAG;
 
 /**
  * Map bech32 HRP to tally role. Roles are lowercase and form the canonical

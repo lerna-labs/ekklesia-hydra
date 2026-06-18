@@ -5,7 +5,7 @@ import { deserializeTx } from '@meshsdk/core-cst';
 import { TRPClientLogged as Client } from './trp-client.js';
 import { bech32 } from 'bech32';
 import { blake2b } from 'blakejs';
-import { CREDENTIAL_PREFIX } from './types.js';
+import { ROLE_TOKEN_TAG } from './types.js';
 import type { VoteCacheEntry, VoteHistoryEntry } from './types.js';
 import { TxQueue } from './tx-queue.js';
 import type { TxType } from './tx-queue.js';
@@ -213,9 +213,9 @@ export function voterIdToTokenName(voterId: string): string {
         );
     }
 
-    const prefixByte = CREDENTIAL_PREFIX[hrp];
+    const prefixByte = ROLE_TOKEN_TAG[hrp];
     if (prefixByte === undefined) {
-        const allowed = Object.keys(CREDENTIAL_PREFIX).join(', ');
+        const allowed = Object.keys(ROLE_TOKEN_TAG).join(', ');
         throw new Error(`Unrecognized bech32 prefix: "${hrp}" — voter IDs must use one of: ${allowed}`);
     }
 

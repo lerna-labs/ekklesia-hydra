@@ -547,7 +547,7 @@ async function voteValidateAndPin(input: VotePipelineInput): Promise<VotePipelin
     }
 
     // Build evidence. responderRole is derived from credentialHrp — the client
-    // does not get to pick. The HRP already passed CREDENTIAL_PREFIX validation
+    // does not get to pick. The HRP already passed ROLE_TOKEN_TAG validation
     // in voterIdToTokenName, so this resolves; fail closed rather than coercing
     // to a default role if that invariant ever changes (F-010).
     const responderRole = resolveRole(credentialHrp);
