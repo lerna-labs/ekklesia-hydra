@@ -4,6 +4,7 @@ import { CLOSE_TOKEN, ipfs, voteCache, IPFS_STAGING_DIR, success, error, hydraMo
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import type { BallotDefinition } from '../types.js';
+import { validateBallotDefinition } from '../ballot-validation.js';
 
 const router = Router();
 
@@ -109,8 +110,20 @@ export async function rehydrateBallotSession(): Promise<{
     let ballotFetched = false;
     if (session.ballotIpfsCid) {
         try {
-            cachedBallot = await ipfs.fetchJson<BallotDefinition>(session.ballotIpfsCid);
-            ballotFetched = true;
+            const fetched = await ipfs.fetchJson<BallotDefinition>(session.ballotIpfsCid);
+            const validationError = validateBallotDefinition(fetched);
+            if (validationError) {
+                // A malformed ballot must never be cached — it would feed voting
+                // and the tally with an invalid definition. Leave cachedBallot
+                // null (degraded mode); identity is still restored.
+                console.error(
+                    `[rehydrate] Ballot definition at ${session.ballotIpfsCid} is invalid: ${validationError}. ` +
+                    `NOT cached — re-/start with a valid ballot.`,
+                );
+            } else {
+                cachedBallot = fetched;
+                ballotFetched = true;
+            }
         } catch (err: any) {
             console.warn(
                 `[rehydrate] Could not fetch ballot definition from IPFS (${session.ballotIpfsCid}): ${err?.message ?? err}. ` +
@@ -220,13 +233,44 @@ router.post('/start', async (req, res) => {
     }
 
     try {
-        // If the head is already Open, treat this as a cache-seeding call and
-        // skip both the cache wipe and the open-wait. Recovers a stuck session
-        // (e.g. L1 commit succeeded on the Hydra side after the original
-        // /start timed out client-side) without disturbing any in-head state.
-        const alreadyOpen = hydraMonitor.headStatus === 'OPEN';
+        // /start opens a NEW voting period only. A head that is already OPEN is
+        // never re-seeded: silently re-seeding a running head let a second /start
+        // overwrite the cached ballot identity (the ballotid-clobbered-on-reseed
+        // bug, which corrupted the settled (601) ballotId in production — and
+        // poisoned the persisted session too). Read current state via
+        // GET /head-info / GET /ballot; the in-memory cache is restored from disk
+        // on restart, so a re-seed path is no longer needed for recovery.
+        if (hydraMonitor.headStatus === 'OPEN') {
+            return error(
+                res,
+                'CONFLICT',
+                'Head is already OPEN — /start opens a new voting period and will not re-seed a running head. Use GET /head-info and GET /ballot to read current state.',
+                409,
+            );
+        }
 
-        if (!alreadyOpen) {
+        // Fetch + validate the ballot up front. If a ballot CID was provided it
+        // MUST fetch and pass validation BEFORE we wipe any prior session state
+        // or open a head — Ekklesia never opens a head for a missing or malformed
+        // ballot (the same gate /prepare applies before minting). On failure we
+        // return without opening; the staging directory and any prior session are
+        // left untouched.
+        let fetchedBallot: BallotDefinition | null = null;
+        if (ballotIpfsCid) {
+            try {
+                fetchedBallot = await ipfs.fetchJson<BallotDefinition>(ballotIpfsCid);
+            } catch (fetchErr: any) {
+                return error(res, 'IPFS_UNAVAILABLE', `Could not fetch ballot definition from IPFS (${ballotIpfsCid}): ${fetchErr?.message ?? fetchErr}. Refusing to /start.`, 503);
+            }
+            const validationError = validateBallotDefinition(fetchedBallot);
+            if (validationError) {
+                return error(res, 'INVALID_INPUT', `Ballot definition at ${ballotIpfsCid} is invalid: ${validationError}. Refusing to /start.`, 400);
+            }
+        }
+
+        // Fresh-open path — an already-OPEN head was rejected above. The block
+        // scope keeps the prior session-wipe + open-wait grouped together.
+        {
             // Refuse to open a new head while a finalized head's artifacts are
             // still sitting in the staging directory. Once `finalize-response.json`
             // exists the staging directory holds the complete, audit-grade
@@ -286,19 +330,14 @@ router.post('/start', async (req, res) => {
             // The SDK fetches UTxO details from Blockfrost and builds the commit
             // automatically for single-UTxO commits (no blueprint needed).
             await wrangler.waitForHeadOpen({ utxos }, 600000); // 10 min — init + L1 commit can be slow
-        } else {
-            console.log('/start called against an already-Open head — seeding identity/ballot cache without wiping existing state.');
         }
 
-        // Cache the ballot definition from IPFS if CID was provided
-        if (ballotIpfsCid) {
-            cachedBallotIpfsCid = ballotIpfsCid;
-            try {
-                cachedBallot = await ipfs.fetchJson<BallotDefinition>(ballotIpfsCid);
-                console.log(`Ballot definition cached from IPFS: ${ballotIpfsCid}`);
-            } catch (fetchErr: any) {
-                console.warn(`Warning: Could not fetch ballot from IPFS (${ballotIpfsCid}):`, fetchErr.message);
-            }
+        // Cache the ballot definition that was fetched and validated up front
+        // (before the head opened). Guaranteed present + valid when a CID was given.
+        if (fetchedBallot) {
+            cachedBallotIpfsCid = ballotIpfsCid!;
+            cachedBallot = fetchedBallot;
+            console.log(`Ballot definition cached from IPFS: ${ballotIpfsCid}`);
         }
 
         // Cache ballot identity for voting + settlement routes
@@ -341,7 +380,9 @@ router.post('/start', async (req, res) => {
         return success(res, {
             ballotCached: cachedBallot !== null,
             ballotId: cachedBallotId,
-            alreadyOpen,
+            // Retained for response-shape compatibility; always false now that
+            // /start rejects an already-OPEN head rather than re-seeding it.
+            alreadyOpen: false,
         });
     } catch (err: any) {
         console.error('Failed to start head:', err);

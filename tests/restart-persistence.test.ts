@@ -67,7 +67,11 @@ const SAMPLE_SESSION = {
 const SAMPLE_BALLOT_DEFINITION = {
     title: 'Test Ballot',
     namespace: 'vote.test.restart',
-    questions: [],
+    // A valid question — rehydrate now validates the fetched ballot and will not
+    // cache a malformed one (e.g. empty questions), so the fixture must be valid.
+    questions: [
+        { questionId: 'q1', method: 'single-choice', options: [{ label: 'A', value: 0 }, { label: 'B', value: 1 }] },
+    ],
 } as any;
 
 async function writeSessionFile(payload: unknown): Promise<void> {
