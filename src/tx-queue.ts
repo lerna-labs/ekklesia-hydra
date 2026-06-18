@@ -62,6 +62,8 @@ export interface TxQueueEvents {
     failed: (data: { id: string; error: string }) => void;
     /** Entry reached CONFIRMED state (SnapshotConfirmed). */
     confirmed: (data: { id: string; txHash: string }) => void;
+    /** Entry reached APPLIED state — its tx is in a confirmed head snapshot. */
+    applied: (data: { id: string; txHash: string }) => void;
     /** New entry enqueued in BUILT state — signals worker to check for work. */
     enqueued: (data: { id: string }) => void;
 }
@@ -135,7 +137,11 @@ export class TxQueue extends EventEmitter {
         await this.updateState(id, 'CONFIRMED');
         if (entry) this.emit('confirmed', { id, txHash: entry.txHash });
     }
-    async markApplied(id: string): Promise<void> { await this.updateState(id, 'APPLIED'); }
+    async markApplied(id: string): Promise<void> {
+        const entry = this.entries.get(id);
+        await this.updateState(id, 'APPLIED');
+        if (entry) this.emit('applied', { id, txHash: entry.txHash });
+    }
     async markFailed(id: string, error: string): Promise<void> {
         await this.updateState(id, 'FAILED', { error });
         this.emit('failed', { id, error });
@@ -194,6 +200,54 @@ export class TxQueue extends EventEmitter {
             };
 
             this.on('accepted', onAccepted);
+            this.on('failed', onFailed);
+        });
+    }
+
+    /**
+     * Wait for an entry to reach APPLIED state — i.e. its tx is in a confirmed
+     * head snapshot (SnapshotConfirmed), not merely seen (TxValid). Resolves with
+     * txHash. Rejects on FAILED or timeout.
+     *
+     * Settlement uses this so a finalize tx is provably in a confirmed snapshot
+     * before the head is closed; otherwise Close would post the prior confirmed
+     * snapshot to L1 and fan out a stale (601) BallotResult datum (audit F-015).
+     */
+    waitForApplied(id: string, timeoutMs = 120_000): Promise<{ txHash: string }> {
+        const entry = this.entries.get(id);
+        if (entry?.state === 'APPLIED') {
+            return Promise.resolve({ txHash: entry.txHash });
+        }
+        if (entry?.state === 'FAILED') {
+            return Promise.reject(new Error(entry.error ?? 'Transaction failed'));
+        }
+
+        return new Promise((resolve, reject) => {
+            let settled = false;
+            const cleanup = () => {
+                this.removeListener('applied', onApplied);
+                this.removeListener('failed', onFailed);
+            };
+            const settle = (fn: Function, value: any) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                cleanup();
+                fn(value);
+            };
+
+            const timer = setTimeout(() => {
+                settle(reject, new Error(`Timeout waiting for SnapshotConfirmed on entry ${id}`));
+            }, timeoutMs);
+
+            const onApplied = (data: { id: string; txHash: string }) => {
+                if (data.id === id) settle(resolve, { txHash: data.txHash });
+            };
+            const onFailed = (data: { id: string; error: string }) => {
+                if (data.id === id) settle(reject, new Error(data.error));
+            };
+
+            this.on('applied', onApplied);
             this.on('failed', onFailed);
         });
     }
