@@ -201,9 +201,26 @@ function asEntryArray(s: VoteSelection['selection']): SelectionEntry[] | null {
         : null;
 }
 
-/** Enumerate every integer grid position in [min, max] at `step`. */
-function gridValues(grid: { min: number; max: number; step?: number }): number[] {
+/**
+ * Enumerate every integer grid position in [min, max] at `step`.
+ *
+ * Fail-closed against a malformed grid. `/prepare` validates grids (validateGrid
+ * in ballot.ts), but a ballot fetched from IPFS at /start is trusted as-is, so a
+ * malformed grid could reach the tally here. A non-positive `step` would make the
+ * loop below never terminate (an unbounded array → finalize hangs); reject such
+ * grids loudly instead (audit F-003).
+ */
+export function gridValues(grid: { min: number; max: number; step?: number }): number[] {
     const step = grid.step ?? 1;
+    if (
+        !Number.isInteger(grid.min) || !Number.isInteger(grid.max) || !Number.isInteger(step) ||
+        step <= 0 || grid.max < grid.min || (grid.max - grid.min) % step !== 0
+    ) {
+        throw new Error(
+            `Invalid grid spec {min:${grid.min}, max:${grid.max}, step:${step}} — ` +
+            `min/max/step must be integers with step > 0, max >= min, and (max - min) divisible by step`,
+        );
+    }
     const values: number[] = [];
     for (let v = grid.min; v <= grid.max; v += step) values.push(v);
     return values;
