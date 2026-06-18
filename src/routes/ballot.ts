@@ -8,7 +8,7 @@ import {checkBallotModifiable, error, HYDRA_NETWORK, hydraMonitor, ipfs, success
 import {getCachedResultsAddress} from './lifecycle.js';
 import {toBallotSurveyDetails} from '../cip179.js';
 import type {BallotDefinition, BallotQuestion} from '../types.js';
-import {BALLOT_DEFINITION_PREFIX, BALLOT_INSTANCE_PREFIX, CREDENTIAL_PREFIX, buildAssetName} from '../types.js';
+import {BALLOT_DEFINITION_PREFIX, BALLOT_INSTANCE_PREFIX, ROLE_TOKEN_TAG, buildAssetName} from '../types.js';
 
 /** Roles permitted in ballot.roleWeighting. Matches the HRP_TO_ROLE range. */
 const ALLOWED_ROLES = new Set(['drep', 'pool', 'stake']);
@@ -101,7 +101,7 @@ function validateBallotDefinition(ballot: BallotDefinition): string | null {
     // acceptedCredentials must reference bech32 HRPs Hydra recognizes.
     const accepted = ballot.ekklesia?.acceptedCredentials;
     if (accepted && Array.isArray(accepted)) {
-        const allowedHrps = new Set(Object.keys(CREDENTIAL_PREFIX));
+        const allowedHrps = new Set(Object.keys(ROLE_TOKEN_TAG));
         for (const hrp of accepted) {
             if (!allowedHrps.has(hrp)) {
                 return `ekklesia.acceptedCredentials contains unrecognized HRP "${hrp}" — allowed: ${Array.from(allowedHrps).join(', ')}`;
