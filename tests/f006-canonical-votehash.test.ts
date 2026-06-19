@@ -11,10 +11,10 @@
  * helper the backend uses (ekklesia-helpers/json), so the same logical bundle
  * always yields the same hash regardless of key order.
  *
- * The merkleRoot is deliberately NOT canonicalized: it is the value the voter
- * signs, on a fixed `JSON.stringify` insertion-order contract shared with the
- * backend broker and wallet client. Canonicalizing it would invalidate
- * signatures, so this test pins that it stays as-is.
+ * (The merkleRoot was later ALSO moved to canonical bytes for cross-interface
+ * reproducibility — see canonical-signing-payload.test.ts. The guard below now
+ * pins that voteHash uses canonical bytes; the merkleRoot contract is covered in
+ * that dedicated test.)
  */
 
 import { describe, it, expect } from 'vitest';
@@ -59,7 +59,7 @@ describe('F-006 — canonical voteHash', () => {
         });
     });
 
-    describe('structural guard — producer + verifier use canonical bytes; merkleRoot does not', () => {
+    describe('structural guard — voteHash producer + verifier use canonical bytes', () => {
         const voting = readFileSync(resolve(here, '../src/routes/voting.ts'), 'utf-8')
             .replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
         const settlement = readFileSync(resolve(here, '../src/routes/settlement.ts'), 'utf-8')
@@ -67,10 +67,6 @@ describe('F-006 — canonical voteHash', () => {
 
         it('voting.ts computes voteHash over canonicalBytes(evidence)', () => {
             expect(voting).toMatch(/voteHash = bytesToHex\(blake2b256\(canonicalBytes\(evidence\)\)\)/);
-        });
-
-        it('voting.ts keeps merkleRoot on JSON.stringify (signed contract — not canonicalized)', () => {
-            expect(voting).toMatch(/merkleRoot = bytesToHex\(blake2b256\(JSON\.stringify\(signedPayload\)\)\)/);
         });
 
         it('settlement.ts verifier re-hashes evidence with canonicalBytes (matches producer)', () => {

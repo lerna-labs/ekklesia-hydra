@@ -549,14 +549,21 @@ async function voteValidateAndPin(input: VotePipelineInput): Promise<VotePipelin
 
     // Build signed payload + compute hashes.
     //
-    // merkleRoot is the value the VOTER SIGNS, so its byte encoding is a fixed
-    // signing contract shared with the backend broker and the wallet client:
-    // plain `JSON.stringify` over `{ ballotId, nonce, votes }` insertion order
-    // (ekklesia-backend/helper/voteBroker.js does the same). It is intentionally
-    // NOT canonicalized — switching it would invalidate every signature produced
-    // against the current contract. Only voteHash (below) moves to canonical JSON.
+    // merkleRoot is the value the VOTER SIGNS. It is hashed over the canonical
+    // (RFC-8785) JSON of `{ ballotId, nonce, votes }` so that any interface which
+    // builds the same logical vote produces the same merkleRoot regardless of key
+    // order — the backend broker signs the same canonical bytes
+    // (ekklesia-backend/helper/voteBroker.js). This doubles as verifier
+    // robustness: a third-party client may submit the votes in any key order and
+    // we still recompute the merkleRoot the client signed (the SDK only string-
+    // compares the COSE payload to this value; it does not see the payload, so no
+    // SDK change is needed). Common `{questionId, selection}` votes are already
+    // alphabetical, so their canonical merkleRoot equals the old JSON.stringify
+    // value — backwards-safe; only non-alphabetical shapes (e.g. abstain) reorder.
+    // Supersedes F-006's "do not canonicalize merkleRoot" note — see TRD
+    // HYDRA_CANONICAL_SIGNING_PAYLOAD; flagged for auditor sync.
     const signedPayload: SignedVotePayload = { ballotId, nonce, votes };
-    const merkleRoot = bytesToHex(blake2b256(JSON.stringify(signedPayload)));
+    const merkleRoot = bytesToHex(blake2b256(canonicalBytes(signedPayload)));
 
     // Verify signature(s)
     const { error: sigError, witnesses } = verifyVoteSignatures(merkleRoot, voterId, signature);
