@@ -25,6 +25,8 @@
     "test:load": "vitest run tests/load.test.ts"
   },
   "dependencies": {
+    "@emurgo/cardano-message-signing-nodejs": "^1.1.0",
+    "@emurgo/cardano-serialization-lib-nodejs": "^15.0.3",
     "@lerna-labs/ekklesia-helpers": "^1.1.0",
     "@lerna-labs/hydra-proof": "^1.0.0-beta.1",
     "@lerna-labs/hydra-sdk": "^1.0.0-beta.29",
