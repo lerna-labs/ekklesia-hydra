@@ -3,6 +3,7 @@ import {createNativeScript, verifySignature} from '@lerna-labs/hydra-sdk';
 import {resolveNativeScriptHash} from '@meshsdk/core';
 import {blake2b256, bytesToHex} from '@lerna-labs/hydra-proof';
 import {canonicalBytes} from '@lerna-labs/ekklesia-helpers/json';
+import {verifyCoseSignature} from '../cose-verify.js';
 import {bech32} from 'bech32';
 import {blake2b} from 'blakejs';
 import {
@@ -324,27 +325,31 @@ function verifyScriptWitness(
     witness: CoseWitness,
 ): { error: string | null; pubKeyHex: string } {
     try {
-        // Use the SDK's verifySignature with a dummy address — we only care
-        // about the Ed25519 signature and message match, not address match.
-        // The SDK returns pubKeyHex regardless of address match.
-        // We pass the voterId but ignore isValid — instead check the components.
-        const result = verifySignature(
+        // Verify the Ed25519 signature AND that it signed this vote's merkleRoot.
+        // Address match is intentionally skipped — the credential is a script
+        // hash, not this key. The key's membership in the script is checked
+        // separately by satisfiesScript. Previously this only checked that a
+        // public key could be extracted (which the SDK returns whenever the COSE
+        // merely parses), so an invalid or wrong-message witness was accepted —
+        // collapsing an M-of-N multisig DRep. (Critical: script witnesses never
+        // verified.)
+        const { validates, messageMatches, pubKeyHex } = verifyCoseSignature(
             witness.coseSign1Hex,
             merkleRoot,
-            // Dummy — we can't match a script address to a key hash
-            'addr_test1qz2fxv2umyhttkxyxp8x0dlpdt3k6cwng5pxj3jhsydzer3jcu5d8ps7zex2k2xt3uqxgjqnnj83ws8lhrn648jjxtwq2ytjqp',
             witness.coseKeyHex,
         );
 
-        // The SDK verifies: validates (Ed25519) && message_matches && address_matches
-        // For scripts, address_matches will be false, so isValid is false.
-        // But pubKeyHex is still populated if the COSE parsing succeeded
-        // and the Ed25519 signature was verified against the payload.
-        if (!result.pubKeyHex) {
+        if (!pubKeyHex) {
             return { error: 'Could not extract public key from COSE witness', pubKeyHex: '' };
         }
+        if (!validates || !messageMatches) {
+            return {
+                error: `Script witness signature did not verify (validates=${validates}, messageMatches=${messageMatches})`,
+                pubKeyHex: '',
+            };
+        }
 
-        return { error: null, pubKeyHex: result.pubKeyHex };
+        return { error: null, pubKeyHex };
     } catch (err: any) {
         return { error: `Script witness verification error: ${err.message}`, pubKeyHex: '' };
     }
@@ -394,7 +399,7 @@ function satisfiesScript(script: NativeScriptDef, providedKeyHashes: Set<string>
  *
  * Returns { error, witnesses } — error is null on success.
  */
-function verifyVoteSignatures(
+export function verifyVoteSignatures(
     merkleRoot: string,
     voterId: string,
     sig: VoteSignatureData,
@@ -465,22 +470,27 @@ function verifyVoteSignatures(
             signature: sig.signature ?? '',
         };
 
-        // For calidus votes, the signing key is a hot key that won't match the
-        // pool voter ID. Verify Ed25519 + message match only, skip address match.
+        // For calidus votes, the signing key is a pool hot key that won't match
+        // the pool voter ID, so skip the address check — but the Ed25519
+        // signature and message match MUST still hold. (Previously this only
+        // checked that a public key could be extracted, so a calidus vote with an
+        // invalid or wrong-message signature was accepted.)
         if (sig.calidusDeclaration) {
             try {
-                const result = verifySignature(
+                const { validates, messageMatches, pubKeyHex } = verifyCoseSignature(
                     witness.coseSign1Hex,
                     merkleRoot,
-                    voterId,
                     witness.coseKeyHex,
                 );
-                // isValid will be false (address mismatch) but we check sigMeta/pubKeyHex
-                // to confirm the Ed25519 signature and message are valid.
-                if (!result.pubKeyHex) {
+                if (!pubKeyHex) {
                     return { error: 'Could not extract public key from COSE witness', witnesses: [] };
                 }
-                // pubKeyHex populated = Ed25519 sig valid + message matches
+                if (!validates || !messageMatches) {
+                    return {
+                        error: `Calidus signature did not verify (validates=${validates}, messageMatches=${messageMatches})`,
+                        witnesses: [],
+                    };
+                }
                 return { error: null, witnesses: [witness] };
             } catch (err: any) {
                 return { error: `Signature verification error: ${err.message}`, witnesses: [] };
