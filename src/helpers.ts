@@ -33,6 +33,61 @@ export const TRP_RESOLVE_CONCURRENCY = Math.max(
     parseInt(process.env.TRP_RESOLVE_CONCURRENCY || '12', 10),
 );
 
+// ---------------------------------------------------------------------------
+// Hydra v2 (ADR-33) head-open + deposit timing
+// ---------------------------------------------------------------------------
+//
+// Under Hydra v2 a head opens with an EMPTY UTxO set; the (601) ballot token
+// is added afterwards as a signed deposit/increment that the node only pulls
+// into the head once it has matured for `--deposit-period`. `/start` kicks the
+// deposit off in the background and returns immediately (202); the background
+// task waits for `CommitFinalized` and then confirms the (601) is actually
+// spendable in the head's confirmed ledger before flipping the ballot READY.
+// The finalize wait is sized from the node's live `deposit-period` plus a
+// buffer for L1 deposit-observation latency, so it must exceed
+// `deposit-period` + that latency for the target network:
+//
+//   preprod (deposit-period 120s):  defaults below are ample
+//   mainnet (deposit-period 3600s): the derived wait scales automatically;
+//                                   raise DEPOSIT_FINALIZE_TIMEOUT_OVERRIDE_MS
+//                                   only if the measured L1 latency demands it
+//
+/** How long `/start` waits for the head to reach Open after sending Init. */
+export const HEAD_OPEN_TIMEOUT_MS = parseInt(process.env.HEAD_OPEN_TIMEOUT_MS || '180000', 10);
+/**
+ * Fallback per-attempt wait for a deposit to reach CommitFinalized, used only
+ * when the node's live `deposit-period` is not yet known. Normally the timeout
+ * is derived dynamically as `deposit-period + DEPOSIT_FINALIZE_BUFFER_MS`.
+ *
+ * Defaults to the mainnet `deposit-period` (3600s / 1h) so a node that hasn't
+ * reported its period yet is assumed to be on the slowest realistic setting —
+ * erring toward a longer wait, never a premature FAILED. When the period IS
+ * known (the common case) the derived path scales the wait to the live value.
+ */
+export const DEPOSIT_FINALIZE_TIMEOUT_MS = parseInt(process.env.DEPOSIT_FINALIZE_TIMEOUT_MS || '3600000', 10);
+/**
+ * Explicit operator override for the finalize wait. When > 0 it wins over the
+ * derived `deposit-period + buffer` path — an interim escape hatch for setups
+ * whose true L1 deposit-observation latency exceeds the derived budget (see the
+ * measured ~5 min latency on Dolos-backed preprod). `0` (default) = disabled.
+ */
+export const DEPOSIT_FINALIZE_TIMEOUT_OVERRIDE_MS = parseInt(process.env.DEPOSIT_FINALIZE_TIMEOUT_OVERRIDE_MS || '0', 10);
+/** Buffer added to the node's deposit-period for L1 confirmation when sizing the finalize wait. */
+export const DEPOSIT_FINALIZE_BUFFER_MS = parseInt(process.env.DEPOSIT_FINALIZE_BUFFER_MS || '180000', 10);
+/**
+ * After `CommitFinalized`, how long to poll the CONFIRMED snapshot for the
+ * (601) to become spendable before declaring the deposit FAILED. CommitFinalized
+ * is necessary but not sufficient — the increment may lag into the confirmed
+ * ledger, and READY must mean "a /vote will resolve its gas input".
+ */
+export const DEPOSIT_CONFIRM_TIMEOUT_MS = parseInt(process.env.DEPOSIT_CONFIRM_TIMEOUT_MS || '180000', 10);
+/** Poll interval while confirming the (601) is spendable in the confirmed ledger. */
+export const DEPOSIT_CONFIRM_POLL_INTERVAL_MS = parseInt(process.env.DEPOSIT_CONFIRM_POLL_INTERVAL_MS || '5000', 10);
+/** Re-draft attempts on a transient stale-input L1 submit error. */
+export const DEPOSIT_SUBMIT_RETRIES = parseInt(process.env.DEPOSIT_SUBMIT_RETRIES || '3', 10);
+/** Delay before re-drafting a deposit (lets the node re-sync its chain view). */
+export const DEPOSIT_SUBMIT_RETRY_DELAY_MS = parseInt(process.env.DEPOSIT_SUBMIT_RETRY_DELAY_MS || '8000', 10);
+
 /** Log only when VERBOSE mode is enabled. Errors always log regardless. */
 export function debug(...args: unknown[]): void {
     if (VERBOSE) console.log(...args);
@@ -382,10 +437,10 @@ export function error(res: Response, code: ErrorCode, message: string, statusCod
  * mutated under us.
  *
  * `Unknown`, `Idle`, and `Final` are considered safe: pre-init or fully
- * settled. Anything else is active.
+ * settled. Anything else is active. (Hydra v2 / ADR-33 dropped the
+ * `INITIALIZING` state — heads transition Idle → Open directly.)
  */
 const ACTIVE_HEAD_STATES = new Set([
-    'INITIALIZING',
     'OPEN',
     'CLOSED',
     'FANOUT_POSSIBLE',
@@ -442,7 +497,7 @@ export function checkBallotModifiable(args: ModifyCheckArgs): ModifyCheckResult 
  * FANOUT_POSSIBLE. Safe to re-invoke after a transient error.
  *
  * Fails fast (instead of hanging 10 minutes on waitForStatus) when:
- *   - the head is in a non-closeable state (IDLE / INITIALIZING / UNKNOWN)
+ *   - the head is in a non-closeable state (IDLE / UNKNOWN)
  *   - Hydra responds CommandFailed to the Close or Fanout command we send
  *
  * Replaces the per-route close ladder that used to live in /close,

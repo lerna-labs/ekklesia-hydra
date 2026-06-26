@@ -29,7 +29,7 @@
     "@emurgo/cardano-serialization-lib-nodejs": "^15.0.3",
     "@lerna-labs/ekklesia-helpers": "^1.1.0",
     "@lerna-labs/hydra-proof": "^1.0.0-beta.1",
-    "@lerna-labs/hydra-sdk": "^1.0.0-beta.29",
+    "@lerna-labs/hydra-sdk": "^2.0.0-beta.1",
     "@meshsdk/core": "^1.9.0-beta.83",
     "bech32": "^2.0.0",
     "dotenv": "^16.4.5",

@@ -19,7 +19,7 @@ import {
     debug,
     enqueueAndWait,
 } from '../helpers.js';
-import {getCachedBallot, getCachedBallotIdentity} from './lifecycle.js';
+import {getCachedBallot, getCachedBallotIdentity, getDepositStatus} from './lifecycle.js';
 import {HRP_TO_ROLE, PROTOCOL_VERSION, resolveRole} from '../types.js';
 import type {
     BallotDefinition,
@@ -701,6 +701,15 @@ router.post('/register', async (req, res) => {
         return error(res, 'INVALID_VOTER_ID', `Invalid voter ID: ${e.message}`, 400);
     }
 
+    // Hydra v2: voting is only allowed once the (601) deposit has finalized
+    // into the head. Until then the ballot token isn't in the L2 ledger.
+    {
+        const depositStatus = getDepositStatus();
+        if (depositStatus !== 'READY') {
+            return error(res, 'CONFLICT', `Ballot not active yet — (601) deposit status is ${depositStatus ?? 'NONE'}. The ballot token is still being deposited into the head; poll GET /health until ballotActive is true.`, 409);
+        }
+    }
+
     // Reject voters whose credential type isn't permitted by the ballot.
     const ballot = getCachedBallot();
     if (ballot) {
@@ -842,6 +851,15 @@ router.post('/vote', async (req, res) => {
         credentialHrp = voterIdHrp(voterId);
     } catch (e: any) {
         return error(res, 'INVALID_VOTER_ID', `Invalid voter ID: ${e.message}`, 400);
+    }
+
+    // Hydra v2: voting is only allowed once the (601) deposit has finalized
+    // into the head. Until then the ballot token isn't in the L2 ledger.
+    {
+        const depositStatus = getDepositStatus();
+        if (depositStatus !== 'READY') {
+            return error(res, 'CONFLICT', `Ballot not active yet — (601) deposit status is ${depositStatus ?? 'NONE'}. The ballot token is still being deposited into the head; poll GET /health until ballotActive is true.`, 409);
+        }
     }
 
     // Reject voters whose credential type isn't permitted by the ballot.

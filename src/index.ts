@@ -19,7 +19,7 @@ import { HYDRA_NETWORK, VERBOSE, voteCache, hydraMonitor, txQueue, queueWorker }
 
 import auditRoutes from './routes/audit.js';
 import ballotRoutes from './routes/ballot.js';
-import lifecycleRoutes, { rehydrateBallotSession } from './routes/lifecycle.js';
+import lifecycleRoutes, { rehydrateBallotSession, reconcileDepositReadiness } from './routes/lifecycle.js';
 import votingRoutes from './routes/voting.js';
 import settlementRoutes from './routes/settlement.js';
 import queryRoutes from './routes/query.js';
@@ -65,7 +65,7 @@ process.on('SIGINT', async () => {
     process.exit(0);
 });
 
-const port = 3000;
+const port = parseInt(process.env.PORT || '3000', 10);
 
 async function start() {
     // Rehydrate vote cache from disk before accepting requests
@@ -161,6 +161,9 @@ async function start() {
         } catch (err: any) {
             console.warn(`Queue reconciliation failed (continuing): ${err.message}`);
         }
+        // Hydra v2: re-arm/confirm the async ballot-token deposit against the
+        // live head snapshot (READY if the token is already in-head, else wait).
+        await reconcileDepositReadiness();
     }
 
     // Re-reconcile on every monitor reconnect — head may have advanced or restarted.
@@ -171,6 +174,7 @@ async function start() {
             if (result.reconciled > 0 || result.resubmitted > 0) {
                 console.log(`Queue re-reconciled after reconnect: ${result.reconciled} confirmed, ${result.resubmitted} pending`);
             }
+            await reconcileDepositReadiness();
         } catch (err: any) {
             console.warn(`Queue re-reconcile failed: ${err.message}`);
         }

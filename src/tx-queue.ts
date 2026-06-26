@@ -21,11 +21,11 @@ import path from 'node:path';
 
 export type TxState = 'BUILT' | 'SUBMITTED' | 'ACCEPTED' | 'CONFIRMED' | 'APPLIED' | 'FAILED';
 
-export type TxType = 'register' | 'vote-and-register' | 'cast_vote' | 'count_vote' | 'finalize';
+export type TxType = 'register' | 'vote-and-register' | 'cast_vote' | 'count_vote' | 'finalize' | 'prime';
 
 /** Whether a tx type contends on the shared ballot token UTxO. */
 export function isContending(type: TxType): boolean {
-    return type === 'register' || type === 'vote-and-register' || type === 'finalize';
+    return type === 'register' || type === 'vote-and-register' || type === 'finalize' || type === 'prime';
 }
 
 export interface TxQueueEntry {
