@@ -30,3 +30,22 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm audit --omit=dev --audit-level=critical
+
+  changelog:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.base_ref == 'development' &&
+      !contains(github.event.pull_request.labels.*.name, 'skip-changelog')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Require a changeset
+        run: |
+          git fetch origin "${{ github.base_ref }}"
+          changed=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD" -- '.changeset/*.md')
+          if [ -z "$changed" ]; then
+            echo "No changeset found. Run 'npx changeset' to add one, or label this PR 'skip-changelog' if it genuinely doesn't need a changelog entry."
+            exit 1
+          fi

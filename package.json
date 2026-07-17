@@ -23,7 +23,10 @@
     "typecheck": "tsc -p tsconfig.build.json --noEmit",
     "test:unit": "vitest run tests/ --exclude '**/e2e.test.ts' --exclude '**/load.test.ts'",
     "test:e2e": "vitest run tests/e2e.test.ts",
-    "test:load": "vitest run tests/load.test.ts"
+    "test:load": "vitest run tests/load.test.ts",
+    "changeset": "changeset",
+    "changeset:version": "changeset version",
+    "changeset:tag": "node scripts/tag-release.mjs"
   },
   "dependencies": {
     "@emurgo/cardano-message-signing-nodejs": "^1.1.0",
@@ -44,6 +47,7 @@
     "node": ">=22.0.0"
   },
   "devDependencies": {
+    "@changesets/cli": "^2.31.1",
     "@types/express": "^4.17.21",
     "esbuild": "^0.28.1",
     "tsx": "^4.22.4",
