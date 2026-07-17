@@ -6,9 +6,16 @@ name: Release
 # is merged (no pending changesets left), it runs the tag step below instead,
 # which pushes a v<version> tag — that's what the existing GHCR publish
 # workflow (publish.yml) triggers from.
+#
+# Commits, the release PR, and the tag are attributed to the Ekklesia
+# Release Manager GitHub App rather than github-actions[bot].
 on:
   push:
     branches: [main]
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -18,9 +25,31 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/create-github-app-token@v3
+        id: app-token
+        with:
+          app-id: ${{ vars.RELEASE_MANAGER_APP_ID }}
+          private-key: ${{ secrets.RELEASE_MANAGER_APP_PRIVATE_KEY }}
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Refuse to release while still in prerelease mode
+        run: |
+          if [ -f .changeset/pre.json ]; then
+            echo "::error::.changeset/pre.json is still present — this branch is still in Changesets prerelease mode. Run 'npm run changeset:pre:exit', commit, and include it in the staging -> main promotion before releasing."
+            exit 1
+          fi
+
+      - name: Configure git identity for the release bot
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          user_id=$(gh api "/users/${{ steps.app-token.outputs.app-slug }}[bot]" --jq .id)
+          git config --global user.name "${{ steps.app-token.outputs.app-slug }}[bot]"
+          git config --global user.email "${user_id}+${{ steps.app-token.outputs.app-slug }}[bot]@users.noreply.github.com"
 
       - uses: actions/setup-node@v4
         with:
@@ -37,4 +66,4 @@ jobs:
           version: npm run changeset:version
           publish: npm run changeset:tag
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
