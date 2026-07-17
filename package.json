@@ -40,6 +40,9 @@
   "overrides": {
     "libsodium-sumo": "0.7.15"
   },
+  "engines": {
+    "node": ">=22.0.0"
+  },
   "devDependencies": {
     "@types/express": "^4.17.21",
     "esbuild": "^0.27.4",
