@@ -1,0 +1,40 @@
+name: Release
+
+# Runs on every push to main. changesets/action checks for pending changeset
+# files: if there are any, it opens/updates a "Version Packages" PR that
+# bumps package.json and rolls the changesets into CHANGELOG.md. Once that PR
+# is merged (no pending changesets left), it runs the tag step below instead,
+# which pushes a v<version> tag — that's what the existing GHCR publish
+# workflow (publish.yml) triggers from.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Create release PR or tag the release
+        uses: changesets/action@v1
+        with:
+          title: "chore: release"
+          commit: "chore: version packages"
+          version: npm run changeset:version
+          publish: npm run changeset:tag
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
