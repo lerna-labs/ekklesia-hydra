@@ -42,6 +42,16 @@ jobs:
             echo "development and staging have identical trees; nothing to promote."
             exit 0
           fi
+          # Also skip when development already matches the released baseline (main):
+          # everything on development is released, so there is nothing unreleased to
+          # promote. This makes the post-release backports order-independent — a
+          # main -> development backport landing before main -> staging no longer
+          # opens a stray promotion PR.
+          main_tree=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq '.commit.tree.sha')
+          if [ "$head_tree" = "$main_tree" ]; then
+            echo "development matches the released baseline (main); nothing unreleased to promote."
+            exit 0
+          fi
           # Body lists the pending changesets so the accumulator shows what is queued.
           node .github/scripts/promotion-body.mjs staging > pr-body.md
           num=$(gh pr list --repo "$GITHUB_REPOSITORY" --base staging --head development --state open --json number --jq '.[0].number // empty')
