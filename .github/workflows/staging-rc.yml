@@ -108,17 +108,14 @@ jobs:
           client-id: ${{ vars.RELEASE_MANAGER_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_MANAGER_APP_PRIVATE_KEY }}
 
-      - name: Ensure an open staging -> main promotion PR
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Open or refresh the staging -> main promotion PR
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          existing=$(gh pr list --repo "$GITHUB_REPOSITORY" \
-            --base main --head staging --state open \
-            --json number --jq '.[0].number // empty')
-          if [ -n "$existing" ]; then
-            echo "Promotion PR #$existing is already open; GitHub keeps its diff current."
-            exit 0
-          fi
           # Compare content trees, not commit counts (merge-commit asymmetry
           # would otherwise open empty PRs). Identical trees mean nothing to promote.
           base_tree=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq '.commit.tree.sha')
@@ -127,8 +124,13 @@ jobs:
             echo "staging and main have identical trees; nothing to promote."
             exit 0
           fi
-          gh pr create --repo "$GITHUB_REPOSITORY" \
-            --base main --head staging \
-            --title "Promote staging to main" \
-            --body "Accumulator PR. Merging this promotes the tested release candidate into main, where the Release Manager opens a Version Packages PR that cuts the production version and image." \
-            --label promotion
+          # Body lists the pending changesets so the accumulator shows what is queued.
+          node .github/scripts/promotion-body.mjs main > pr-body.md
+          num=$(gh pr list --repo "$GITHUB_REPOSITORY" --base main --head staging --state open --json number --jq '.[0].number // empty')
+          if [ -n "$num" ]; then
+            jq -Rs '{body: .}' pr-body.md | gh api -X PATCH "repos/$GITHUB_REPOSITORY/pulls/$num" --input - >/dev/null
+            echo "Refreshed promotion PR #$num body."
+          else
+            gh pr create --repo "$GITHUB_REPOSITORY" --base main --head staging \
+              --title "Promote staging to main" --body-file pr-body.md --label promotion
+          fi
