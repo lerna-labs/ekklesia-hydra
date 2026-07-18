@@ -2,10 +2,10 @@ name: Publish Docker image to GHCR
 
 on:
   push:
-    branches: [ "main" ]
-    # "!v*-*" excludes prerelease tags (e.g. v1.1.0-rc.1) pushed from staging
-    # by prerelease.yml — those aren't production releases.
-    tags:     [ "v*", "!v*-*" ]
+    # Production image builds only on a version tag (never on a plain push to
+    # main), so a release builds exactly once. "!v*-*" excludes prerelease
+    # tags such as v1.1.0-rc.1.
+    tags: [ "v*", "!v*-*" ]
 
 permissions:
   contents: read
@@ -62,3 +62,21 @@ jobs:
           cache-to:   type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:cache,mode=max
           secrets: |
             npmrc=${{ secrets.NPMRC }}
+
+      - uses: actions/create-github-app-token@v3
+        id: app-token
+        with:
+          app-id: ${{ vars.RELEASE_MANAGER_APP_ID }}
+          private-key: ${{ secrets.RELEASE_MANAGER_APP_PRIVATE_KEY }}
+
+      - name: Create GitHub Release
+        # Attributed to the Release Manager App via its token. Notes are the
+        # CHANGELOG section for this version.
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          notes=$(awk -v v="## ${version}" '$0==v{f=1;next} /^## /{if(f)exit} f' CHANGELOG.md)
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes "${notes:-Release ${GITHUB_REF_NAME}}"
