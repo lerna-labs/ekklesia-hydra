@@ -44,11 +44,21 @@ jobs:
       - name: Compute snapshot RC version
         id: rc
         run: |
-          npx changeset version --snapshot rc
-          echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
-          # Discard the snapshot bump. Nothing is committed to staging; the
-          # changeset files must stay intact for the real release on main.
-          git checkout -- .
+          pending=$(find .changeset -maxdepth 1 -name '*.md' ! -name 'README.md' | head -1)
+          if [ -n "$pending" ]; then
+            npx changeset version --snapshot rc
+            echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+            echo "has_rc=true" >> "$GITHUB_OUTPUT"
+            # Discard the snapshot bump. Nothing is committed to staging; the
+            # changeset files must stay intact for the real release on main.
+            git checkout -- .
+          else
+            # No pending changesets: nothing new to release-candidate. Refresh the
+            # moving staging image but do NOT emit a version tag, which would be
+            # the plain release version and collide with the production tag.
+            echo "has_rc=false" >> "$GITHUB_OUTPUT"
+            echo "No pending changesets; publishing the staging image without a version tag."
+          fi
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -72,7 +82,7 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=${{ steps.rc.outputs.version }}
+            type=raw,value=${{ steps.rc.outputs.version }},enable=${{ steps.rc.outputs.has_rc == 'true' }}
             type=raw,value=staging
             type=sha,format=short,prefix=staging-sha-
 
@@ -109,9 +119,12 @@ jobs:
             echo "Promotion PR #$existing is already open; GitHub keeps its diff current."
             exit 0
           fi
-          ahead=$(gh api "repos/$GITHUB_REPOSITORY/compare/main...staging" --jq '.ahead_by')
-          if [ "$ahead" -eq 0 ]; then
-            echo "staging is not ahead of main; nothing to promote."
+          # Compare content trees, not commit counts (merge-commit asymmetry
+          # would otherwise open empty PRs). Identical trees mean nothing to promote.
+          base_tree=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq '.commit.tree.sha')
+          head_tree=$(gh api "repos/$GITHUB_REPOSITORY/commits/staging" --jq '.commit.tree.sha')
+          if [ "$base_tree" = "$head_tree" ]; then
+            echo "staging and main have identical trees; nothing to promote."
             exit 0
           fi
           gh pr create --repo "$GITHUB_REPOSITORY" \
