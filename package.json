@@ -42,7 +42,9 @@
     "tx3-sdk": "^0.7.0"
   },
   "overrides": {
-    "libsodium-sumo": "0.7.15"
+    "libsodium-sumo": "0.7.15",
+    "path-to-regexp": "0.1.13",
+    "qs": "6.15.3"
   },
   "engines": {
     "node": ">=22.0.0"

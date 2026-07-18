@@ -22,20 +22,17 @@ jobs:
       - uses: actions/create-github-app-token@v3
         id: app-token
         with:
-          app-id: ${{ vars.RELEASE_MANAGER_APP_ID }}
+          client-id: ${{ vars.RELEASE_MANAGER_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_MANAGER_APP_PRIVATE_KEY }}
 
-      - name: Ensure an open development -> staging promotion PR
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Open or refresh the development -> staging promotion PR
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          existing=$(gh pr list --repo "$GITHUB_REPOSITORY" \
-            --base staging --head development --state open \
-            --json number --jq '.[0].number // empty')
-          if [ -n "$existing" ]; then
-            echo "Promotion PR #$existing is already open; GitHub keeps its diff current."
-            exit 0
-          fi
           # Compare content trees, not commit counts. Merge-commit promotions
           # leave each branch with a merge commit the other lacks, so an
           # ahead_by check opens empty PRs; identical trees mean nothing to promote.
@@ -45,8 +42,13 @@ jobs:
             echo "development and staging have identical trees; nothing to promote."
             exit 0
           fi
-          gh pr create --repo "$GITHUB_REPOSITORY" \
-            --base staging --head development \
-            --title "Promote development to staging" \
-            --body "Accumulator PR. Merging this promotes the queued features into staging, which builds a release-candidate image for the preprod testnet. Version bumps are cut later, on main." \
-            --label promotion
+          # Body lists the pending changesets so the accumulator shows what is queued.
+          node .github/scripts/promotion-body.mjs staging > pr-body.md
+          num=$(gh pr list --repo "$GITHUB_REPOSITORY" --base staging --head development --state open --json number --jq '.[0].number // empty')
+          if [ -n "$num" ]; then
+            jq -Rs '{body: .}' pr-body.md | gh api -X PATCH "repos/$GITHUB_REPOSITORY/pulls/$num" --input - >/dev/null
+            echo "Refreshed promotion PR #$num body."
+          else
+            gh pr create --repo "$GITHUB_REPOSITORY" --base staging --head development \
+              --title "Promote development to staging" --body-file pr-body.md --label promotion
+          fi
