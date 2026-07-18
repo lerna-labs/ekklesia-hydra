@@ -44,11 +44,21 @@ jobs:
       - name: Compute snapshot RC version
         id: rc
         run: |
-          npx changeset version --snapshot rc
-          echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
-          # Discard the snapshot bump. Nothing is committed to staging; the
-          # changeset files must stay intact for the real release on main.
-          git checkout -- .
+          pending=$(find .changeset -maxdepth 1 -name '*.md' ! -name 'README.md' | head -1)
+          if [ -n "$pending" ]; then
+            npx changeset version --snapshot rc
+            echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+            echo "has_rc=true" >> "$GITHUB_OUTPUT"
+            # Discard the snapshot bump. Nothing is committed to staging; the
+            # changeset files must stay intact for the real release on main.
+            git checkout -- .
+          else
+            # No pending changesets: nothing new to release-candidate. Refresh the
+            # moving staging image but do NOT emit a version tag, which would be
+            # the plain release version and collide with the production tag.
+            echo "has_rc=false" >> "$GITHUB_OUTPUT"
+            echo "No pending changesets; publishing the staging image without a version tag."
+          fi
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -72,7 +82,7 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=${{ steps.rc.outputs.version }}
+            type=raw,value=${{ steps.rc.outputs.version }},enable=${{ steps.rc.outputs.has_rc == 'true' }}
             type=raw,value=staging
             type=sha,format=short,prefix=staging-sha-
 
