@@ -2,10 +2,10 @@ name: Publish Docker image to GHCR
 
 on:
   push:
-    branches: [ "main" ]
-    # "!v*-*" excludes prerelease tags (e.g. v1.1.0-rc.1) pushed from staging
-    # by prerelease.yml — those aren't production releases.
-    tags:     [ "v*", "!v*-*" ]
+    # Production image builds only on a version tag (never on a plain push to
+    # main), so a release builds exactly once. "!v*-*" excludes prerelease
+    # tags such as v1.1.0-rc.1.
+    tags: [ "v*", "!v*-*" ]
 
 permissions:
   contents: read
