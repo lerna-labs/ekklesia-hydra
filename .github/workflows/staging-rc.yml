@@ -1,0 +1,121 @@
+name: Staging release candidate
+
+# On every push to staging, build and push a release-candidate image to GHCR
+# for the preprod testnet to pull. The RC version is a Changesets snapshot
+# (e.g. 1.2.0-rc-20260718154506) computed from the pending changesets: it
+# reflects the real next version but is ephemeral — nothing is committed to
+# staging, and the changeset files stay intact so the real version bump can
+# happen later on main.
+#
+# This workflow also keeps a single open staging -> main promotion PR alive,
+# the accumulator for the next production release.
+on:
+  push:
+    branches: [staging]
+
+concurrency:
+  group: staging-rc-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+  pull-requests: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: lerna-labs/ekklesia-hydra
+
+jobs:
+  rc-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Compute snapshot RC version
+        id: rc
+        run: |
+          npx changeset version --snapshot rc
+          echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+          # Discard the snapshot bump. Nothing is committed to staging; the
+          # changeset files must stay intact for the real release on main.
+          git checkout -- .
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        # Registry cache export (cache-to type=registry) needs the
+        # docker-container driver this sets up; the default docker driver
+        # cannot export a registry cache.
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata (tags/labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ steps.rc.outputs.version }}
+            type=raw,value=staging
+            type=sha,format=short,prefix=staging-sha-
+
+      - name: Build and push (staging RC)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:staging-cache
+          cache-to:   type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:staging-cache,mode=max
+          secrets: |
+            npmrc=${{ secrets.NPMRC }}
+
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/create-github-app-token@v3
+        id: app-token
+        with:
+          app-id: ${{ vars.RELEASE_MANAGER_APP_ID }}
+          private-key: ${{ secrets.RELEASE_MANAGER_APP_PRIVATE_KEY }}
+
+      - name: Ensure an open staging -> main promotion PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          existing=$(gh pr list --repo "$GITHUB_REPOSITORY" \
+            --base main --head staging --state open \
+            --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            echo "Promotion PR #$existing is already open; GitHub keeps its diff current."
+            exit 0
+          fi
+          ahead=$(gh api "repos/$GITHUB_REPOSITORY/compare/main...staging" --jq '.ahead_by')
+          if [ "$ahead" -eq 0 ]; then
+            echo "staging is not ahead of main; nothing to promote."
+            exit 0
+          fi
+          gh pr create --repo "$GITHUB_REPOSITORY" \
+            --base main --head staging \
+            --title "Promote staging to main" \
+            --body "Accumulator PR. Merging this promotes the tested release candidate into main, where the Release Manager opens a Version Packages PR that cuts the production version and image." \
+            --label promotion

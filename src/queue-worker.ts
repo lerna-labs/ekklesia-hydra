@@ -270,11 +270,16 @@ export class QueueWorker {
         return { reconciled, resubmitted };
     }
 
-    /** Best-effort check if a tx's output exists in the snapshot. */
+    /**
+     * Did this entry's tx land? Reconcile only needs to know whether the tx
+     * produced any still-live output, not which one — our txs create at most two
+     * outputs (voter token + admin change), both under this txHash. A ref is
+     * `txHash#outputIndex`; compare the txHash segment exactly so the match can't
+     * depend on hash length or a shared prefix.
+     */
     private checkEntryInSnapshot(entry: TxQueueEntry, snapshot: Record<string, any>): boolean {
-        // Look for a UTxO produced by this tx (txHash#outputIndex)
         for (const ref of Object.keys(snapshot)) {
-            if (ref.startsWith(entry.txHash + '#')) return true;
+            if (ref.split('#', 1)[0] === entry.txHash) return true;
         }
         return false;
     }

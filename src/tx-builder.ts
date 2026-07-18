@@ -97,6 +97,44 @@ export function hydraValueToAmounts(value: Record<string, any>): Amount[] {
 }
 
 // ---------------------------------------------------------------------------
+// prime_snapshot — self-spend the (601) ballot UTxO back to its own address
+// ---------------------------------------------------------------------------
+//
+// Under Hydra v2 (ADR-33) a head opens empty and the (601) is added as a
+// deposit/increment. That increment lands in the head ledger but does NOT by
+// itself advance a *confirmed* signed snapshot — and the TRP resolves in-head
+// transaction inputs against the confirmed snapshot, so until one is produced
+// the ballot token is invisible to it (`input not resolved: gas`). Spending the
+// (601) back to its own address in a single zero-fee tx produces the next
+// confirmed snapshot carrying the token, after which the TRP resolves
+// register/vote txs normally. The existing inline datum is preserved verbatim
+// (raw CBOR passthrough) so the (601) BallotResult datum is untouched ahead of
+// settlement, and the value (token + gas ADA) is recreated unchanged.
+
+export function buildPrimeSnapshotTx(params: {
+    address: string;
+    inputRef: UtxoRef;
+    inputValue: Amount[];
+    inlineDatumCborHex: string | null;
+}): string {
+    const { address, inputRef, inputValue, inlineDatumCborHex } = params;
+
+    const txBuilder = new MeshTxBuilder({ isHydra: true });
+    txBuilder
+        .txIn(inputRef.txHash, inputRef.outputIndex, inputValue, address)
+        .txOut(address, inputValue);
+    if (inlineDatumCborHex) {
+        // Preserve the (601) datum exactly — raw CBOR passthrough, no re-encode.
+        txBuilder.txOutInlineDatumValue(inlineDatumCborHex, 'CBOR');
+    }
+    txBuilder
+        .setFee('0')
+        .changeAddress(address);
+
+    return txBuilder.completeSync();
+}
+
+// ---------------------------------------------------------------------------
 // cast_vote — update datum on voter's own UTxO (no minting)
 // ---------------------------------------------------------------------------
 

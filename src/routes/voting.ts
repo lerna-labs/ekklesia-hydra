@@ -2,6 +2,8 @@ import {Router} from 'express';
 import {createNativeScript, verifySignature} from '@lerna-labs/hydra-sdk';
 import {resolveNativeScriptHash} from '@meshsdk/core';
 import {blake2b256, bytesToHex} from '@lerna-labs/hydra-proof';
+import {canonicalBytes} from '@lerna-labs/ekklesia-helpers/json';
+import {verifyCoseSignature} from '../cose-verify.js';
 import {bech32} from 'bech32';
 import {blake2b} from 'blakejs';
 import {
@@ -13,11 +15,12 @@ import {
     voteCache,
     voterIdHrp,
     voterIdToTokenName,
+    extractScriptCredentialHash,
     debug,
     enqueueAndWait,
 } from '../helpers.js';
-import {getCachedBallot, getCachedBallotIdentity} from './lifecycle.js';
-import {HRP_TO_ROLE} from '../types.js';
+import {getCachedBallot, getCachedBallotIdentity, getDepositStatus} from './lifecycle.js';
+import {HRP_TO_ROLE, PROTOCOL_VERSION, resolveRole} from '../types.js';
 import type {
     BallotDefinition,
     CoseWitness,
@@ -58,6 +61,37 @@ function isOnGrid(v: number, min: number, max: number, step: number): boolean {
     if (!Number.isInteger(v)) return false;
     if (v < min || v > max) return false;
     return (v - min) % step === 0;
+}
+
+/**
+ * Check that a voter's bech32 HRP is permitted by the ballot.
+ *
+ * Source of truth (in priority order):
+ *   1. ballot.ekklesia.acceptedCredentials — explicit HRP allowlist
+ *   2. ballot.roleWeighting keys — mapped to HRPs via HRP_TO_ROLE
+ *
+ * Ballots with neither populated are treated as open (no gate), preserving
+ * behavior for ballots authored before this check existed. Returns null on
+ * success or a human-readable error string on rejection.
+ */
+function checkVoterEligibility(credentialHrp: string, ballot: BallotDefinition): string | null {
+    const accepted = ballot.ekklesia?.acceptedCredentials;
+    if (Array.isArray(accepted) && accepted.length > 0) {
+        if (!accepted.includes(credentialHrp)) {
+            return `Voter credential "${credentialHrp}" is not accepted by this ballot (acceptedCredentials: ${accepted.join(', ')})`;
+        }
+        return null;
+    }
+
+    const declaredRoles = ballot.roleWeighting ? Object.keys(ballot.roleWeighting) : [];
+    if (declaredRoles.length > 0) {
+        const role = HRP_TO_ROLE[credentialHrp];
+        if (!role || !declaredRoles.includes(role)) {
+            return `Voter role "${role ?? credentialHrp}" is not declared in ballot.roleWeighting (${declaredRoles.join(', ')})`;
+        }
+    }
+
+    return null;
 }
 
 /**
@@ -291,27 +325,31 @@ function verifyScriptWitness(
     witness: CoseWitness,
 ): { error: string | null; pubKeyHex: string } {
     try {
-        // Use the SDK's verifySignature with a dummy address — we only care
-        // about the Ed25519 signature and message match, not address match.
-        // The SDK returns pubKeyHex regardless of address match.
-        // We pass the voterId but ignore isValid — instead check the components.
-        const result = verifySignature(
+        // Verify the Ed25519 signature AND that it signed this vote's merkleRoot.
+        // Address match is intentionally skipped — the credential is a script
+        // hash, not this key. The key's membership in the script is checked
+        // separately by satisfiesScript. Previously this only checked that a
+        // public key could be extracted (which the SDK returns whenever the COSE
+        // merely parses), so an invalid or wrong-message witness was accepted —
+        // collapsing an M-of-N multisig DRep. (Critical: script witnesses never
+        // verified.)
+        const { validates, messageMatches, pubKeyHex } = verifyCoseSignature(
             witness.coseSign1Hex,
             merkleRoot,
-            // Dummy — we can't match a script address to a key hash
-            'addr_test1qz2fxv2umyhttkxyxp8x0dlpdt3k6cwng5pxj3jhsydzer3jcu5d8ps7zex2k2xt3uqxgjqnnj83ws8lhrn648jjxtwq2ytjqp',
             witness.coseKeyHex,
         );
 
-        // The SDK verifies: validates (Ed25519) && message_matches && address_matches
-        // For scripts, address_matches will be false, so isValid is false.
-        // But pubKeyHex is still populated if the COSE parsing succeeded
-        // and the Ed25519 signature was verified against the payload.
-        if (!result.pubKeyHex) {
+        if (!pubKeyHex) {
             return { error: 'Could not extract public key from COSE witness', pubKeyHex: '' };
         }
+        if (!validates || !messageMatches) {
+            return {
+                error: `Script witness signature did not verify (validates=${validates}, messageMatches=${messageMatches})`,
+                pubKeyHex: '',
+            };
+        }
 
-        return { error: null, pubKeyHex: result.pubKeyHex };
+        return { error: null, pubKeyHex };
     } catch (err: any) {
         return { error: `Script witness verification error: ${err.message}`, pubKeyHex: '' };
     }
@@ -361,7 +399,7 @@ function satisfiesScript(script: NativeScriptDef, providedKeyHashes: Set<string>
  *
  * Returns { error, witnesses } — error is null on success.
  */
-function verifyVoteSignatures(
+export function verifyVoteSignatures(
     merkleRoot: string,
     voterId: string,
     sig: VoteSignatureData,
@@ -373,17 +411,22 @@ function verifyVoteSignatures(
         const decoded = bech32.decode(voterId);
         const bytes = bech32.fromWords(decoded.words);
 
-        // CIP-129: first byte is credential type (0x22=key, 0x23=script), rest is hash
-        let credentialHash: string;
-        if (decoded.prefix === 'drep' && bytes[0] === 0x23) {
-            credentialHash = Buffer.from(bytes.slice(1)).toString('hex');
-        } else {
-            credentialHash = Buffer.from(bytes).toString('hex');
+        // Strip the CIP-129 (drep) / CIP-19 (stake) header byte to recover the
+        // 28-byte credential hash. Returns null if the credential is not a
+        // script type — a native script can only satisfy a script credential,
+        // never a key credential (or a prefix-less pool ID).
+        const credentialHash = extractScriptCredentialHash(decoded.prefix, bytes);
+        if (credentialHash === null) {
+            return {
+                error: `Credential ${voterId} (${decoded.prefix}) is not a script-based credential — ` +
+                    `native script witnesses require a script DRep (0x23) or script stake (0xf…) credential`,
+                witnesses: [],
+            };
         }
 
         if (scriptHash !== credentialHash) {
             return {
-                error: `Native script hash ${scriptHash} does not match DRep credential ${credentialHash}`,
+                error: `Native script hash ${scriptHash} does not match credential ${credentialHash}`,
                 witnesses: [],
             };
         }
@@ -427,22 +470,27 @@ function verifyVoteSignatures(
             signature: sig.signature ?? '',
         };
 
-        // For calidus votes, the signing key is a hot key that won't match the
-        // pool voter ID. Verify Ed25519 + message match only, skip address match.
+        // For calidus votes, the signing key is a pool hot key that won't match
+        // the pool voter ID, so skip the address check — but the Ed25519
+        // signature and message match MUST still hold. (Previously this only
+        // checked that a public key could be extracted, so a calidus vote with an
+        // invalid or wrong-message signature was accepted.)
         if (sig.calidusDeclaration) {
             try {
-                const result = verifySignature(
+                const { validates, messageMatches, pubKeyHex } = verifyCoseSignature(
                     witness.coseSign1Hex,
                     merkleRoot,
-                    voterId,
                     witness.coseKeyHex,
                 );
-                // isValid will be false (address mismatch) but we check sigMeta/pubKeyHex
-                // to confirm the Ed25519 signature and message are valid.
-                if (!result.pubKeyHex) {
+                if (!pubKeyHex) {
                     return { error: 'Could not extract public key from COSE witness', witnesses: [] };
                 }
-                // pubKeyHex populated = Ed25519 sig valid + message matches
+                if (!validates || !messageMatches) {
+                    return {
+                        error: `Calidus signature did not verify (validates=${validates}, messageMatches=${messageMatches})`,
+                        witnesses: [],
+                    };
+                }
                 return { error: null, witnesses: [witness] };
             } catch (err: any) {
                 return { error: `Signature verification error: ${err.message}`, witnesses: [] };
@@ -499,9 +547,23 @@ async function voteValidateAndPin(input: VotePipelineInput): Promise<VotePipelin
         }
     }
 
-    // Build signed payload + compute hashes
+    // Build signed payload + compute hashes.
+    //
+    // merkleRoot is the value the VOTER SIGNS. It is hashed over the canonical
+    // (RFC-8785) JSON of `{ ballotId, nonce, votes }` so that any interface which
+    // builds the same logical vote produces the same merkleRoot regardless of key
+    // order — the backend broker signs the same canonical bytes
+    // (ekklesia-backend/helper/voteBroker.js). This doubles as verifier
+    // robustness: a third-party client may submit the votes in any key order and
+    // we still recompute the merkleRoot the client signed (the SDK only string-
+    // compares the COSE payload to this value; it does not see the payload, so no
+    // SDK change is needed). Common `{questionId, selection}` votes are already
+    // alphabetical, so their canonical merkleRoot equals the old JSON.stringify
+    // value — backwards-safe; only non-alphabetical shapes (e.g. abstain) reorder.
+    // Supersedes F-006's "do not canonicalize merkleRoot" note — see TRD
+    // HYDRA_CANONICAL_SIGNING_PAYLOAD; flagged for auditor sync.
     const signedPayload: SignedVotePayload = { ballotId, nonce, votes };
-    const merkleRoot = bytesToHex(blake2b256(JSON.stringify(signedPayload)));
+    const merkleRoot = bytesToHex(blake2b256(canonicalBytes(signedPayload)));
 
     // Verify signature(s)
     const { error: sigError, witnesses } = verifyVoteSignatures(merkleRoot, voterId, signature);
@@ -510,12 +572,20 @@ async function voteValidateAndPin(input: VotePipelineInput): Promise<VotePipelin
     }
 
     // Build evidence. responderRole is derived from credentialHrp — the client
-    // does not get to pick. Any HRP that reaches this point already passed
-    // CREDENTIAL_PREFIX validation in voterIdToTokenName, so HRP_TO_ROLE is
-    // guaranteed to have a mapping; the fallback is defensive.
+    // does not get to pick. The HRP already passed ROLE_TOKEN_TAG validation
+    // in voterIdToTokenName, so this resolves; fail closed rather than coercing
+    // to a default role if that invariant ever changes (F-010).
+    const responderRole = resolveRole(credentialHrp);
+    if (!responderRole) {
+        throw Object.assign(
+            new Error(`Unrecognized credential HRP "${credentialHrp}"`),
+            { statusCode: 400, code: 'INVALID_VOTE' as const },
+        );
+    }
     const evidence: VoteEvidence = {
-        specVersion: '0.3.0',
-        responderRole: HRP_TO_ROLE[credentialHrp] ?? 'drep',
+        specVersion: PROTOCOL_VERSION,
+        surveyTxId: ballotId,
+        responderRole,
         answers: votes,
         ekklesia: {
             voterId,
@@ -523,13 +593,22 @@ async function voteValidateAndPin(input: VotePipelineInput): Promise<VotePipelin
             nonce,
             signedPayload,
             witnesses,
-            nativeScript: signature.nativeScript,
-            calidusDeclaration: signature.calidusDeclaration,
+            // nativeScript / calidusDeclaration appear only for the credential
+            // types that use them (script-based and calidus voters), matching
+            // the backend producer's conditional inclusion (audit finding F-007).
+            ...(signature.nativeScript ? { nativeScript: signature.nativeScript } : {}),
+            ...(signature.calidusDeclaration ? { calidusDeclaration: signature.calidusDeclaration } : {}),
             merkleProof: { root: '', steps: [] },
         },
     };
 
-    const voteHash = bytesToHex(blake2b256(JSON.stringify(evidence)));
+    // voteHash is the on-chain commitment over the full evidence bundle. It is
+    // hashed over the canonical (RFC-8785) JSON of the evidence so the same
+    // logical bundle always yields the same hash regardless of key order — and
+    // byte-for-byte matches the backend's `blake2b256(canonicalBytes(evidence))`
+    // (ekklesia-backend/helper/voteBroker.js). Was `JSON.stringify(evidence)`
+    // (insertion order), which diverged from the backend (audit finding F-006).
+    const voteHash = bytesToHex(blake2b256(canonicalBytes(evidence)));
 
     // Pin to IPFS
     const { cid: ipfsCid } = await ipfs.pinJson(
@@ -614,10 +693,30 @@ router.post('/register', async (req, res) => {
     }
 
     let tokenName: string;
+    let credentialHrp: string;
     try {
         tokenName = voterIdToTokenName(voterId);
+        credentialHrp = voterIdHrp(voterId);
     } catch (e: any) {
         return error(res, 'INVALID_VOTER_ID', `Invalid voter ID: ${e.message}`, 400);
+    }
+
+    // Hydra v2: voting is only allowed once the (601) deposit has finalized
+    // into the head. Until then the ballot token isn't in the L2 ledger.
+    {
+        const depositStatus = getDepositStatus();
+        if (depositStatus !== 'READY') {
+            return error(res, 'CONFLICT', `Ballot not active yet — (601) deposit status is ${depositStatus ?? 'NONE'}. The ballot token is still being deposited into the head; poll GET /health until ballotActive is true.`, 409);
+        }
+    }
+
+    // Reject voters whose credential type isn't permitted by the ballot.
+    const ballot = getCachedBallot();
+    if (ballot) {
+        const eligErr = checkVoterEligibility(credentialHrp, ballot);
+        if (eligErr) {
+            return error(res, 'INELIGIBLE_VOTER', eligErr, 403);
+        }
     }
 
     // Prevent duplicate registration — voter token already exists in head
@@ -752,6 +851,24 @@ router.post('/vote', async (req, res) => {
         credentialHrp = voterIdHrp(voterId);
     } catch (e: any) {
         return error(res, 'INVALID_VOTER_ID', `Invalid voter ID: ${e.message}`, 400);
+    }
+
+    // Hydra v2: voting is only allowed once the (601) deposit has finalized
+    // into the head. Until then the ballot token isn't in the L2 ledger.
+    {
+        const depositStatus = getDepositStatus();
+        if (depositStatus !== 'READY') {
+            return error(res, 'CONFLICT', `Ballot not active yet — (601) deposit status is ${depositStatus ?? 'NONE'}. The ballot token is still being deposited into the head; poll GET /health until ballotActive is true.`, 409);
+        }
+    }
+
+    // Reject voters whose credential type isn't permitted by the ballot.
+    const ballot = getCachedBallot();
+    if (ballot) {
+        const eligErr = checkVoterEligibility(credentialHrp, ballot);
+        if (eligErr) {
+            return error(res, 'INELIGIBLE_VOTER', eligErr, 403);
+        }
     }
 
     // Per-voter lock: only one request per voter at a time

@@ -5,7 +5,7 @@ import { deserializeTx } from '@meshsdk/core-cst';
 import { TRPClientLogged as Client } from './trp-client.js';
 import { bech32 } from 'bech32';
 import { blake2b } from 'blakejs';
-import { CREDENTIAL_PREFIX } from './types.js';
+import { ROLE_TOKEN_TAG } from './types.js';
 import type { VoteCacheEntry, VoteHistoryEntry } from './types.js';
 import { TxQueue } from './tx-queue.js';
 import type { TxType } from './tx-queue.js';
@@ -20,6 +20,73 @@ export const CLOSE_TOKEN = process.env.CLOSE_TOKEN || 'shutitdown';
 export const IPFS_API_URL = process.env.IPFS_API_URL || 'http://localhost:5001';
 export const IPFS_STAGING_DIR = process.env.IPFS_STAGING_DIR || '/ipfs-staging';
 export const VERBOSE = process.env.VERBOSE === '1' || process.env.VERBOSE === 'true';
+
+/**
+ * Cap on how many TRP resolve calls run concurrently during bulk settlement
+ * (the burn fan-out). Resolving one countVoteTx per voter all at once
+ * overwhelms the TRP gateway (HTTP 429) and its backing Hydra UTxO lookups
+ * ("input not resolved: voter_token"). The queue worker's in-flight throttle
+ * only governs dispatch, not this resolve phase, so it is bounded here.
+ */
+export const TRP_RESOLVE_CONCURRENCY = Math.max(
+    1,
+    parseInt(process.env.TRP_RESOLVE_CONCURRENCY || '12', 10),
+);
+
+// ---------------------------------------------------------------------------
+// Hydra v2 (ADR-33) head-open + deposit timing
+// ---------------------------------------------------------------------------
+//
+// Under Hydra v2 a head opens with an EMPTY UTxO set; the (601) ballot token
+// is added afterwards as a signed deposit/increment that the node only pulls
+// into the head once it has matured for `--deposit-period`. `/start` kicks the
+// deposit off in the background and returns immediately (202); the background
+// task waits for `CommitFinalized` and then confirms the (601) is actually
+// spendable in the head's confirmed ledger before flipping the ballot READY.
+// The finalize wait is sized from the node's live `deposit-period` plus a
+// buffer for L1 deposit-observation latency, so it must exceed
+// `deposit-period` + that latency for the target network:
+//
+//   preprod (deposit-period 120s):  defaults below are ample
+//   mainnet (deposit-period 3600s): the derived wait scales automatically;
+//                                   raise DEPOSIT_FINALIZE_TIMEOUT_OVERRIDE_MS
+//                                   only if the measured L1 latency demands it
+//
+/** How long `/start` waits for the head to reach Open after sending Init. */
+export const HEAD_OPEN_TIMEOUT_MS = parseInt(process.env.HEAD_OPEN_TIMEOUT_MS || '180000', 10);
+/**
+ * Fallback per-attempt wait for a deposit to reach CommitFinalized, used only
+ * when the node's live `deposit-period` is not yet known. Normally the timeout
+ * is derived dynamically as `deposit-period + DEPOSIT_FINALIZE_BUFFER_MS`.
+ *
+ * Defaults to the mainnet `deposit-period` (3600s / 1h) so a node that hasn't
+ * reported its period yet is assumed to be on the slowest realistic setting —
+ * erring toward a longer wait, never a premature FAILED. When the period IS
+ * known (the common case) the derived path scales the wait to the live value.
+ */
+export const DEPOSIT_FINALIZE_TIMEOUT_MS = parseInt(process.env.DEPOSIT_FINALIZE_TIMEOUT_MS || '3600000', 10);
+/**
+ * Explicit operator override for the finalize wait. When > 0 it wins over the
+ * derived `deposit-period + buffer` path — an interim escape hatch for setups
+ * whose true L1 deposit-observation latency exceeds the derived budget (see the
+ * measured ~5 min latency on Dolos-backed preprod). `0` (default) = disabled.
+ */
+export const DEPOSIT_FINALIZE_TIMEOUT_OVERRIDE_MS = parseInt(process.env.DEPOSIT_FINALIZE_TIMEOUT_OVERRIDE_MS || '0', 10);
+/** Buffer added to the node's deposit-period for L1 confirmation when sizing the finalize wait. */
+export const DEPOSIT_FINALIZE_BUFFER_MS = parseInt(process.env.DEPOSIT_FINALIZE_BUFFER_MS || '180000', 10);
+/**
+ * After `CommitFinalized`, how long to poll the CONFIRMED snapshot for the
+ * (601) to become spendable before declaring the deposit FAILED. CommitFinalized
+ * is necessary but not sufficient — the increment may lag into the confirmed
+ * ledger, and READY must mean "a /vote will resolve its gas input".
+ */
+export const DEPOSIT_CONFIRM_TIMEOUT_MS = parseInt(process.env.DEPOSIT_CONFIRM_TIMEOUT_MS || '180000', 10);
+/** Poll interval while confirming the (601) is spendable in the confirmed ledger. */
+export const DEPOSIT_CONFIRM_POLL_INTERVAL_MS = parseInt(process.env.DEPOSIT_CONFIRM_POLL_INTERVAL_MS || '5000', 10);
+/** Re-draft attempts on a transient stale-input L1 submit error. */
+export const DEPOSIT_SUBMIT_RETRIES = parseInt(process.env.DEPOSIT_SUBMIT_RETRIES || '3', 10);
+/** Delay before re-drafting a deposit (lets the node re-sync its chain view). */
+export const DEPOSIT_SUBMIT_RETRY_DELAY_MS = parseInt(process.env.DEPOSIT_SUBMIT_RETRY_DELAY_MS || '8000', 10);
 
 /** Log only when VERBOSE mode is enabled. Errors always log regardless. */
 export function debug(...args: unknown[]): void {
@@ -147,6 +214,35 @@ export function sanitizeBigInts(obj: any): any {
 }
 
 /**
+ * Drop-in replacement for `Promise.allSettled(items.map(fn))` that caps the
+ * number of `fn` invocations in flight at `limit`. Results preserve input
+ * order so callers can index back into `items` for per-item error reporting.
+ *
+ * Used to throttle the TRP resolve fan-out during settlement — see
+ * {@link TRP_RESOLVE_CONCURRENCY}.
+ */
+export async function mapWithConcurrency<T, R>(
+    items: readonly T[],
+    limit: number,
+    fn: (item: T, index: number) => Promise<R>,
+): Promise<PromiseSettledResult<R>[]> {
+    const results: PromiseSettledResult<R>[] = new Array(items.length);
+    let next = 0;
+    const workerCount = Math.max(1, Math.min(limit, items.length));
+    const workers = Array.from({ length: workerCount }, async () => {
+        for (let i = next++; i < items.length; i = next++) {
+            try {
+                results[i] = { status: 'fulfilled', value: await fn(items[i], i) };
+            } catch (reason) {
+                results[i] = { status: 'rejected', reason };
+            }
+        }
+    });
+    await Promise.all(workers);
+    return results;
+}
+
+/**
  * Parse a bech32 voter ID into the credential prefix byte and 28-byte hash
  * used as the voter token asset name (29 bytes total).
  *
@@ -162,9 +258,19 @@ export function voterIdToTokenName(voterId: string): string {
 
     const decoded = bech32.decode(voterId);
     const hrp = decoded.prefix;
-    const prefixByte = CREDENTIAL_PREFIX[hrp];
+
+    // A calidus key is a signing witness, not a voter identity. Minting a token
+    // for `calidus1...` would give an SPO a second voter token alongside their
+    // pool token (a double vote). SPOs vote as the pool with a calidusDeclaration.
+    if (hrp === 'calidus') {
+        throw new Error(
+            'Calidus keys are signing witnesses, not voter identities — submit voterId as the pool (pool1...) with a calidusDeclaration in the signature.',
+        );
+    }
+
+    const prefixByte = ROLE_TOKEN_TAG[hrp];
     if (prefixByte === undefined) {
-        const allowed = Object.keys(CREDENTIAL_PREFIX).join(', ');
+        const allowed = Object.keys(ROLE_TOKEN_TAG).join(', ');
         throw new Error(`Unrecognized bech32 prefix: "${hrp}" — voter IDs must use one of: ${allowed}`);
     }
 
@@ -185,6 +291,38 @@ export function voterIdToTokenName(voterId: string): string {
 export function voterIdHrp(voterId: string): string {
     const decoded = bech32.decode(voterId);
     return decoded.prefix;
+}
+
+/**
+ * Extract the 28-byte credential hash from a script-capable voter ID, for
+ * matching against a native-script hash (`resolveNativeScriptHash`).
+ *
+ * Only script-based credentials can be satisfied by a native script:
+ *   - drep   — CIP-129 governance credential, 1-byte kind prefix + 28-byte hash.
+ *              `0x22` = key hash, `0x23` = script hash. Only `0x23` is a script.
+ *   - stake  — CIP-19 reward address, 1-byte header + 28-byte hash. The header's
+ *     /stake_test high nibble is the address type: `0xe?` = key hash, `0xf?` = script hash.
+ *              Only `0xf?` is a script.
+ *
+ * pool IDs are a raw 28-byte hash with no header byte and are never script-based
+ * (an SPO signs with its cold key), so they have no entry here. `calidus` is a
+ * signing witness, not a voter identity (F-001), and likewise never appears.
+ *
+ * Returns the 28-byte hash as lowercase hex, or null if `bytes` is not a
+ * recognized *script* credential for `hrp` (caller should reject — a native
+ * script cannot stand in for a key credential).
+ */
+export function extractScriptCredentialHash(hrp: string, bytes: Uint8Array | number[]): string | null {
+    // Every script credential here is a 1-byte header + 28-byte blake2b-224 hash.
+    if (bytes.length !== 29) return null;
+
+    const header = bytes[0];
+    const isScript =
+        (hrp === 'drep' && header === 0x23) ||
+        ((hrp === 'stake' || hrp === 'stake_test') && (header >> 4) === 0xf);
+
+    if (!isScript) return null;
+    return Buffer.from(Array.from(bytes).slice(1)).toString('hex');
 }
 
 export type InitializePayload = {
@@ -266,6 +404,7 @@ export type ErrorCode =
     | 'INVALID_VOTE'
     | 'INVALID_VOTER_ID'
     | 'UNAUTHORIZED'
+    | 'INELIGIBLE_VOTER'
     | 'SIGNATURE_INVALID'
     | 'CONFLICT'
     | 'NOT_FOUND'
@@ -298,10 +437,10 @@ export function error(res: Response, code: ErrorCode, message: string, statusCod
  * mutated under us.
  *
  * `Unknown`, `Idle`, and `Final` are considered safe: pre-init or fully
- * settled. Anything else is active.
+ * settled. Anything else is active. (Hydra v2 / ADR-33 dropped the
+ * `INITIALIZING` state — heads transition Idle → Open directly.)
  */
 const ACTIVE_HEAD_STATES = new Set([
-    'INITIALIZING',
     'OPEN',
     'CLOSED',
     'FANOUT_POSSIBLE',
@@ -358,7 +497,7 @@ export function checkBallotModifiable(args: ModifyCheckArgs): ModifyCheckResult 
  * FANOUT_POSSIBLE. Safe to re-invoke after a transient error.
  *
  * Fails fast (instead of hanging 10 minutes on waitForStatus) when:
- *   - the head is in a non-closeable state (IDLE / INITIALIZING / UNKNOWN)
+ *   - the head is in a non-closeable state (IDLE / UNKNOWN)
  *   - Hydra responds CommandFailed to the Close or Fanout command we send
  *
  * Replaces the per-route close ladder that used to live in /close,

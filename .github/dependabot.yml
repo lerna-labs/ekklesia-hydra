@@ -1,0 +1,64 @@
+# Dependabot version-update configuration.
+#
+# `cooldown` enforces a minimum age on version updates so we never auto-bump to a
+# brand-new release — a guard against zero-day supply-chain compromise in freshly
+# published packages. Packages must be at least 3 days old (minors 7, majors 14)
+# before Dependabot will open an update PR.
+#
+# The semver-*-days breakdown is only supported for ecosystems where Dependabot
+# enforces strict SemVer tagging (npm/yarn here) — docker and github-actions
+# aren't on that list, so those blocks only get a flat default-days.
+#
+# Note: Dependabot *security* updates are managed separately (GitHub repo
+# settings) and are intentionally not subject to this cooldown — a published CVE
+# fix should land promptly.
+version: 2
+updates:
+  # --- Node dependencies (package.json / package-lock.json) ---
+  - package-ecosystem: "npm"
+    directory: "/"
+    target-branch: "development"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 3
+      semver-major-days: 14
+      semver-minor-days: 7
+      semver-patch-days: 3
+    groups:
+      # Batch low-risk minor/patch bumps into a single PR to cut review noise;
+      # majors stay individual so each gets its own (14-day-aged) review.
+      npm-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+    commit-message:
+      prefix: "chore(deps)"
+      prefix-development: "chore(dev-deps)"
+
+  # --- GitHub Actions (.github/workflows/*.yml) ---
+  # semver-*-days isn't supported here — action tags aren't reliably SemVer,
+  # so only the flat default-days cooldown applies.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    target-branch: "development"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "chore(ci)"
+
+  # --- Docker base images (Dockerfile, Dockerfile.dev) ---
+  # semver-*-days isn't supported here either — image tags aren't reliably
+  # SemVer, so only the flat default-days cooldown applies.
+  - package-ecosystem: "docker"
+    directory: "/"
+    target-branch: "development"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "chore(docker)"

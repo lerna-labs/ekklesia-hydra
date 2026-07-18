@@ -9,45 +9,99 @@ export const BALLOT_DEFINITION_PREFIX = '00258a50';
 export const BALLOT_INSTANCE_PREFIX = '00259a20';
 
 // ---------------------------------------------------------------------------
-// Bech32 HRP → Credential Prefix Byte Mapping
+// Protocol version
 // ---------------------------------------------------------------------------
 
 /**
- * Maps bech32 human-readable prefixes to the 1-byte credential prefix
- * used in voter token asset names.
+ * Evidence/results protocol version stamped into every vote-evidence bundle
+ * (`VoteEvidence.specVersion`) and results object (`FullResults.specVersion`)
+ * this middleware produces. This is the *protocol* version of the on-disk /
+ * IPFS artifact shape and hashing contract — distinct from
+ * `BallotDefinition.specVersion`, which is the ballot author's own version.
  *
- * Voter token asset name = <prefix byte><blake2b_224(bech32_decoded_data)> (29 bytes)
- *
- * Only `drep`, `pool`, `calidus`, `stake`, `stake_test` are accepted as
- * voter IDs. Payment-stake composite addresses (addr / addr_test) are
- * intentionally excluded: the signing key only verifies a particular
- * payment address and can be spoofed against a stake credential, which
- * is of limited use in a voting platform.
+ * Versioning contract: changes to how a vote is represented, hashed, encoded,
+ * or identified ship as a NEW protocol version, never as an in-place mutation.
+ * Two ballots have already settled under the previous versions (hydra `'0.3.0'`
+ * and backend `'ekklesia/1.0'`); those artifacts must remain verifiable
+ * byte-for-byte by replay tooling keyed off their declared version. This
+ * middleware always produces the current version (one head, one ballot — no old
+ * artifact is ever re-minted here); old-version replay lives in external audit
+ * tooling.
  */
-export const CREDENTIAL_PREFIX: Record<string, number> = {
+export const PROTOCOL_VERSION = 'ekklesia/2.0';
+
+// ---------------------------------------------------------------------------
+// Bech32 HRP → Voter-Token Role Tag
+// ---------------------------------------------------------------------------
+
+/**
+ * Maps a bech32 voter HRP to the 1-byte tag prepended to its voter-token asset
+ * name. This is an internal Ekklesia role tag, NOT a literal CIP bech32 first
+ * byte — e.g. `stake` and `stake_test` deliberately share `0xe0` because they
+ * are the same tally role (a real CIP-19 mainnet reward address starts `0xe1`,
+ * which is irrelevant here). Renamed from `CREDENTIAL_PREFIX` to make that
+ * explicit (audit finding F-012).
+ *
+ * Voter token asset name = <tag byte><blake2b_224(bech32_decoded_data)> (29 bytes)
+ *
+ * Only `drep`, `pool`, `stake`, `stake_test` are accepted as voter IDs.
+ * Payment-stake composite addresses (addr / addr_test) are intentionally
+ * excluded: the signing key only verifies a particular payment address and can
+ * be spoofed against a stake credential, which is of limited use in a voting
+ * platform.
+ *
+ * `calidus` is deliberately NOT a voter identity. A calidus key is an SPO hot
+ * key authorized for a pool's cold key; an SPO voting with it submits `voterId`
+ * as the pool (`pool1...`) and supplies the calidus key only as a signing
+ * witness (`calidusDeclaration`). Tokenizing `calidus1...` separately would give
+ * one operator two distinct voter tokens — one under the pool ID and one under
+ * the calidus key hash — both tallying as `pool`, i.e. a double vote. The pool
+ * ID is the single canonical SPO identity.
+ */
+export const ROLE_TOKEN_TAG: Record<string, number> = {
     drep: 0x22,
     stake: 0xe0,
     stake_test: 0xe0,
     pool: 0x06,
-    calidus: 0x06,      // Calidus hot key represents a pool — same prefix.
 };
 
 /** All recognized bech32 HRPs for voter identification. */
-export type VoterHrp = keyof typeof CREDENTIAL_PREFIX;
+export type VoterHrp = keyof typeof ROLE_TOKEN_TAG;
 
 /**
  * Map bech32 HRP to tally role. Roles are lowercase and form the canonical
  * three-group voter space: `drep`, `pool`, `stake`. `stake_test` is just
  * the testnet prefix for stake credentials and collapses into the same
- * role. `calidus` is an SPO hot key and counts toward `pool`.
+ * role. There is no `calidus` entry: an SPO voting with a calidus hot key
+ * submits as the pool (`voterId = pool1...`), so its `credentialHrp` is
+ * already `pool` and it tallies under `pool` without a separate mapping.
  */
 export const HRP_TO_ROLE: Record<string, string> = {
     drep: 'drep',
     pool: 'pool',
-    calidus: 'pool',
     stake: 'stake',
     stake_test: 'stake',
 };
+
+/**
+ * Resolve a bech32 HRP to its canonical tally role, or `null` if the HRP is not
+ * a recognized voter credential.
+ *
+ * Callers must fail closed on `null` rather than coercing to a default role.
+ * Silently mapping a missing or unrecognized HRP to a real role (the old
+ * `?? 'drep'`) miscounts the role-weighted tally, and trusting an
+ * evidence-supplied `responderRole` (the old `?? evidence.responderRole`) lets
+ * out-of-band evidence pick its own bucket (audit findings F-010/F-011).
+ *
+ * Note there is intentionally no `drep_test` / `calidus_test`: CIP-129 governance
+ * credentials use the `drep` HRP on every network (no testnet variant); only
+ * CIP-19 stake reward addresses are network-tagged, and `stake_test` is already
+ * mapped above.
+ */
+export function resolveRole(hrp: string | undefined | null): string | null {
+    if (!hrp) return null;
+    return HRP_TO_ROLE[hrp] ?? null;
+}
 
 // ---------------------------------------------------------------------------
 // Ballot Definition — (600) token datum, immutable on L1
@@ -649,6 +703,12 @@ export interface EkklesiaVoteExtension {
 export interface VoteEvidence {
     // CIP-179 core
     specVersion: string;
+    /**
+     * The L1 transaction that anchors this ballot (defaults to `ballotId`).
+     * Present in every bundle so the hydra and backend evidence producers emit
+     * the same top-level shape (audit finding F-007).
+     */
+    surveyTxId: string;
     responderRole: string;
     answers: VoteSelection[];
 

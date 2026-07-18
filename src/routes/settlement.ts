@@ -2,10 +2,11 @@ import { Router } from 'express';
 import { createNativeScript, Wrangler } from '@lerna-labs/hydra-sdk';
 import { blake2b256, bytesToHex, computePackage } from '@lerna-labs/hydra-proof';
 import type { FileLeaf } from '@lerna-labs/hydra-proof';
-import { initialize, voterIdToTokenName, CLOSE_TOKEN, VERBOSE, IPFS_STAGING_DIR, ipfs, voteCache, success, error, debug, hydraMonitor, getHeadId, txQueue, enqueueAndWait, driveHeadToFinal } from '../helpers.js';
+import { initialize, voterIdToTokenName, CLOSE_TOKEN, VERBOSE, IPFS_STAGING_DIR, ipfs, voteCache, success, error, debug, hydraMonitor, getHeadId, txQueue, enqueueAndWait, driveHeadToFinal, mapWithConcurrency, TRP_RESOLVE_CONCURRENCY } from '../helpers.js';
 import { hydraValueToAmounts } from '../tx-builder.js';
 import { getCachedBallot, getCachedBallotId, getCachedBallotIdentity, getCachedResultsAddress } from './lifecycle.js';
-import { BALLOT_INSTANCE_PREFIX, BALLOT_DEFINITION_PREFIX, HRP_TO_ROLE } from '../types.js';
+import { BALLOT_INSTANCE_PREFIX, BALLOT_DEFINITION_PREFIX, resolveRole, PROTOCOL_VERSION } from '../types.js';
+import { canonicalBytes } from '@lerna-labs/ekklesia-helpers/json';
 import type {
     BackendGroupTally,
     BackendOptionResult,
@@ -201,9 +202,26 @@ function asEntryArray(s: VoteSelection['selection']): SelectionEntry[] | null {
         : null;
 }
 
-/** Enumerate every integer grid position in [min, max] at `step`. */
-function gridValues(grid: { min: number; max: number; step?: number }): number[] {
+/**
+ * Enumerate every integer grid position in [min, max] at `step`.
+ *
+ * Fail-closed against a malformed grid. `/prepare` validates grids (validateGrid
+ * in ballot.ts), but a ballot fetched from IPFS at /start is trusted as-is, so a
+ * malformed grid could reach the tally here. A non-positive `step` would make the
+ * loop below never terminate (an unbounded array → finalize hangs); reject such
+ * grids loudly instead (audit F-003).
+ */
+export function gridValues(grid: { min: number; max: number; step?: number }): number[] {
     const step = grid.step ?? 1;
+    if (
+        !Number.isInteger(grid.min) || !Number.isInteger(grid.max) || !Number.isInteger(step) ||
+        step <= 0 || grid.max < grid.min || (grid.max - grid.min) % step !== 0
+    ) {
+        throw new Error(
+            `Invalid grid spec {min:${grid.min}, max:${grid.max}, step:${step}} — ` +
+            `min/max/step must be integers with step > 0, max >= min, and (max - min) divisible by step`,
+        );
+    }
     const values: number[] = [];
     for (let v = grid.min; v <= grid.max; v += step) values.push(v);
     return values;
@@ -265,7 +283,7 @@ function tallyRange(
  * from it — Hydra emits only the raw counts and leaves the choice of
  * winner-selection method to the consumer.
  */
-function tallyRanked(
+export function tallyRanked(
     answers: VoteSelection[],
     options: BallotOption[] | undefined,
 ): MethodTally {
@@ -277,8 +295,16 @@ function tallyRanked(
     const matrix: number[][] = sortedValues.map(() => sortedValues.map(() => 0));
 
     for (const a of answers) {
-        const ranking = asNumberArray(a.selection);
-        if (!ranking || ranking.length === 0) continue;
+        const raw = asNumberArray(a.selection);
+        if (!raw || raw.length === 0) continue;
+
+        // Dedupe defensively, preserving first-occurrence order. /vote rejects
+        // duplicate rankings at the API boundary, but evidence pinned out-of-band
+        // to IPFS can reach the tally directly. A duplicate would make the
+        // pairwise loop write the diagonal (matrix[i][i] — an option preferring
+        // itself), which is semantically nonsense and corrupts every method
+        // derived from the matrix (Borda, Condorcet, …). (audit finding F-005)
+        const ranking = Array.from(new Set(raw));
 
         firstPrefCounts.set(ranking[0], (firstPrefCounts.get(ranking[0]) ?? 0) + 1);
 
@@ -442,8 +468,10 @@ async function tallyVotes(
     // Count voters per role
     const votersByRole: Record<string, number> = {};
     for (const evidence of evidenceList) {
-        const hrp = evidence.ekklesia?.credentialHrp ?? 'drep';
-        const role = HRP_TO_ROLE[hrp] ?? evidence.responderRole ?? 'Unknown';
+        // Fail closed: an evidence file with a missing or unrecognized
+        // credentialHrp lands in an explicit `unknown` bucket (and `raw`), never
+        // silently in a real role or a self-declared `responderRole` (F-010).
+        const role = resolveRole(evidence.ekklesia?.credentialHrp) ?? 'unknown';
         votersByRole[role] = (votersByRole[role] ?? 0) + 1;
     }
 
@@ -471,8 +499,10 @@ async function tallyVotes(
     }
 
     for (const evidence of evidenceList) {
-        const hrp = evidence.ekklesia?.credentialHrp ?? 'drep';
-        const role = HRP_TO_ROLE[hrp] ?? evidence.responderRole ?? 'Unknown';
+        // Fail closed: an evidence file with a missing or unrecognized
+        // credentialHrp lands in an explicit `unknown` bucket (and `raw`), never
+        // silently in a real role or a self-declared `responderRole` (F-010).
+        const role = resolveRole(evidence.ekklesia?.credentialHrp) ?? 'unknown';
         for (const answer of evidence.answers) {
             const perRoleAnswers = answersByQuestionRole.get(answer.questionId);
             const perRoleAbstain = abstainByQuestionRole.get(answer.questionId);
@@ -755,7 +785,7 @@ router.post('/finalize', async (_req, res) => {
 
         // --- 4. Build full results object ---
         const fullResults: FullResults = {
-            specVersion: '0.3.0',
+            specVersion: PROTOCOL_VERSION,
             ballotId,
             tallies,
             questionTallies,
@@ -833,12 +863,17 @@ router.post('/finalize', async (_req, res) => {
             resultsAddress: getCachedResultsAddress() ?? admin_payment_address,
         });
         const signedFinalizeTx = await admin_wallet.signTx(unsignedFinalizeTx);
+        const finalizeId = `finalize:${ballotName}`;
         const { txHash } = await enqueueAndWait({
-            id: `finalize:${ballotName}`,
+            id: finalizeId,
             type: 'finalize',
             unsignedCborHex: unsignedFinalizeTx,
             signedCborHex: signedFinalizeTx,
         });
+        // F-015: block until the finalize datum write is in a confirmed snapshot,
+        // so any subsequent close (e.g. /settle/close) fans out the finalized
+        // (601) datum rather than a stale one.
+        await txQueue.waitForApplied(finalizeId);
 
         await saveFinalizeResponse({
             txHash,
@@ -898,8 +933,9 @@ router.post('/count', async (req, res) => {
 
         // Resolve + sign + enqueue every burn, then wait for the worker to
         // dispatch them all. Burns are non-contending so the worker pipelines
-        // them up to MAX_IN_FLIGHT in parallel.
-        const results = await Promise.allSettled(allVotes.map(async (vote) => {
+        // them up to MAX_IN_FLIGHT in parallel. The TRP resolve phase is
+        // capped at TRP_RESOLVE_CONCURRENCY to avoid 429-flooding the gateway.
+        const results = await mapWithConcurrency(allVotes, TRP_RESOLVE_CONCURRENCY, async (vote) => {
             const tokenName = voterIdToTokenName(vote.voterId);
             const { tx: unsignedTx } = await client.countVoteTx({
                 votingAuthority: admin_payment_address,
@@ -915,7 +951,7 @@ router.post('/count', async (req, res) => {
                 signedCborHex: signedTx,
             });
             return { voterId: vote.voterId, txHash };
-        }));
+        });
 
         const detailed = results.map((r, i) => {
             if (r.status === 'fulfilled') return r.value;
@@ -1018,7 +1054,7 @@ router.post('/settle/burn', async (_req, res) => {
         // the WAL (e.g., from a previous /settle/burn call), enqueueing
         // again with the same id overwrites the prior state — but we'd
         // also re-await its acceptance, so retries Just Work.
-        const burnResults = await Promise.allSettled(headVoters.map(async (voter) => {
+        const burnResults = await mapWithConcurrency(headVoters, TRP_RESOLVE_CONCURRENCY, async (voter) => {
             const { tx: unsignedTx } = await client.countVoteTx({
                 votingAuthority: admin_payment_address,
                 mintingScript: Buffer.from(TOKEN_SCRIPT as string, 'hex'),
@@ -1032,7 +1068,7 @@ router.post('/settle/burn', async (_req, res) => {
                 unsignedCborHex: unsignedTx,
                 signedCborHex: signedTx,
             });
-        }));
+        });
 
         let burned = 0;
         let burnFailed = 0;
@@ -1106,23 +1142,46 @@ router.post('/settle/finalize', async (_req, res) => {
         // This is the authoritative record of every voter's on-chain state
         // at the moment settlement began — the source of truth for the evidence package.
         //
-        // If the snapshot is missing but the head also has zero voter tokens,
-        // we treat that as an empty-ballot finalize and synthesize an empty
-        // snapshot on the fly. This keeps /settle/finalize usable in the
-        // unusual case where /settle/burn was never called (e.g. ballots
-        // that had no voter activity and skipped straight to finalize).
+        // If the snapshot is missing we fall back to the vote cache. Two
+        // sub-cases, distinguished by whether the cache holds any voters:
+        //
+        //  - Cache empty   → genuinely an empty ballot (no voter activity, or
+        //                    /settle/burn was skipped on a head that never had
+        //                    votes). Synthesize an empty snapshot; the result
+        //                    reflects a zero-voter ballot.
+        //
+        //  - Cache populated → voter tokens were burned OUTSIDE the /settle/burn
+        //                    path (e.g. a stray /count call), so the snapshot
+        //                    that step normally writes was never created, yet
+        //                    real votes exist locally. Reconstruct the snapshot
+        //                    from the cache rather than silently finalizing an
+        //                    empty datum. Every reconstructed voter still passes
+        //                    the evidence-hash verification below, so only votes
+        //                    whose evidence reproduces the recorded voteHash are
+        //                    counted. NOTE: with the on-chain voter tokens gone,
+        //                    the integrity anchor shifts from the burned head
+        //                    datum to the local cache/evidence — only valid when
+        //                    that evidence has been independently reconciled
+        //                    (e.g. via /audit/full).
         const ledgerSnapshotPath = pathMod.join(IPFS_STAGING_DIR, 'pre-burn-ledger.json');
         let ledgerVoters: Array<{ tokenName: string; version: number; voteHash: string; ipfsCid: string }>;
         try {
             const raw = await fs.readFile(ledgerSnapshotPath, 'utf-8');
             ledgerVoters = JSON.parse(raw);
         } catch {
-            // We already confirmed remainingVoters.length === 0 above, so the
-            // head genuinely has no voter tokens. Write an empty snapshot and
-            // continue — the finalized results will reflect a zero-voter ballot.
-            ledgerVoters = [];
+            const cached = voteCache.getAll();
+            ledgerVoters = cached.map(v => ({
+                tokenName: voterIdToTokenName(v.voterId),
+                version: v.version,
+                voteHash: v.voteHash,
+                ipfsCid: v.ipfsCid,
+            }));
             await fs.writeFile(ledgerSnapshotPath, JSON.stringify(ledgerVoters, null, 2));
-            debug(`[settle/finalize] No pre-burn snapshot found AND head has no voter tokens — synthesized empty snapshot at ${ledgerSnapshotPath}`);
+            if (ledgerVoters.length === 0) {
+                debug(`[settle/finalize] No pre-burn snapshot AND empty cache — synthesized empty snapshot at ${ledgerSnapshotPath}`);
+            } else {
+                console.warn(`[settle/finalize] No pre-burn snapshot found, but cache holds ${ledgerVoters.length} voter(s). Reconstructed snapshot from cache — voter tokens were burned outside /settle/burn. Evidence-hash verification still applies.`);
+            }
         }
 
         debug(`[settle/finalize] Loaded pre-burn ledger: ${ledgerVoters.length} voters`);
@@ -1140,7 +1199,11 @@ router.post('/settle/finalize', async (_req, res) => {
             try {
                 const raw = await fs.readFile(evidencePath, 'utf-8');
                 const evidence = JSON.parse(raw);
-                const fileHash = bytesToHex(blake2b256(JSON.stringify(evidence)));
+                // Re-hash with canonical JSON to match the on-chain voteHash the
+                // producer wrote via `canonicalBytes(evidence)` (F-006). Parsing
+                // then canonicalizing reproduces the producer's hash regardless of
+                // the on-disk byte order.
+                const fileHash = bytesToHex(blake2b256(canonicalBytes(evidence)));
                 if (fileHash === voter.voteHash) {
                     verifiedVoters.push({
                         tokenName: voter.tokenName,
@@ -1181,7 +1244,7 @@ router.post('/settle/finalize', async (_req, res) => {
         const tallies = buildBackendTallies(ballot, questionTallies, votersByQuestionRole);
 
         const fullResults: FullResults = {
-            specVersion: '0.3.0',
+            specVersion: PROTOCOL_VERSION,
             ballotId,
             tallies,
             questionTallies,
@@ -1255,12 +1318,18 @@ router.post('/settle/finalize', async (_req, res) => {
             resultsAddress: getCachedResultsAddress() ?? admin_payment_address,
         });
         const signedFinalizeTx = await admin_wallet.signTx(unsignedFinalizeTx);
+        const finalizeId = `finalize:${ballotName}`;
         const { txHash: finalizeTxHash } = await enqueueAndWait({
-            id: `finalize:${ballotName}`,
+            id: finalizeId,
             type: 'finalize',
             unsignedCborHex: unsignedFinalizeTx,
             signedCborHex: signedFinalizeTx,
         });
+        // F-015: the finalize datum write must reach a confirmed snapshot before
+        // the head is closed, or Close would post the prior confirmed snapshot to
+        // L1 and fan out a stale (601) BallotResult datum. Block on
+        // SnapshotConfirmed (APPLIED), not merely TxValid (ACCEPTED).
+        await txQueue.waitForApplied(finalizeId);
 
         await saveFinalizeResponse({
             txHash: finalizeTxHash,
@@ -1428,7 +1497,7 @@ router.post('/settle', async (req, res) => {
         // WebSocket up to MAX_IN_FLIGHT in parallel. Each burn spends a
         // unique voter UTxO so there's no contention. The worker handles
         // retries on transient errors.
-        const burnResults = await Promise.allSettled(headVoters.map(async (voter) => {
+        const burnResults = await mapWithConcurrency(headVoters, TRP_RESOLVE_CONCURRENCY, async (voter) => {
             const { tx: unsignedTx } = await client.countVoteTx({
                 votingAuthority: admin_payment_address,
                 mintingScript: Buffer.from(TOKEN_SCRIPT as string, 'hex'),
@@ -1442,7 +1511,7 @@ router.post('/settle', async (req, res) => {
                 unsignedCborHex: unsignedTx,
                 signedCborHex: signedTx,
             });
-        }));
+        });
 
         let burned = 0;
         let burnFailed = 0;
@@ -1501,7 +1570,11 @@ router.post('/settle', async (req, res) => {
             try {
                 const raw = await fs.readFile(evidencePath, 'utf-8');
                 const evidence = JSON.parse(raw);
-                const fileHash = bytesToHex(blake2b256(JSON.stringify(evidence)));
+                // Re-hash with canonical JSON to match the on-chain voteHash the
+                // producer wrote via `canonicalBytes(evidence)` (F-006). Parsing
+                // then canonicalizing reproduces the producer's hash regardless of
+                // the on-disk byte order.
+                const fileHash = bytesToHex(blake2b256(canonicalBytes(evidence)));
                 if (fileHash === voter.voteHash) {
                     verifiedVoters.push(voter);
                     debug(`[settle] Recovered evidence for ${voter.tokenName} v${voter.version} from disk`);
@@ -1534,7 +1607,7 @@ router.post('/settle', async (req, res) => {
         const tallies = buildBackendTallies(ballot, questionTallies, votersByQuestionRole);
 
         const fullResults: FullResults = {
-            specVersion: '0.3.0',
+            specVersion: PROTOCOL_VERSION,
             ballotId,
             tallies,
             questionTallies,
@@ -1622,12 +1695,18 @@ router.post('/settle', async (req, res) => {
             resultsAddress: getCachedResultsAddress() ?? admin_payment_address,
         });
         const signedFinalizeTx = await admin_wallet.signTx(unsignedFinalizeTx);
+        const finalizeId = `finalize:${ballotName}`;
         const { txHash: finalizeTxHash } = await enqueueAndWait({
-            id: `finalize:${ballotName}`,
+            id: finalizeId,
             type: 'finalize',
             unsignedCborHex: unsignedFinalizeTx,
             signedCborHex: signedFinalizeTx,
         });
+        // F-015: the finalize datum write must reach a confirmed snapshot before
+        // the head is closed, or Close would post the prior confirmed snapshot to
+        // L1 and fan out a stale (601) BallotResult datum. Block on
+        // SnapshotConfirmed (APPLIED), not merely TxValid (ACCEPTED).
+        await txQueue.waitForApplied(finalizeId);
 
         await saveFinalizeResponse({
             txHash: finalizeTxHash,
