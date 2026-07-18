@@ -1,14 +1,16 @@
 name: Release
 
 # Runs on every push to main. changesets/action checks for pending changeset
-# files: if there are any, it opens/updates a "Version Packages" PR that
-# bumps package.json and rolls the changesets into CHANGELOG.md. Once that PR
-# is merged (no pending changesets left), it runs the tag step below instead,
-# which pushes a v<version> tag — that's what the existing GHCR publish
-# workflow (publish.yml) triggers from.
+# files: if there are any (a staging -> main promotion just landed), it
+# opens/updates a "Version Packages" PR that bumps package.json and rolls the
+# changesets into CHANGELOG.md. Once that PR is merged (no pending changesets
+# left), the same action runs the tag step, which pushes a v<version> tag —
+# that's what publish.yml builds the production image from.
 #
-# Commits, the release PR, and the tag are attributed to the Ekklesia
-# Release Manager GitHub App rather than github-actions[bot].
+# There is no prerelease mode here. Release candidates are ephemeral snapshots
+# built on staging (staging-rc.yml); main only ever cuts clean X.Y.Z versions.
+# Commits, the release PR, and the tag are attributed to the Ekklesia Release
+# Manager App rather than github-actions[bot].
 on:
   push:
     branches: [main]
@@ -35,13 +37,6 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token }}
-
-      - name: Refuse to release while still in prerelease mode
-        run: |
-          if [ -f .changeset/pre.json ]; then
-            echo "::error::.changeset/pre.json is still present — this branch is still in Changesets prerelease mode. Run 'npm run changeset:pre:exit', commit, and include it in the staging -> main promotion before releasing."
-            exit 1
-          fi
 
       - name: Configure git identity for the release bot
         env:
