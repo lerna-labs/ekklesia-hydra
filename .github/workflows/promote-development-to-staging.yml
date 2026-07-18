@@ -22,7 +22,7 @@ jobs:
       - uses: actions/create-github-app-token@v3
         id: app-token
         with:
-          app-id: ${{ vars.RELEASE_MANAGER_APP_ID }}
+          client-id: ${{ vars.RELEASE_MANAGER_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_MANAGER_APP_PRIVATE_KEY }}
 
       - name: Ensure an open development -> staging promotion PR
