@@ -4,4 +4,4 @@
 
 ### Minor Changes
 
-- c213421: Wire the Ekklesia Release Manager bot into release automation. `release.yml` (main) and the new `prerelease.yml` (staging, continuous `rc` prerelease mode) now run as the bot instead of `github-actions[bot]`, and `publish.yml` no longer fires on prerelease tags.
+- c213421: Wire the Ekklesia Release Manager bot into release automation. Version bumps, release PRs, and tags now run as the Release Manager App instead of github-actions[bot]. Features accumulate on development, staging builds ephemeral snapshot release-candidate images for the preprod testnet, and merges to main cut the versioned release and publish the production image to GHCR.
