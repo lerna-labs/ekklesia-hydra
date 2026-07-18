@@ -1,0 +1,58 @@
+name: Backport release to lower branches
+
+# After a production release tag is pushed to main, the lower branches must be
+# resynced to the released baseline so the next cycle computes versions from
+# the right point and the consumed changeset files are dropped everywhere.
+#
+# This opens two backport PRs — main -> staging and main -> development. Because
+# staging carries no committed version state (release candidates are ephemeral
+# snapshots), main is strictly ahead of both, so these merge cleanly without
+# force-pushing. A human (or auto-merge, if enabled) merges them to close the
+# loop.
+on:
+  push:
+    tags:
+      - "v*"
+      - "!v*-*"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  backport:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [staging, development]
+    steps:
+      - uses: actions/create-github-app-token@v3
+        id: app-token
+        with:
+          app-id: ${{ vars.RELEASE_MANAGER_APP_ID }}
+          private-key: ${{ secrets.RELEASE_MANAGER_APP_PRIVATE_KEY }}
+
+      - name: Ensure a backport PR into ${{ matrix.target }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          existing=$(gh pr list --repo "$GITHUB_REPOSITORY" \
+            --base "$TARGET" --head main --state open \
+            --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            echo "Backport PR #$existing into $TARGET already open."
+            exit 0
+          fi
+          ahead=$(gh api "repos/$GITHUB_REPOSITORY/compare/$TARGET...main" --jq '.ahead_by')
+          if [ "$ahead" -eq 0 ]; then
+            echo "$TARGET is already in sync with main; nothing to backport."
+            exit 0
+          fi
+          # skip-changelog is honoured by the CI changelog gate; the backport
+          # carries no changeset of its own.
+          gh pr create --repo "$GITHUB_REPOSITORY" \
+            --base "$TARGET" --head main \
+            --title "Backport ${GITHUB_REF_NAME} to $TARGET" \
+            --body "Resync $TARGET to the released baseline ${GITHUB_REF_NAME}. Merging drops the consumed changeset files and advances the version so the next cycle computes from the correct point." \
+            --label backport --label skip-changelog

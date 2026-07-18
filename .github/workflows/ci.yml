@@ -32,9 +32,13 @@ jobs:
       - run: npm audit --omit=dev --audit-level=critical
 
   changelog:
+    # Require a changeset on feature PRs into development. The Release Manager's
+    # own backport PRs (main -> development) carry no changeset and are exempt,
+    # as are PRs labelled skip-changelog (docs- or CI-only changes).
     if: >-
       github.event_name == 'pull_request' &&
       github.base_ref == 'development' &&
+      github.event.pull_request.user.login != 'ekklesia-release-manager[bot]' &&
       !contains(github.event.pull_request.labels.*.name, 'skip-changelog')
     runs-on: ubuntu-latest
     steps:
