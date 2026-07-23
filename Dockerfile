@@ -1,14 +1,14 @@
 # syntax=docker/dockerfile:1.7
 
 # --- deps: prod deps only
-FROM node:22-slim AS deps
+FROM node:26-slim AS deps
 WORKDIR /app
 COPY package*.json ./
 # If you need private npm, we'll mount a secret in the next RUN:
 RUN --mount=type=secret,id=npmrc,target=/root/.npmrc npm ci --omit=dev
 
 # --- build: compile TS
-FROM node:22-slim AS build
+FROM node:26-slim AS build
 WORKDIR /app
 COPY package*.json ./
 RUN --mount=type=secret,id=npmrc,target=/root/.npmrc npm ci
@@ -20,7 +20,7 @@ COPY src ./src
 RUN npm run build  # -> dist/
 
 # --- runtime: small & clean
-FROM node:22-slim
+FROM node:26-slim
 WORKDIR /app
 ENV NODE_ENV=production
 COPY package.json ./
