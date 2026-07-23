@@ -32,14 +32,14 @@
   "dependencies": {
     "@emurgo/cardano-message-signing-nodejs": "^1.1.0",
     "@emurgo/cardano-serialization-lib-nodejs": "^15.0.3",
-    "@lerna-labs/ekklesia-helpers": "^1.1.0",
+    "@lerna-labs/ekklesia-helpers": "^1.1.1",
     "@lerna-labs/hydra-proof": "^1.0.0-beta.1",
     "@lerna-labs/hydra-sdk": "^2.0.0-beta.1",
-    "@meshsdk/core": "^1.9.0-beta.83",
+    "@meshsdk/core": "^1.9.1",
     "bech32": "^2.0.0",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "tx3-sdk": "^0.7.0"
+    "tx3-sdk": "^0.14.0"
   },
   "overrides": {
     "libsodium-sumo": "0.7.15",
