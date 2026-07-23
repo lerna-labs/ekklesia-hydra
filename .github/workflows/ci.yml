@@ -14,7 +14,7 @@ jobs:
       # (so this required check reports success) but skips the heavy steps.
       - id: run
         run: echo "go=${{ github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'backport') }}" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         if: steps.run.outputs.go == 'true'
       - uses: actions/setup-node@v4
         if: steps.run.outputs.go == 'true'
@@ -35,7 +35,7 @@ jobs:
     steps:
       - id: run
         run: echo "go=${{ github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'backport') }}" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         if: steps.run.outputs.go == 'true'
       - uses: actions/setup-node@v4
         if: steps.run.outputs.go == 'true'
@@ -58,7 +58,7 @@ jobs:
       !contains(github.event.pull_request.labels.*.name, 'skip-changelog')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Require a changeset
