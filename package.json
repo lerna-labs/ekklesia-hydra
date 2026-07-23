@@ -37,7 +37,7 @@
     "@lerna-labs/hydra-sdk": "^2.0.0-beta.1",
     "@meshsdk/core": "^1.9.0-beta.83",
     "bech32": "^2.0.0",
-    "dotenv": "^16.4.5",
+    "dotenv": "^17.4.2",
     "express": "^4.19.2",
     "tx3-sdk": "^0.7.0"
   },
