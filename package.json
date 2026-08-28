@@ -44,7 +44,8 @@
   "overrides": {
     "libsodium-sumo": "0.7.15",
     "path-to-regexp": "0.1.13",
-    "qs": "6.15.3"
+    "qs": "6.15.3",
+    "npm": "10.9.9"
   },
   "engines": {
     "node": ">=22.0.0"
