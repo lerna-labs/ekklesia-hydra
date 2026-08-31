@@ -1,5 +1,5 @@
 blank_issues_enabled: false
 contact_links:
   - name: File an issue
-    url: https://github.com/Lerna-Labs/ekklesia-docs/issues/new/choose
-    about: Issues for the Ekklesia platform are tracked centrally in the docs repository, not here.
+    url: https://github.com/lerna-labs/ekklesia-docs/issues/new/choose
+    about: Issues for the Ekklesia system, including this Hydra integration, are tracked in the docs repository.
