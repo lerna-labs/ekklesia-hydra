@@ -27,7 +27,29 @@ env:
   IMAGE_NAME: lerna-labs/ekklesia-hydra
 
 jobs:
+  gate:
+    # Skip the RC build entirely when staging already matches the released main
+    # (nothing unreleased to preview — e.g. right after a release backport).
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.g.outputs.build }}
+    steps:
+      - id: g
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          main_tree=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq '.commit.tree.sha')
+          head_tree=$(gh api "repos/$GITHUB_REPOSITORY/commits/staging" --jq '.commit.tree.sha')
+          if [ "$main_tree" = "$head_tree" ]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "staging matches the released main; nothing unreleased to preview."
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
   rc-image:
+    needs: gate
+    if: needs.gate.outputs.build == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

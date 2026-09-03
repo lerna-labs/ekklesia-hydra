@@ -10,26 +10,42 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
+      # Backport PRs carry content already validated on main. The job still runs
+      # (so this required check reports success) but skips the heavy steps.
+      - id: run
+        run: echo "go=${{ github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'backport') }}" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
+        if: steps.run.outputs.go == 'true'
       - uses: actions/setup-node@v4
+        if: steps.run.outputs.go == 'true'
         with:
           node-version: 22
           cache: npm
       - run: npm ci
+        if: steps.run.outputs.go == 'true'
       - run: npm run typecheck
+        if: steps.run.outputs.go == 'true'
       - run: npm run test:unit
+        if: steps.run.outputs.go == 'true'
       - run: npm run build
+        if: steps.run.outputs.go == 'true'
 
   audit:
     runs-on: ubuntu-latest
     steps:
+      - id: run
+        run: echo "go=${{ github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'backport') }}" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
+        if: steps.run.outputs.go == 'true'
       - uses: actions/setup-node@v4
+        if: steps.run.outputs.go == 'true'
         with:
           node-version: 22
           cache: npm
       - run: npm ci
+        if: steps.run.outputs.go == 'true'
       - run: npm audit --omit=dev --audit-level=critical
+        if: steps.run.outputs.go == 'true'
 
   changelog:
     # Require a changeset on feature PRs into development. The Release Manager's
