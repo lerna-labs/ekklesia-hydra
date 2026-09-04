@@ -9,6 +9,9 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # Only checks out the repo and runs local build/test scripts.
+    permissions:
+      contents: read
     steps:
       # Backport PRs carry content already validated on main. The job still runs
       # (so this required check reports success) but skips the heavy steps.
@@ -32,6 +35,9 @@ jobs:
 
   audit:
     runs-on: ubuntu-latest
+    # Only checks out the repo and runs `npm audit` locally.
+    permissions:
+      contents: read
     steps:
       - id: run
         run: echo "go=${{ github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'backport') }}" >> "$GITHUB_OUTPUT"
@@ -57,6 +63,9 @@ jobs:
       github.event.pull_request.user.login != 'ekklesia-release-manager[bot]' &&
       !contains(github.event.pull_request.labels.*.name, 'skip-changelog')
     runs-on: ubuntu-latest
+    # Only checks out the repo and diffs it against the base branch locally.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
