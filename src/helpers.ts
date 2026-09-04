@@ -362,6 +362,32 @@ export async function initialize(): Promise<InitializePayload> {
 
 const HISTORY_DIR = path.join(IPFS_STAGING_DIR, 'history');
 
+/**
+ * Voter IDs reach `appendVoteHistory`/`getVoteHistory` from `req.body` (POST
+ * /vote) and `req.params` (GET /audit/vote/:voterId) and are used verbatim
+ * to build a filename below. `bech32.decode` (used elsewhere for
+ * `voterIdToTokenName`/`voterIdHrp`) is not a sufficient guard here on its
+ * own: its charset check on the HRP accepts any printable ASCII character in
+ * the 33-126 range, which includes "." and "/", and its checksum is computed
+ * over whatever prefix is supplied rather than restricting which prefixes
+ * are legal — so a string with a hostile HRP and a correctly computed
+ * checksum still passes `bech32.decode()` cleanly.
+ *
+ * This pattern additionally anchors the HRP to the fixed set of roles this
+ * system actually issues (`drep`, `pool`, `calidus`, `stake`, `stake_test`)
+ * and restricts the data part to bech32's own 32-character alphabet. Every
+ * character either half of the pattern allows is a plain ASCII letter,
+ * digit, or the single `1` separator — none of them can form a directory
+ * traversal sequence, an absolute-path prefix, or a null byte.
+ */
+const VOTER_ID_PATTERN =
+    /^(?:drep|pool|calidus|stake|stake_test)1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{6,90}$/;
+
+/** True if `voterId` is a well-formed, known-role bech32 voter identifier. */
+export function isValidVoterId(voterId: unknown): voterId is string {
+    return typeof voterId === 'string' && VOTER_ID_PATTERN.test(voterId);
+}
+
 /** Ensure the history directory exists. */
 async function ensureHistoryDir(): Promise<void> {
     await fs.mkdir(HISTORY_DIR, { recursive: true });
@@ -369,6 +395,12 @@ async function ensureHistoryDir(): Promise<void> {
 
 /** Append a history entry for a voter. */
 export async function appendVoteHistory(voterId: string, entry: VoteHistoryEntry): Promise<void> {
+    // Reject outright rather than stripping to something path-safe — a
+    // rewritten value would silently point the write at a different voter's
+    // (or no voter's) history file with no way for the caller to tell.
+    if (!isValidVoterId(voterId)) {
+        throw new Error(`Invalid voter ID: "${voterId}" is not a recognized bech32 voter identifier`);
+    }
     await ensureHistoryDir();
     const filePath = path.join(HISTORY_DIR, `${voterId}.json`);
     let history: VoteHistoryEntry[] = [];
@@ -384,6 +416,14 @@ export async function appendVoteHistory(voterId: string, entry: VoteHistoryEntry
 
 /** Read the full vote history chain for a voter. */
 export async function getVoteHistory(voterId: string): Promise<VoteHistoryEntry[]> {
+    // Same rejection as appendVoteHistory, but fails soft: every caller here
+    // already reached this point through a vote-cache lookup or a validated
+    // registration, so a value that fails this check has no history to
+    // return, and this route (GET /audit/vote/:voterId) has no surrounding
+    // try/catch to turn a thrown error into a response.
+    if (!isValidVoterId(voterId)) {
+        return [];
+    }
     const filePath = path.join(HISTORY_DIR, `${voterId}.json`);
     try {
         const raw = await fs.readFile(filePath, 'utf-8');
