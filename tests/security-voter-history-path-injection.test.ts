@@ -76,6 +76,14 @@ describe('js/path-injection #14, #15, #16 — voter history file naming', () => 
             const words = bech32.toWords(Buffer.from('deadbeef', 'hex'));
             return bech32.encode('addr', words, 200);
         })(),
+        // calidus is a well-formed bech32 identifier but not a role
+        // ROLE_TOKEN_TAG mints a voter token for — voterIdToTokenName
+        // refuses it explicitly (F-001). This pattern must agree.
+        'calidus (signing witness, not a voter identity — F-001)': (() => {
+            const bytes = Buffer.alloc(29, 0xab);
+            bytes[0] = 0x22;
+            return bech32.encode('calidus', bech32.toWords(bytes), 200);
+        })(),
     };
 
     describe('isValidVoterId', () => {

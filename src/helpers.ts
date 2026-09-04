@@ -373,15 +373,28 @@ const HISTORY_DIR = path.join(IPFS_STAGING_DIR, 'history');
  * are legal — so a string with a hostile HRP and a correctly computed
  * checksum still passes `bech32.decode()` cleanly.
  *
- * This pattern additionally anchors the HRP to the fixed set of roles this
- * system actually issues (`drep`, `pool`, `calidus`, `stake`, `stake_test`)
- * and restricts the data part to bech32's own 32-character alphabet. Every
+ * This pattern additionally anchors the HRP to `ROLE_TOKEN_TAG`'s keys — the
+ * exact set of roles this system ever mints a voter token for — and
+ * restricts the data part to bech32's own 32-character alphabet. Every
  * character either half of the pattern allows is a plain ASCII letter,
  * digit, or the single `1` separator — none of them can form a directory
  * traversal sequence, an absolute-path prefix, or a null byte.
+ *
+ * Deliberately excludes `calidus`: it decodes as a well-formed bech32
+ * identifier, but `voterIdToTokenName` refuses it (a calidus key is a
+ * signing witness, not a voter identity — minting it a voter token would
+ * give an SPO a second vote alongside their pool token). Deriving the
+ * alternation from `ROLE_TOKEN_TAG` keeps this pattern in lockstep with that
+ * rule instead of maintaining a second, separately-written role list that
+ * could drift from it.
+ *
+ * The alternation is sorted longest-first so `stake_test1...` matches on the
+ * first attempt rather than relying on backtracking past `stake`.
  */
-const VOTER_ID_PATTERN =
-    /^(?:drep|pool|calidus|stake|stake_test)1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{6,90}$/;
+const VOTER_ID_HRPS = Object.keys(ROLE_TOKEN_TAG).sort((a, b) => b.length - a.length);
+const VOTER_ID_PATTERN = new RegExp(
+    `^(?:${VOTER_ID_HRPS.join('|')})1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{6,90}$`,
+);
 
 /** True if `voterId` is a well-formed, known-role bech32 voter identifier. */
 export function isValidVoterId(voterId: unknown): voterId is string {
