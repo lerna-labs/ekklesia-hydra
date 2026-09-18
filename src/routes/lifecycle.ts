@@ -430,7 +430,6 @@ router.post('/prime', async (_req, res) => {
  *   without disturbing any in-head state. Response includes `alreadyOpen: true`.
  */
 router.post('/start', async (req, res) => {
-    const wrangler = new Wrangler(process.env.HYDRA_API_URL, undefined, hydraMonitor);
     const utxos = req.body.utxos as Array<{ txHash: string; outputIndex: number }> | undefined;
     const ballotIpfsCid = req.body.ballotIpfsCid as string | undefined;
     const ballotPolicy = req.body.ballotPolicy as string | undefined;
@@ -450,6 +449,21 @@ router.post('/start', async (req, res) => {
         if (!u.txHash || u.outputIndex === undefined || u.outputIndex < 0) {
             return error(res, 'INVALID_INPUT', `Bad UTxO ref: ${JSON.stringify(u)}`, 400);
         }
+    }
+
+    // Wrangler's constructor reads HYDRA_API_URL and BLOCKFROST_API_KEY from
+    // the environment and throws synchronously if either is unset. Construct
+    // it only after the request-shape guards above (so a bad request against
+    // a misconfigured instance still reports on its own merits) and inside a
+    // try/catch (an async handler in Express 4 does not turn a synchronous
+    // throw into a response on its own — the request would otherwise hang
+    // until the client times out).
+    let wrangler: Wrangler;
+    try {
+        wrangler = new Wrangler(process.env.HYDRA_API_URL, undefined, hydraMonitor);
+    } catch (err: any) {
+        console.error('Failed to initialize Wrangler for /start:', err);
+        return error(res, 'CLIENT_INIT_FAILED', err?.message || 'Failed to initialize Hydra client', 503);
     }
 
     try {
