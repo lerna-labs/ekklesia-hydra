@@ -1,49 +1,15 @@
-# Contributing
+# Dependency overrides
 
-Thanks for your interest in contributing to ekklesia-hydra.
+`package.json` carries an `overrides` block that forces a resolved version for
+a package this project doesn't depend on directly. Every entry exists to close
+a vulnerability in a transitive dependency, with one exception noted below.
+Before touching an entry, check whether the direct dependency that pulls the
+package in question has since shipped a version that resolves to a patched
+copy on its own; if it has, bumping that direct dependency is preferable to
+carrying the override, since an override only rewrites this project's own
+installed tree, not what a consumer of a published package resolves.
 
-## Branching
-
-`development` is the integration branch — branch from it, and open your pull
-request back against it. Changes flow `development` → `staging` → `main` as
-they're promoted toward release; `main` is what ships.
-
-## Local checks
-
-Before opening a pull request, run these locally:
-
-```bash
-npm run typecheck    # tsc --noEmit
-npm run test:unit    # vitest unit suite
-npm run build        # esbuild -> dist/
-```
-
-These are also what CI runs on your pull request.
-
-The end-to-end (`npm run test:e2e`) and load (`npm run test:load`) suites
-require live infrastructure (a running Hydra node, IPFS, Blockfrost access,
-etc.) that CI doesn't have. They're run manually against a real environment
-and are **not** part of the default PR gate.
-
-## Changelog entries
-
-Every change needs a changelog entry, added via `npx changeset` in your
-branch. CI fails a pull request into `development` that's missing one unless
-it's labeled to skip.
-
-## Dependency overrides
-
-`package.json` carries an `overrides` block that forces a resolved version
-for a package this project doesn't depend on directly. Every entry exists to
-close a vulnerability in a transitive dependency, with one exception noted
-below. Before touching an entry, check whether the direct dependency that
-pulls the package in question has since shipped a version that resolves to a
-patched copy on its own; if it has, bumping that direct dependency is
-preferable to carrying the override, since an override only rewrites this
-project's own installed tree, not what a consumer of a published package
-resolves.
-
-### `npm`
+## `npm`
 
 This is the one entry that looks like dead weight and isn't. Three copies of
 `@cardano-sdk/crypto` in this tree (pulled in through `@meshsdk/provider` and
@@ -69,7 +35,7 @@ branches carry no `npm` override and resolve
 7.5.22. Removing the override reintroduces the critical without changing a
 single line outside `package.json`.
 
-### `libsodium-sumo`
+## `libsodium-sumo`
 
 `libsodium-sumo: 0.7.15` has no advisory behind it in the GitHub Advisory
 Database or anywhere else searched while writing this section. It was added
@@ -80,16 +46,10 @@ Until someone restates that requirement precisely, treat this entry as
 unverified rather than as either a safe removal target or a confirmed ABI
 pin.
 
-### Everything else
+## Everything else
 
 The remaining entries (`path-to-regexp`, `qs`, `nanoid`, `postcss`,
 `mongoose`, `body-parser`, the nested `js-yaml` pins under
 `@changesets/parse` and `read-yaml-file`, `ip-address`, and `undici`) each
 close a specific advisory in a transitive dependency; the advisory IDs are in
 this project's `CHANGELOG.md` under the change that added or moved each one.
-
-## Filing issues
-
-Issues for the Ekklesia platform are tracked centrally in the
-[ekklesia-docs](https://github.com/Lerna-Labs/ekklesia-docs) repository, not
-here — please file bugs and feature requests there.
