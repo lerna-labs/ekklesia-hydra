@@ -68,6 +68,8 @@ describe('js/path-injection #14, #15, #16 — voter history file naming', () => 
         'directory traversal with a bech32-shaped prefix': `drep1${'../../../etc/passwd'}`,
         'absolute path': '/etc/passwd',
         'null byte': 'drep1' + String.fromCharCode(0) + 'malicious',
+        'percent-encoded traversal separators': 'drep1%2e%2e%2fetc%2fpasswd',
+        'backslash traversal separators': 'drep1..\\..\\..\\windows\\system32',
         'hostile HRP with a valid bech32 checksum': (() => {
             const words = bech32.toWords(Buffer.from('deadbeef', 'hex'));
             return bech32.encode('../../../etc/passwd', words, 200);
