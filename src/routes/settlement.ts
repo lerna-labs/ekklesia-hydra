@@ -956,7 +956,7 @@ router.post('/count', async (req, res) => {
         const detailed = results.map((r, i) => {
             if (r.status === 'fulfilled') return r.value;
             const reason = (r.reason as Error)?.message ?? 'unknown';
-            console.error(`[count] FULL ERROR for ${allVotes[i].voterId}:`, reason);
+            console.error('[count] FULL ERROR for %s:', allVotes[i].voterId, reason);
             return { voterId: allVotes[i].voterId, error: reason };
         });
 
@@ -1076,7 +1076,7 @@ router.post('/settle/burn', async (_req, res) => {
             if (burnResults[i].status === 'fulfilled') {
                 burned++;
             } else {
-                console.error(`[settle/burn] FULL ERROR for ${headVoters[i].tokenName}:`, (burnResults[i] as PromiseRejectedResult).reason?.message);
+                console.error('[settle/burn] FULL ERROR for %s:', headVoters[i].tokenName, (burnResults[i] as PromiseRejectedResult).reason?.message);
                 burnFailed++;
             }
         }
@@ -1519,7 +1519,7 @@ router.post('/settle', async (req, res) => {
             if (burnResults[i].status === 'fulfilled') {
                 burned++;
             } else {
-                console.error(`[settle/burn] FULL ERROR for ${headVoters[i].tokenName}:`, (burnResults[i] as PromiseRejectedResult).reason?.message);
+                console.error('[settle/burn] FULL ERROR for %s:', headVoters[i].tokenName, (burnResults[i] as PromiseRejectedResult).reason?.message);
                 burnFailed++;
             }
         }

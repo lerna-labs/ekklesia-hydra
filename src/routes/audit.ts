@@ -63,7 +63,7 @@ router.get('/audit/vote/:voterId', async (req, res) => {
     try {
         evidence = await ipfs.fetchJson<VoteEvidence>(cacheEntry.ipfsCid);
     } catch (err: any) {
-        console.warn(`Could not fetch evidence from IPFS for ${voterId}:`, err.message);
+        console.warn('Could not fetch evidence from IPFS for %s:', voterId, err.message);
     }
 
     // Fetch vote history chain
