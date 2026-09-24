@@ -467,6 +467,7 @@ export type ErrorCode =
     | 'HYDRA_UNREACHABLE'
     | 'NO_BALLOT_CACHED'
     | 'CLOSE_TOKEN_INVALID'
+    | 'RATE_LIMITED'
     | 'INTERNAL_ERROR';
 
 /** Send a standardized success response. */

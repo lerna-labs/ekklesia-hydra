@@ -7,6 +7,7 @@ import { hydraValueToAmounts } from '../tx-builder.js';
 import { getCachedBallot, getCachedBallotId, getCachedBallotIdentity, getCachedResultsAddress } from './lifecycle.js';
 import { BALLOT_INSTANCE_PREFIX, BALLOT_DEFINITION_PREFIX, resolveRole, PROTOCOL_VERSION } from '../types.js';
 import { canonicalBytes } from '@lerna-labs/ekklesia-helpers/json';
+import { adminActionLimiter, readActionLimiter } from '../rate-limit.js';
 import type {
     BackendGroupTally,
     BackendOptionResult,
@@ -736,7 +737,7 @@ function cacheToVoterRefs(votes: VoteCacheEntry[]): VoterRef[] {
  *   ballotId: string       — ballot identifier (ULID or tx hash)
  *   ballotName: string     — hex asset name suffix (fingerprint) of the (601) token
  */
-router.post('/finalize', async (_req, res) => {
+router.post('/finalize', adminActionLimiter, async (_req, res) => {
     const ballot = getCachedBallot();
     if (!ballot) {
         return error(res, 'NO_BALLOT_CACHED', 'No ballot definition cached. Was /start called with ballotIpfsCid?', 400);
@@ -990,7 +991,7 @@ router.post('/count', async (req, res) => {
  * No body — voter token policy is derived from the admin wallet's native
  * script; ballot identity comes from the cache populated by /start.
  */
-router.post('/settle/burn', async (_req, res) => {
+router.post('/settle/burn', adminActionLimiter, async (_req, res) => {
     // Ensure vote queue is drained before settlement begins
     if (!txQueue.isDrained()) {
         const qs = txQueue.status();
@@ -1105,7 +1106,7 @@ router.post('/settle/burn', async (_req, res) => {
  * No body — identity (ballotId, ballotName, ballotPolicy) is read from the
  * cache populated by /start. One head, one ballot.
  */
-router.post('/settle/finalize', async (_req, res) => {
+router.post('/settle/finalize', adminActionLimiter, async (_req, res) => {
     const ballot = getCachedBallot();
     if (!ballot) {
         return error(res, 'NO_BALLOT_CACHED', 'No ballot definition cached', 400);
@@ -1374,7 +1375,7 @@ router.post('/settle/finalize', async (_req, res) => {
  * Returns 404 when no finalize has run this session — /start wipes the
  * file when it opens a fresh head.
  */
-router.get('/results', async (_req, res) => {
+router.get('/results', readActionLimiter, async (_req, res) => {
     try {
         const fs = await import('node:fs/promises');
         const pathMod = await import('node:path');
@@ -1447,7 +1448,7 @@ router.post('/settle/close', async (req, res) => {
  * Identity fields (ballotId, ballotName, ballotPolicy) are read from the
  * cache populated by /start. One head, one ballot.
  */
-router.post('/settle', async (req, res) => {
+router.post('/settle', adminActionLimiter, async (req, res) => {
     const { closeToken } = req.body as { closeToken: string };
 
     if (!closeToken) {
