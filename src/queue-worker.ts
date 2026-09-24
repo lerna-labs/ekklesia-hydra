@@ -212,7 +212,7 @@ export class QueueWorker {
             await this.queue.markSubmitted(entry.id);
             debug(`[queue-worker] Submitted: ${entry.id} (${entry.txHash.slice(0, 16)}…)`);
         } catch (err: any) {
-            console.error(`[queue-worker] Submit failed for ${entry.id}:`, err.message);
+            console.error('[queue-worker] Submit failed for %s:', entry.id, err.message);
             // Don't mark as failed — leave as BUILT for retry on next dispatch
         }
     }
