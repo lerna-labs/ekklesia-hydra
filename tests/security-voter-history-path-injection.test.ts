@@ -15,7 +15,10 @@
  * `isValidVoterId` closes it by anchoring the HRP to the fixed role set this
  * system issues and the data part to bech32's own alphabet, and
  * `appendVoteHistory`/`getVoteHistory` reject before ever building a path
- * from a value that fails the check.
+ * from a value that fails the check. Both functions additionally resolve
+ * the candidate path and confirm it still lands inside the history
+ * directory before either touches the filesystem, so the write or read is
+ * safe even for an input that somehow cleared the allowlist above.
  */
 
 import { promises as fsp } from 'node:fs';
@@ -68,6 +71,8 @@ describe('js/path-injection #14, #15, #16 — voter history file naming', () => 
         'directory traversal with a bech32-shaped prefix': `drep1${'../../../etc/passwd'}`,
         'absolute path': '/etc/passwd',
         'null byte': 'drep1' + String.fromCharCode(0) + 'malicious',
+        'percent-encoded traversal separators': 'drep1%2e%2e%2fetc%2fpasswd',
+        'backslash traversal separators': 'drep1..\\..\\..\\windows\\system32',
         'hostile HRP with a valid bech32 checksum': (() => {
             const words = bech32.toWords(Buffer.from('deadbeef', 'hex'));
             return bech32.encode('../../../etc/passwd', words, 200);

@@ -363,6 +363,15 @@ export async function initialize(): Promise<InitializePayload> {
 const HISTORY_DIR = path.join(IPFS_STAGING_DIR, 'history');
 
 /**
+ * Absolute form of `HISTORY_DIR` with a trailing separator, so a resolved
+ * candidate path can only match this prefix by landing inside the directory
+ * itself — not merely by sharing its name as a string prefix (a sibling
+ * directory like `history-evil` starts with `.../history` but not with
+ * `.../history/`).
+ */
+const HISTORY_ROOT = path.resolve(HISTORY_DIR) + path.sep;
+
+/**
  * Voter IDs reach `appendVoteHistory`/`getVoteHistory` from `req.body` (POST
  * /vote) and `req.params` (GET /audit/vote/:voterId) and are used verbatim
  * to build a filename below. `bech32.decode` (used elsewhere for
@@ -415,7 +424,14 @@ export async function appendVoteHistory(voterId: string, entry: VoteHistoryEntry
         throw new Error(`Invalid voter ID: "${voterId}" is not a recognized bech32 voter identifier`);
     }
     await ensureHistoryDir();
-    const filePath = path.join(HISTORY_DIR, `${voterId}.json`);
+    // Belt-and-braces on top of the allowlist above: resolve the candidate
+    // path and confirm it still lands inside HISTORY_DIR before either
+    // filesystem call below runs, so a write is safe even if the allowlist
+    // were ever loosened.
+    const filePath = path.resolve(HISTORY_DIR, `${voterId}.json`);
+    if (!filePath.startsWith(HISTORY_ROOT)) {
+        throw new Error(`Invalid voter ID: "${voterId}" resolves outside the vote history directory`);
+    }
     let history: VoteHistoryEntry[] = [];
     try {
         const raw = await fs.readFile(filePath, 'utf-8');
@@ -437,7 +453,11 @@ export async function getVoteHistory(voterId: string): Promise<VoteHistoryEntry[
     if (!isValidVoterId(voterId)) {
         return [];
     }
-    const filePath = path.join(HISTORY_DIR, `${voterId}.json`);
+    // Same containment check as appendVoteHistory, guarding this read.
+    const filePath = path.resolve(HISTORY_DIR, `${voterId}.json`);
+    if (!filePath.startsWith(HISTORY_ROOT)) {
+        return [];
+    }
     try {
         const raw = await fs.readFile(filePath, 'utf-8');
         return JSON.parse(raw);
