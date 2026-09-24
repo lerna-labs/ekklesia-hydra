@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { getUtxoSet } from '@lerna-labs/hydra-sdk';
 import { initialize, voteCache, IPFS_STAGING_DIR, success, error } from '../helpers.js';
 import { getCachedBallot } from './lifecycle.js';
+import { adminActionLimiter } from '../rate-limit.js';
 
 const router = Router();
 
@@ -88,7 +89,7 @@ router.get('/voter/:voterId', (req, res) => {
  * Used between E2E test runs to prevent stale votes from previous sessions
  * interfering with the current test.
  */
-router.post('/flush-cache', async (_, res) => {
+router.post('/flush-cache', adminActionLimiter, async (_, res) => {
     try {
         const fs = await import('node:fs/promises');
         const path = await import('node:path');

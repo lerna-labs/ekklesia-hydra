@@ -7,6 +7,7 @@ import path from 'node:path';
 import type { BallotDefinition } from '../types.js';
 import { validateBallotDefinition } from '../ballot-validation.js';
 import { buildPrimeSnapshotTx, hydraValueToAmounts, type Amount } from '../tx-builder.js';
+import { adminActionLimiter } from '../rate-limit.js';
 
 const router = Router();
 
@@ -429,7 +430,7 @@ router.post('/prime', async (_req, res) => {
  *   re-calling /start with the same body rebuilds the in-memory caches
  *   without disturbing any in-head state. Response includes `alreadyOpen: true`.
  */
-router.post('/start', async (req, res) => {
+router.post('/start', adminActionLimiter, async (req, res) => {
     const utxos = req.body.utxos as Array<{ txHash: string; outputIndex: number }> | undefined;
     const ballotIpfsCid = req.body.ballotIpfsCid as string | undefined;
     const ballotPolicy = req.body.ballotPolicy as string | undefined;
