@@ -15,10 +15,7 @@
  * `isValidVoterId` closes it by anchoring the HRP to the fixed role set this
  * system issues and the data part to bech32's own alphabet, and
  * `appendVoteHistory`/`getVoteHistory` reject before ever building a path
- * from a value that fails the check. Both functions additionally resolve
- * the candidate path and confirm it still lands inside the history
- * directory before either touches the filesystem, so the write or read is
- * safe even for an input that somehow cleared the allowlist above.
+ * from a value that fails the check.
  */
 
 import { promises as fsp } from 'node:fs';
