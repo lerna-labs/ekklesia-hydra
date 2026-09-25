@@ -20,6 +20,9 @@ token back to L1 at an operator-chosen custody address.
   voting methods (binary, ranked, weighted, etc.) and validation rules.
 - **[`docs/AUDITOR_GUIDE.md`](docs/AUDITOR_GUIDE.md)** — step-by-step
   third-party verification of a finalized ballot.
+- **[`docs/dependency-overrides.md`](docs/dependency-overrides.md)** — why
+  each entry in `package.json`'s `overrides` block exists, and what it
+  takes to remove one safely.
 - **[`schemas/`](schemas/)** — JSON Schemas for the ballot, vote-evidence,
   and results IPFS payloads. Usable directly with Ajv / `check-jsonschema`
   or for generating types in any language.
@@ -29,8 +32,16 @@ token back to L1 at an operator-chosen custody address.
 ```sh
 npm install
 npm run typecheck    # tsc --noEmit
+npm run test:unit    # vitest unit suite
 npm run build        # esbuild → dist/ (ESM)
 npm run dev          # tsx watch (local development)
 npm start            # node dist/index.js
 npm run test:e2e     # vitest integration tests (requires live env)
 ```
+
+Before opening a pull request, run `typecheck`, `test:unit` and `build`
+locally; CI runs the same three. The end-to-end (`npm run test:e2e`) and
+load (`npm run test:load`) suites need live infrastructure (a running Hydra
+node, IPFS, Blockfrost access, etc.) that CI doesn't have, so they're run
+manually against a real environment and aren't part of the pull request
+gate.
