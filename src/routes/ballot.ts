@@ -13,6 +13,18 @@ import {validateBallotDefinition} from '../ballot-validation.js';
 
 const router = Router();
 
+/** Matches a Cardano transaction hash: exactly 64 lowercase hex characters (blake2b_256 digest). */
+const TX_HASH_RE = /^[0-9a-f]{64}$/;
+
+/**
+ * True if `value` is a well-formed Cardano transaction hash. Any UTxO field
+ * that gets interpolated into an outbound Blockfrost request URL must pass
+ * this check first — see the (600) handoff below.
+ */
+export function isValidTxHash(value: unknown): value is string {
+    return typeof value === 'string' && TX_HASH_RE.test(value);
+}
+
 /**
  * Convert a UTC ISO timestamp to an absolute Cardano slot number.
  *
@@ -643,6 +655,11 @@ router.post('/prepare/handoff', async (req, res) => {
         return error(res, 'MISSING_FIELDS', 'Missing required field: definitionUtxo', 400);
     }
 
+    if (!isValidTxHash(definitionUtxo.txHash)) {
+        return error(res, 'INVALID_INPUT', 'definitionUtxo.txHash must be exactly 64 lowercase hex characters', 400);
+    }
+    const definitionTxHash = definitionUtxo.txHash;
+
     const status = hydraMonitor.headStatus;
     if (status !== 'OPEN') {
         return error(res, 'CONFLICT', `Handoff requires the Hydra head to be OPEN (status: ${status ?? 'UNKNOWN'}). Run /start first.`, 409);
@@ -655,7 +672,7 @@ router.post('/prepare/handoff', async (req, res) => {
         const admin_address = admin_wallet.addresses.enterpriseAddressBech32 as string;
 
         // Fetch the source UTxO
-        const fetched = await blockfrost.fetchUTxOs(definitionUtxo.txHash, definitionUtxo.outputIndex);
+        const fetched = await blockfrost.fetchUTxOs(definitionTxHash, definitionUtxo.outputIndex);
         const sourceUtxo = fetched.find(u => u.input.outputIndex === definitionUtxo.outputIndex);
         if (!sourceUtxo) {
             return error(res, 'INVALID_INPUT', '(600) UTxO not found on-chain (already spent?)', 400);
@@ -679,11 +696,11 @@ router.post('/prepare/handoff', async (req, res) => {
                 ? 'cardano-preprod'
                 : 'cardano-preview';
         const utxoRes = await fetch(
-            `https://${networkPrefix}.blockfrost.io/api/v0/txs/${definitionUtxo.txHash}/utxos`,
+            `https://${networkPrefix}.blockfrost.io/api/v0/txs/${definitionTxHash}/utxos`,
             { headers: { project_id: blockfrostKey } },
         );
         if (!utxoRes.ok) {
-            throw new Error(`Blockfrost /txs/${definitionUtxo.txHash}/utxos failed: ${utxoRes.status}`);
+            throw new Error(`Blockfrost /txs/${definitionTxHash}/utxos failed: ${utxoRes.status}`);
         }
         const utxoData = await utxoRes.json() as {
             outputs: Array<{ output_index: number; inline_datum?: string | null }>;
