@@ -120,7 +120,10 @@ router.post('/prepare', async (req, res) => {
 
     try {
         // --- 1. Initialize wallet with L1 fetcher and timelocked native script ---
-        const blockfrostKey = process.env.BLOCKFROST_API_KEY as string;
+        const blockfrostKey = process.env.BLOCKFROST_API_KEY;
+        if (!blockfrostKey) {
+            return error(res, 'CLIENT_INIT_FAILED', 'Missing required environment variable: BLOCKFROST_API_KEY', 503);
+        }
         const blockfrost = new BlockfrostProvider(blockfrostKey);
         const admin_wallet: MeshWallet = await getAdmin(blockfrostKey);
         const admin_address = admin_wallet.addresses.enterpriseAddressBech32 as string;
@@ -128,7 +131,7 @@ router.post('/prepare', async (req, res) => {
         // Convert voting window open time to a slot for the timelock
         const votingOpenSlot = await timestampToSlot(
             ballot.ekklesia.votingWindow.open,
-            process.env.BLOCKFROST_API_KEY as string,
+            blockfrostKey,
         );
 
         // Create timelocked script: all:[sig(admin), before(votingOpenSlot)]
@@ -355,7 +358,10 @@ router.post('/prepare/cancel', async (req, res) => {
     }
 
     try {
-        const blockfrostKey = process.env.BLOCKFROST_API_KEY as string;
+        const blockfrostKey = process.env.BLOCKFROST_API_KEY;
+        if (!blockfrostKey) {
+            return error(res, 'CLIENT_INIT_FAILED', 'Missing required environment variable: BLOCKFROST_API_KEY', 503);
+        }
         const blockfrost = new BlockfrostProvider(blockfrostKey);
         const admin_wallet: MeshWallet = await getAdmin(blockfrostKey);
         const admin_address = admin_wallet.addresses.enterpriseAddressBech32 as string;
@@ -471,7 +477,10 @@ router.post('/prepare/update', async (req, res) => {
     }
 
     try {
-        const blockfrostKey = process.env.BLOCKFROST_API_KEY as string;
+        const blockfrostKey = process.env.BLOCKFROST_API_KEY;
+        if (!blockfrostKey) {
+            return error(res, 'CLIENT_INIT_FAILED', 'Missing required environment variable: BLOCKFROST_API_KEY', 503);
+        }
         const blockfrost = new BlockfrostProvider(blockfrostKey);
         const admin_wallet: MeshWallet = await getAdmin(blockfrostKey);
         const admin_address = admin_wallet.addresses.enterpriseAddressBech32 as string;
@@ -666,7 +675,10 @@ router.post('/prepare/handoff', async (req, res) => {
     }
 
     try {
-        const blockfrostKey = process.env.BLOCKFROST_API_KEY as string;
+        const blockfrostKey = process.env.BLOCKFROST_API_KEY;
+        if (!blockfrostKey) {
+            return error(res, 'CLIENT_INIT_FAILED', 'Missing required environment variable: BLOCKFROST_API_KEY', 503);
+        }
         const blockfrost = new BlockfrostProvider(blockfrostKey);
         const admin_wallet: MeshWallet = await getAdmin(blockfrostKey);
         const admin_address = admin_wallet.addresses.enterpriseAddressBech32 as string;
@@ -754,7 +766,10 @@ router.post('/sweep', async (req, res) => {
     const { dumpAddress } = req.body as { dumpAddress?: string };
 
     try {
-        const blockfrostKey = process.env.BLOCKFROST_API_KEY as string;
+        const blockfrostKey = process.env.BLOCKFROST_API_KEY;
+        if (!blockfrostKey) {
+            return error(res, 'CLIENT_INIT_FAILED', 'Missing required environment variable: BLOCKFROST_API_KEY', 503);
+        }
         const blockfrost = new BlockfrostProvider(blockfrostKey);
         const admin_wallet: MeshWallet = await getAdmin(blockfrostKey);
         const admin_address = admin_wallet.addresses.enterpriseAddressBech32 as string;
