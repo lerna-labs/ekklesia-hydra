@@ -4,6 +4,7 @@ import { getCachedBallot } from './lifecycle.js';
 import type { VoteEvidence } from '../types.js';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import { readActionLimiter } from '../rate-limit.js';
 
 const router = Router();
 
@@ -63,7 +64,7 @@ router.get('/audit/vote/:voterId', async (req, res) => {
     try {
         evidence = await ipfs.fetchJson<VoteEvidence>(cacheEntry.ipfsCid);
     } catch (err: any) {
-        console.warn(`Could not fetch evidence from IPFS for ${voterId}:`, err.message);
+        console.warn('Could not fetch evidence from IPFS for %s:', voterId, err.message);
     }
 
     // Fetch vote history chain
@@ -105,7 +106,7 @@ router.get('/audit/vote/:voterId', async (req, res) => {
  *   - Total voter count
  *   - IPFS evidence directory CID (if available from finalization)
  */
-router.get('/audit/full', async (_, res) => {
+router.get('/audit/full', readActionLimiter, async (_, res) => {
     const ballot = getCachedBallot();
     const allVotes = voteCache.getAll();
     const evidenceDir = voteCache.getDocumentsDir();

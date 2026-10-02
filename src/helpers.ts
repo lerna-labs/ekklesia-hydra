@@ -362,6 +362,9 @@ export async function initialize(): Promise<InitializePayload> {
 
 const HISTORY_DIR = path.join(IPFS_STAGING_DIR, 'history');
 
+/** Absolute HISTORY_DIR with a trailing separator, so a prefix match requires landing inside the directory rather than merely sharing its name. */
+const HISTORY_ROOT = path.resolve(HISTORY_DIR) + path.sep;
+
 /**
  * Voter IDs reach `appendVoteHistory`/`getVoteHistory` from `req.body` (POST
  * /vote) and `req.params` (GET /audit/vote/:voterId) and are used verbatim
@@ -415,7 +418,11 @@ export async function appendVoteHistory(voterId: string, entry: VoteHistoryEntry
         throw new Error(`Invalid voter ID: "${voterId}" is not a recognized bech32 voter identifier`);
     }
     await ensureHistoryDir();
-    const filePath = path.join(HISTORY_DIR, `${voterId}.json`);
+    // Resolve and confirm containment inside HISTORY_DIR before either filesystem call below.
+    const filePath = path.resolve(HISTORY_DIR, `${voterId}.json`);
+    if (!filePath.startsWith(HISTORY_ROOT)) {
+        throw new Error(`Invalid voter ID: "${voterId}" resolves outside the vote history directory`);
+    }
     let history: VoteHistoryEntry[] = [];
     try {
         const raw = await fs.readFile(filePath, 'utf-8');
@@ -437,7 +444,10 @@ export async function getVoteHistory(voterId: string): Promise<VoteHistoryEntry[
     if (!isValidVoterId(voterId)) {
         return [];
     }
-    const filePath = path.join(HISTORY_DIR, `${voterId}.json`);
+    const filePath = path.resolve(HISTORY_DIR, `${voterId}.json`);
+    if (!filePath.startsWith(HISTORY_ROOT)) {
+        return [];
+    }
     try {
         const raw = await fs.readFile(filePath, 'utf-8');
         return JSON.parse(raw);
@@ -467,6 +477,7 @@ export type ErrorCode =
     | 'HYDRA_UNREACHABLE'
     | 'NO_BALLOT_CACHED'
     | 'CLOSE_TOKEN_INVALID'
+    | 'RATE_LIMITED'
     | 'INTERNAL_ERROR';
 
 /** Send a standardized success response. */
