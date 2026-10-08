@@ -1,5 +1,19 @@
 # @lerna-labs/hydra-middleware
 
+## 1.2.0
+
+### Minor Changes
+
+- cc347ee: Add rate limiting to the expensive admin and settlement route handlers that write to the Hydra head or walk the evidence directory on disk: POST /start, POST /flush-cache, GET /audit/full, POST /finalize, POST /settle/burn, POST /settle/finalize, GET /results, and POST /settle. Defaults are sized for normal operator use (a handful of calls, including retries, per ballot lifecycle) while blocking a request flood.
+
+### Patch Changes
+
+- 7652344: Fix the five L1 ballot handlers (`/prepare`, `/prepare/cancel`, `/prepare/update`, `/prepare/handoff`, `/sweep`) casting an unset `BLOCKFROST_API_KEY` to a string and passing it straight into `BlockfrostProvider`/`getAdmin`. A missing key now returns `503 CLIENT_INIT_FAILED` naming the variable, instead of surfacing as a Blockfrost authentication failure.
+- 711645d: Fix a tainted-format-string sink: request-supplied identifiers were interpolated directly into the first argument of `console.warn`/`console.error` calls that also took a trailing argument, so a `%`-directive placed in the identifier could be parsed by `util.format` and consume or garble that trailing argument instead of being printed literally. Affected call sites in the audit, settlement, and transaction queue logging now pass the identifier as a `%s`-substituted argument instead of baking it into the format string.
+- 072c7d1: Bump the postcss and mongoose dependency overrides to 8.5.28 and 9.10.1, and convert the path-to-regexp, qs, body-parser, and nanoid overrides from exact version pins to caret ranges, so each picks up its next patch release the next time `npm install` runs. This project ships as a Docker image, not a published npm package, so none of these changes affect a downstream consumer's own dependency resolution.
+- 349dcd6: Raise the undici and ip-address dependency overrides to ^6.28.1 and ^10.5.1, the patched releases for GHSA-3wwx-pv8p-q78v and GHSA-2vr4-cq9g-pvrc. The lockfile now resolves undici 6.29.0 and ip-address 10.7.2.
+- d28b0d7: Resolve the vote history file path for a voterId and verify it still lands inside the vote history directory before every read or write, on top of the existing bech32 role allowlist, closing the remaining js/path-injection findings on POST /vote and GET /audit/vote/:voterId.
+
 ## 1.1.2
 
 ### Patch Changes
