@@ -104,9 +104,9 @@ any future `3.x` patch release.
 `@changesets/parse` pins `js-yaml` to `^4.3.1` and `read-yaml-file` pins it
 to `^3.15.1`, fixing GHSA-5p4m-2wfm-xmqj (quadratic CPU consumption on
 crafted input) in both of the two `js-yaml` major lines this tree resolves.
-`ip-address` is pinned to `^10.3.1`, fixing GHSA-mwp4-54f8-5fhr (an
+`ip-address` is pinned to `^10.5.1`, fixing GHSA-mwp4-54f8-5fhr (an
 octal/decimal parsing mismatch that lets a malformed address slip past
-validation). `undici` is pinned to `^6.27.0`, fixing a set of WebSocket
+validation). `undici` is pinned to `^6.28.1`, fixing a set of WebSocket
 denial-of-service issues (GHSA-vxpw-j846-p89q, GHSA-vrm6-8vpv-qv8q,
 GHSA-v9p9-hfj2-hcw8). All three were already caret ranges and needed no
 change; each still resolves clear of every advisory against it.
