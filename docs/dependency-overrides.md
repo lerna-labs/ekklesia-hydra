@@ -20,37 +20,6 @@ installed tree, not what a consumer of a published package resolves.
 
 ## Functional pins
 
-### `npm`
-
-This is the one entry that looks like dead weight and isn't. Three copies of
-`@cardano-sdk/crypto` in this tree (pulled in through `@meshsdk/provider` and
-its own nested `@cardano-sdk/input-selection` and `@cardano-sdk/key-management`)
-declare `npm: ^9.3.0` as a plain runtime dependency. Left unconstrained, that
-resolves to npm 9.9.4, which bundles `tar` 6.2.1. That `tar` version falls
-inside GHSA-23hp-3jrh-7fpw / CVE-2026-59873, a critical decompression denial
-of service (an attacker-supplied archive with a small compressed size and an
-oversized claimed content length exhausts disk space during extraction),
-fixed in `tar` 7.5.19. The vulnerable range is `<= 7.5.18`.
-
-No override on `tar` itself can reach this. npm ships its own dependencies
-bundled inside its package tarball: every package under
-`node_modules/npm/node_modules/` is recorded in the lockfile with
-`"inBundle": true` and no `resolved` field, and `overrides` cannot rewrite a
-bundled dependency. The only available fix is bumping the package that does
-the bundling, which is why the override targets `npm` and not `tar`.
-
-`npm: 11.19.1` resolves the bundled copy to `tar` 7.5.22, outside the
-vulnerable range. This is verifiable directly: the `staging` and `main`
-branches carry no `npm` override and resolve
-`node_modules/npm/node_modules/tar` to 6.2.1; `development` resolves it to
-7.5.22. Removing the override reintroduces the critical without changing a
-single line outside `package.json`.
-
-A caret range is the wrong shape here because npm's own bundled dependency
-tree is not monotonic across releases: a newer npm version can ship an older,
-vulnerable copy of a bundled package. The pin has to be revisited by hand
-against each candidate npm release rather than left to float.
-
 ### `libsodium-sumo`
 
 `libsodium-sumo: 0.7.15` has no advisory behind it; it is a functional pin.
