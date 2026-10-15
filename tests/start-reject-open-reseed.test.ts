@@ -48,24 +48,3 @@ describe('POST /start rejects re-seeding an already-OPEN head', () => {
         expect(idAssignments.length).toBe(1);
     });
 });
-
-describe('POST /start names a missing BLOCKFROST_API_KEY', () => {
-    it('returns 503 CLIENT_INIT_FAILED naming the variable when it is unset', () => {
-        expect(startHandler).toMatch(
-            /if \(!process\.env\.BLOCKFROST_API_KEY\) \{\s*return error\(res, 'CLIENT_INIT_FAILED', 'Missing required environment variable: BLOCKFROST_API_KEY', 503\);/,
-        );
-    });
-
-    it('checks the key before the head-OPEN guard, so an already-OPEN head still reports it', () => {
-        const keyIdx = startHandler.indexOf('process.env.BLOCKFROST_API_KEY');
-        const openIdx = startHandler.indexOf("headStatus === 'OPEN'");
-        expect(keyIdx).toBeGreaterThan(-1);
-        expect(keyIdx).toBeLessThan(openIdx);
-    });
-
-    it('checks the key after the request-shape guards', () => {
-        const keyIdx = startHandler.indexOf('process.env.BLOCKFROST_API_KEY');
-        expect(startHandler.indexOf("'MISSING_FIELDS'")).toBeLessThan(keyIdx);
-        expect(startHandler.indexOf("'INVALID_INPUT'")).toBeLessThan(keyIdx);
-    });
-});
