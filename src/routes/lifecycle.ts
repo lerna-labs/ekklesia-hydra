@@ -452,13 +452,18 @@ router.post('/start', adminActionLimiter, async (req, res) => {
         }
     }
 
-    // Wrangler's constructor reads HYDRA_API_URL and BLOCKFROST_API_KEY from
-    // the environment and throws synchronously if either is unset. Construct
-    // it only after the request-shape guards above (so a bad request against
-    // a misconfigured instance still reports on its own merits) and inside a
-    // try/catch (an async handler in Express 4 does not turn a synchronous
-    // throw into a response on its own — the request would otherwise hang
-    // until the client times out).
+    // Wrangler's constructor throws synchronously if HYDRA_API_URL is unset,
+    // but it reads BLOCKFROST_API_KEY lazily on first layer 1 use, so the key
+    // is checked explicitly here. Both checks run after the request-shape
+    // guards above (so a bad request against a misconfigured instance still
+    // reports on its own merits) and before the head-OPEN guard below (so a
+    // misconfiguration is named whatever the head state). The construction
+    // sits in a try/catch because an async handler in Express 4 does not turn
+    // a synchronous throw into a response on its own: the request would
+    // otherwise hang until the client times out.
+    if (!process.env.BLOCKFROST_API_KEY) {
+        return error(res, 'CLIENT_INIT_FAILED', 'Missing required environment variable: BLOCKFROST_API_KEY', 503);
+    }
     let wrangler: Wrangler;
     try {
         wrangler = new Wrangler(process.env.HYDRA_API_URL, undefined, hydraMonitor);
