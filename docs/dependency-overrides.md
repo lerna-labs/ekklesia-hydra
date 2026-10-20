@@ -101,13 +101,15 @@ any future `3.x` patch release.
 
 ### Nested `js-yaml`, `ip-address`, `undici`
 
-`@changesets/parse` pins `js-yaml` to `^4.3.1` and `read-yaml-file` pins it
-to `^3.15.1`, fixing GHSA-5p4m-2wfm-xmqj (quadratic CPU consumption on
-crafted input) in both of the two `js-yaml` major lines this tree resolves.
-`ip-address` is pinned to `^10.5.1`, the patched release for
+`@changesets/parse` pins `js-yaml` to `^4.3.2` and `read-yaml-file` pins it
+to `^3.15.2`, fixing GHSA-2883-xcg3-v3hh in both of the two `js-yaml` major
+lines this tree resolves; the earlier floors came from GHSA-5p4m-2wfm-xmqj
+(quadratic CPU consumption on crafted input). `ip-address` is pinned to
+`^10.7.1`, the patched release for GHSA-j6r3-76f7-8jcv and
+GHSA-h3mg-xc3c-68pw (ceiling `<= 10.7.0`); the earlier floors came from
 GHSA-2vr4-cq9g-pvrc (an unclassified NAT64 local-use range that lets a
-crafted address slip past validation); the earlier floor came from
-GHSA-mwp4-54f8-5fhr (an octal/decimal parsing mismatch). `undici` is
+crafted address slip past validation) and GHSA-mwp4-54f8-5fhr (an
+octal/decimal parsing mismatch). `undici` is
 pinned to `^6.28.1`, the patched release for GHSA-3wwx-pv8p-q78v (a
 WebSocket permessage-deflate denial of service); the earlier floor came
 from a set of WebSocket denial-of-service issues (GHSA-vxpw-j846-p89q,
