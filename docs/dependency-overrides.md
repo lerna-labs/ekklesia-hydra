@@ -107,9 +107,11 @@ does not bound CPU use for empty merge sources) in both of the two
 `js-yaml` major lines this tree resolves; the earlier floors came from
 GHSA-5p4m-2wfm-xmqj (quadratic CPU consumption on crafted input).
 `ip-address` is pinned to `^10.7.4`, the patched release for
-GHSA-rxp7-6hxx-x8q5; the earlier floors came from GHSA-j6r3-76f7-8jcv
-(`isInSubnet()` and `isHostInSubnet()` compare IPv4 and IPv6 addresses as one
-address space, so an allowlist check can admit an address outside its range),
+GHSA-rxp7-6hxx-x8q5 (`Address6` matches a zone identifier in quadratic time
+before its length limit applies, so one long string can stall the process);
+the earlier floors came from GHSA-j6r3-76f7-8jcv (`isInSubnet()` and
+`isHostInSubnet()` compare IPv4 and IPv6 addresses as one address space, so
+an allowlist check can admit an address outside its range),
 GHSA-h3mg-xc3c-68pw (`Address6` builds a parse diagnostic with no length
 bound, so one long string can stall or crash the process),
 GHSA-2vr4-cq9g-pvrc (an unclassified NAT64 local-use range that lets a
