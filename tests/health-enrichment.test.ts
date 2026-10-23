@@ -73,6 +73,10 @@ let appPort: number;
 let scratch: string;
 const savedEnv: Record<string, string | undefined> = {};
 
+/** Every URL and header set the probes passed to fetch. */
+const fetched: Array<{ url: string; headers: Record<string, string> }> = [];
+
+
 let helpers: typeof import('../src/helpers.js');
 let lifecycle: typeof import('../src/routes/lifecycle.js');
 let detail: typeof import('../src/health-detail.js');
@@ -106,6 +110,18 @@ const ENV = ['X_API_KEY', 'IPFS_STAGING_DIR', 'IPFS_API_URL', 'TRP_URL', 'BLOCKF
 
 beforeAll(async () => {
     for (const name of ENV) savedEnv[name] = process.env[name];
+    // Nothing in this file may reach the network: Blockfrost hosts are answered
+    // here, local fakes pass through, and any other host is refused.
+    const realFetch = globalThis.fetch;
+    vi.stubGlobal('fetch', async (input: any, init?: RequestInit) => {
+        const url = String(input);
+        fetched.push({ url, headers: { ...((init?.headers as Record<string, string>) ?? {}) } });
+        let host: string;
+        try { host = new URL(url).hostname; } catch { throw new TypeError('fetch failed'); }
+        if (host === '127.0.0.1') return realFetch(input, init);
+        if (host.endsWith('.blockfrost.io')) return new Response(null, { status: 200 });
+        throw new Error(`test attempted a request to ${host}`);
+    });
     ipfsFake = await fake(answer(200), (req) => req.method === 'POST' && req.url === '/api/v0/id');
     trpFake = await fake(answer(404));
     bfFake = await fake(
@@ -143,6 +159,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
     app.close();
     for (const f of [ipfsFake, trpFake, bfFake]) {
         f.server.closeAllConnections();
@@ -163,6 +180,7 @@ beforeEach(async () => {
     monitorHeadId = 'head1';
     (helpers.queueWorker as any).onMessage({ tag: 'HeadIsOpen', headId: 'head1', utxo: {} });
     for (const f of [ipfsFake, trpFake, bfFake]) f.hits = 0;
+    fetched.length = 0;
     ipfsFake.handler = answer(200);
     trpFake.handler = answer(404);
     bfFake.handler = answer(200);
@@ -279,6 +297,35 @@ describe('GET /health detail', () => {
         expect(data.voters.registered).toBe(0);
     });
 
+    it('does not report a snapshot number stored under another head, even without HeadIsOpen', async () => {
+        (helpers.queueWorker as any).onMessage(snapshotConfirmed(12));
+        expect((await get('/health')).body.data.snapshotNumber).toBe(12);
+        monitorHeadId = 'head2';
+        expect((await get('/health')).body.data.snapshotNumber).toBeNull();
+        (helpers.queueWorker as any).onMessage({ ...snapshotConfirmed(3), headId: 'head2', snapshot: { ...snapshotConfirmed(3).snapshot, headId: 'head2' } });
+        expect((await get('/health')).body.data.snapshotNumber).toBe(3);
+    });
+
+    it('keeps a slow read for the old head from filling or clearing the new head\'s count', async () => {
+        let releaseA!: (snapshot: any) => void;
+        SNAPSHOT_GET.mockReturnValueOnce(new Promise((resolve) => { releaseA = resolve; }));
+        SNAPSHOT_GET.mockResolvedValue({
+            'tx1#0': { value: { [VOTER_POLICY]: { '01aa': 1, '02bb': 1 } } },
+        });
+        const slowA = get('/health');
+        await vi.waitFor(() => expect(SNAPSHOT_GET).toHaveBeenCalledTimes(1));
+
+        monitorHeadId = 'head2';
+        expect((await get('/health')).body.data.voters.registered).toBe(2);
+        expect(SNAPSHOT_GET).toHaveBeenCalledTimes(2);
+
+        releaseA({ 'tx9#0': { value: { [VOTER_POLICY]: { '09zz': 1 } } } });
+        expect((await slowA).body.data.voters.registered).toBe(1);
+        // The late result for head1 did not replace head2's cached count.
+        expect((await get('/health')).body.data.voters.registered).toBe(2);
+        expect(SNAPSHOT_GET).toHaveBeenCalledTimes(2);
+    });
+
     it('counts a voter token name once even when two outputs hold it', async () => {
         SNAPSHOT_GET.mockResolvedValue({
             'tx1#0': { value: { [VOTER_POLICY]: { '01aa': 1 } } },
@@ -363,35 +410,35 @@ describe('GET /health probes', () => {
     });
 
     it('derives the Blockfrost host from the first seven characters of a project key', async () => {
-        const seen: string[] = [];
-        const realFetch = globalThis.fetch;
-        vi.stubGlobal('fetch', (url: any, init: any) => {
-            seen.push(String(url));
-            return realFetch(url, init);
-        });
-        try {
-            for (const [key, host] of [['preprodABC', 'cardano-preprod'], ['mainnetXYZ', 'cardano-mainnet'], ['previewQRS', 'cardano-preview']]) {
-                detail.__resetHealthDetailForTests();
-                process.env.BLOCKFROST_API_KEY = key;
-                await get('/health');
-                expect(seen.some((u) => u === `https://${host}.blockfrost.io/api/v0/blocks/latest`)).toBe(true);
-            }
-        } finally {
-            vi.unstubAllGlobals();
+        for (const [key, host] of [['preprodABC', 'cardano-preprod'], ['mainnetXYZ', 'cardano-mainnet'], ['previewQRS', 'cardano-preview']]) {
+            detail.__resetHealthDetailForTests();
+            process.env.BLOCKFROST_API_KEY = key;
+            const { probes } = (await get('/health')).body.data;
+            expect(probes.blockfrost).toMatchObject({ state: 'ok' });
+            const call = fetched.find((f) => f.url === `https://${host}.blockfrost.io/api/v0/blocks/latest`);
+            expect(call?.headers.project_id).toBe(key);
         }
     });
 
-    it('reports provider_unreachable when nothing answers', async () => {
-        const dead = await fake(answer(200));
-        const url = dead.url;
-        dead.server.close();
-        const saved = process.env.TRP_URL;
-        process.env.TRP_URL = url;
-        try {
-            expect((await get('/health')).body.data.probes.trp).toMatchObject({ state: 'down', reason: 'provider_unreachable' });
-        } finally {
-            process.env.TRP_URL = saved;
-        }
+    it('treats a BLOCKFROST_API_KEY that starts with / as a base URL: no project_id, key never returned', async () => {
+        process.env.BLOCKFROST_API_KEY = '/relativetoken';
+        const res = await get('/health');
+        const call = fetched.find((f) => f.url === '/relativetoken/blocks/latest');
+        expect(call).toBeDefined();
+        expect(call!.headers.project_id).toBeUndefined();
+        expect(res.text).not.toContain('relativetoken');
+    });
+
+    it('ignores trailing slashes on a Blockfrost base URL', async () => {
+        const token = 'slashtoken';
+        process.env.BLOCKFROST_API_KEY = `${bfFake.url}/${token}//`;
+        bfFake.guard = (req) => req.method === 'GET' && req.url === `/${token}/blocks/latest`;
+        expect((await get('/health')).body.data.probes.blockfrost).toMatchObject({ state: 'ok' });
+    });
+
+    it('reports provider_unreachable when the connection is dropped', async () => {
+        trpFake.handler = (req) => { req.socket.destroy(); };
+        expect((await get('/health')).body.data.probes.trp).toMatchObject({ state: 'down', reason: 'provider_unreachable' });
     });
 
     it('reports a hung IPFS node as down/timeout and still answers 200 within about 3 seconds', async () => {

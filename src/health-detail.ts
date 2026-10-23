@@ -7,7 +7,7 @@
  * list of reasons.
  */
 
-import { IPFS_API_URL } from './helpers.js';
+import { IPFS_API_URL, TRP_URL } from './helpers.js';
 import { BALLOT_DEFINITION_PREFIX, BALLOT_INSTANCE_PREFIX } from './types.js';
 
 export const PROBE_TIMEOUT_MS = 3_000;
@@ -73,7 +73,7 @@ export function __resetHealthDetailForTests(): void {
         memo.inflight = null;
     }
     blockfrostBaseOverride = null;
-    registeredHeadId = null;
+    resetRegistered(null);
 }
 
 // ---------------------------------------------------------------------------
@@ -116,7 +116,7 @@ async function probeIpfs(): Promise<ProbeResult> {
 }
 
 async function probeTrp(): Promise<ProbeResult> {
-    const url = process.env.TRP_URL;
+    const url = TRP_URL;
     if (!url) return { state: 'not_configured', reason: 'not_configured', checkedAt: new Date().toISOString() };
     const res = await request(url, { method: 'GET' });
     if ('reason' in res) return down(res.reason);
@@ -185,23 +185,37 @@ export function countVoterTokens(snapshot: Record<string, any>, voterPolicy: str
     return names.size;
 }
 
-const registeredMemo = createMemo<number | null>();
-let registeredHeadId: string | null = null;
+interface RegisteredState {
+    headId: string | null;
+    value: number | null | undefined;
+    at: number;
+    inflight: Promise<number | null> | null;
+}
+
+const registered: RegisteredState = { headId: null, value: undefined, at: 0, inflight: null };
+
+function resetRegistered(headId: string | null): void {
+    registered.headId = headId;
+    registered.value = undefined;
+    registered.at = 0;
+    registered.inflight = null;
+}
 
 /**
  * Registered-voter count from `read`, cached for 30 seconds with a single
  * snapshot read shared by concurrent callers. A failed or slow read yields
- * null (and is cached like any other result).
+ * null (and is cached like any other result). A count belongs to the head it
+ * was read for: a different head starts afresh, and a read still running for
+ * an earlier head neither stores its result nor clears the newer head's read.
  */
 export function getRegisteredVoters(headId: string | null, read: () => Promise<number | null>): Promise<number | null> {
-    // A count belongs to the head it was read from; a different head starts afresh.
-    if (headId !== registeredHeadId) {
-        registeredHeadId = headId;
-        registeredMemo.value = undefined;
-        registeredMemo.at = 0;
-        registeredMemo.inflight = null;
+    if (headId !== registered.headId) resetRegistered(headId);
+    if (registered.value !== undefined && Date.now() - registered.at < REGISTERED_CACHE_MS) {
+        return Promise.resolve(registered.value);
     }
-    return memoized(registeredMemo, REGISTERED_CACHE_MS, async () => {
+    if (registered.inflight) return registered.inflight;
+
+    const pending: Promise<number | null> = (async () => {
         let timer: ReturnType<typeof setTimeout> | undefined;
         try {
             return await Promise.race([
@@ -213,5 +227,14 @@ export function getRegisteredVoters(headId: string | null, read: () => Promise<n
         } finally {
             clearTimeout(timer);
         }
+    })().then((value) => {
+        if (registered.inflight === pending) {
+            registered.value = value;
+            registered.at = Date.now();
+            registered.inflight = null;
+        }
+        return value;
     });
+    registered.inflight = pending;
+    return pending;
 }
