@@ -42,7 +42,8 @@ function routeTable(): RouteEntry[] {
             : (layer.handle?.stack ?? []).filter((inner: any) => inner.route).map((inner: any) => inner.route);
         for (const route of routes) {
             for (const method of Object.keys(route.methods)) {
-                entries.push({ method: method.toUpperCase(), path: route.path, keyless: index < authIndex });
+                const name = method === '_all' ? 'ALL' : method.toUpperCase();
+                entries.push({ method: name, path: route.path, keyless: index < authIndex });
             }
         }
     });
@@ -93,7 +94,11 @@ afterAll(async () => {
 
 describe('createApp() route table', () => {
     it('mounts exactly the listed routes ahead of the x-api-key check', () => {
-        const keyless = routeTable().filter((r) => r.keyless).map((r) => `${r.method} ${r.path}`);
+        // An ALL handler on a public path only hands other methods on to the
+        // key check; the method test below holds it to that.
+        const keyless = routeTable()
+            .filter((r) => r.keyless && r.method !== 'ALL')
+            .map((r) => `${r.method} ${r.path}`);
         expect(keyless.sort()).toEqual([...KEYLESS].sort());
     });
 
@@ -110,7 +115,7 @@ describe('createApp() route table', () => {
         const keyed = routeTable().filter((r) => !r.keyless);
         expect(keyed.length).toBeGreaterThan(30);
         for (const { method, path } of keyed) {
-            const status = await send(method, path.replace(/:\w+/g, 'drep1test'));
+            const status = await send(method === 'ALL' ? 'GET' : method, path.replace(/:\w+/g, 'drep1test'));
             expect(status, `${method} ${path}`).toBe(401);
         }
         expect(await send('GET', '/no-such-route')).toBe(401);
@@ -120,6 +125,18 @@ describe('createApp() route table', () => {
         for (const entry of KEYLESS) {
             const [method, path] = entry.split(' ');
             expect(await send(method, path), entry).toBe(200);
+        }
+    });
+
+    it('answers 401 without x-api-key for every other method on a keyless path', async () => {
+        const paths = new Set(routeTable().filter((r) => r.keyless).map((r) => r.path));
+        for (const path of paths) {
+            const served = KEYLESS.filter((e) => e.endsWith(` ${path}`)).map((e) => e.split(' ')[0]);
+            if (served.includes('GET')) served.push('HEAD');
+            for (const method of ['GET', 'HEAD', 'OPTIONS', 'POST', 'PUT', 'PATCH', 'DELETE']) {
+                if (served.includes(method)) continue;
+                expect(await send(method, path), `${method} ${path}`).toBe(401);
+            }
         }
     });
 });

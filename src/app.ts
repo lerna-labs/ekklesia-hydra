@@ -2,7 +2,7 @@ import express from 'express';
 import type { Express } from 'express';
 import { authHeaderMiddleware } from './middleware.js';
 
-import publicRoutes from './routes/public.js';
+import { createPublicRouter } from './routes/public.js';
 import auditRoutes from './routes/audit.js';
 import ballotRoutes from './routes/ballot.js';
 import lifecycleRoutes from './routes/lifecycle.js';
@@ -19,7 +19,7 @@ export function createApp(): Express {
     app.use(express.json({ limit: '10mb' }));
 
     // Keyless routes must be mounted before the key check.
-    app.use(publicRoutes);
+    app.use(createPublicRouter());
     app.use(authHeaderMiddleware);
 
     // Mount route modules

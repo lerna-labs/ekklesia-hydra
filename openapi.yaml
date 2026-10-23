@@ -89,10 +89,11 @@ paths:
         Bare document, not wrapped in the response envelope. `gitSha` and
         `buildTime` come from the `build-info.json` beside the running
         bundle, or from the `GIT_SHA` and `BUILD_TIME` environment variables
-        when no such file exists, and are null when neither is set. A
-        `version` from the same source (`APP_VERSION` in the environment)
-        replaces the `package.json` version. Rate limited to 120 requests
-        per minute per client, separately from the keyed routes. Sent with
+        when no such file exists. They are null when neither source sets
+        them, and when the file exists but cannot be read. A `version` from
+        the same source (`APP_VERSION` in the environment) replaces the
+        `package.json` version. Rate limited to 120 requests per minute per
+        client, separately from the keyed routes. Sent with
         `Cache-Control: public, max-age=60`.
       security: []
       responses:
@@ -104,6 +105,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/VersionDocument' }
+        '429': { $ref: '#/components/responses/RateLimited' }
 
   # ---------- Ballot Setup (L1) ----------
   /prepare:
@@ -1184,6 +1186,11 @@ components:
       content:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    RateLimited:
+      description: Rate limit exceeded (`RATE_LIMITED`)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
 
   schemas:
     # ---------- Envelopes ----------
@@ -1219,6 +1226,7 @@ components:
             - IPFS_UNAVAILABLE
             - HYDRA_UNREACHABLE
             - INTERNAL_ERROR
+            - RATE_LIMITED
         message: { type: string }
 
     # ---------- Public ----------

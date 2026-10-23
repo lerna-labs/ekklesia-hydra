@@ -14,6 +14,7 @@ setGlobalDispatcher(new Agent({
 
 import { Wrangler } from '@lerna-labs/hydra-sdk';
 import { createApp } from './app.js';
+import { getBuildInfo } from './build-info.js';
 import { HYDRA_NETWORK, VERBOSE, voteCache, hydraMonitor, txQueue, queueWorker } from './helpers.js';
 import { rehydrateBallotSession, reconcileDepositReadiness } from './routes/lifecycle.js';
 
@@ -43,6 +44,9 @@ process.on('SIGINT', async () => {
 const port = parseInt(process.env.PORT || '3000', 10);
 
 async function start() {
+    // Resolve the build once at boot, so /version never reads it on a request.
+    getBuildInfo();
+
     // Rehydrate vote cache from disk before accepting requests
     const cacheCount = await voteCache.rehydrate();
     console.log(`Vote cache rehydrated: ${cacheCount} entries loaded from disk`);
