@@ -20,37 +20,6 @@ installed tree, not what a consumer of a published package resolves.
 
 ## Functional pins
 
-### `npm`
-
-This is the one entry that looks like dead weight and isn't. Three copies of
-`@cardano-sdk/crypto` in this tree (pulled in through `@meshsdk/provider` and
-its own nested `@cardano-sdk/input-selection` and `@cardano-sdk/key-management`)
-declare `npm: ^9.3.0` as a plain runtime dependency. Left unconstrained, that
-resolves to npm 9.9.4, which bundles `tar` 6.2.1. That `tar` version falls
-inside GHSA-23hp-3jrh-7fpw / CVE-2026-59873, a critical decompression denial
-of service (an attacker-supplied archive with a small compressed size and an
-oversized claimed content length exhausts disk space during extraction),
-fixed in `tar` 7.5.19. The vulnerable range is `<= 7.5.18`.
-
-No override on `tar` itself can reach this. npm ships its own dependencies
-bundled inside its package tarball: every package under
-`node_modules/npm/node_modules/` is recorded in the lockfile with
-`"inBundle": true` and no `resolved` field, and `overrides` cannot rewrite a
-bundled dependency. The only available fix is bumping the package that does
-the bundling, which is why the override targets `npm` and not `tar`.
-
-`npm: 11.19.1` resolves the bundled copy to `tar` 7.5.22, outside the
-vulnerable range. This is verifiable directly: the `staging` and `main`
-branches carry no `npm` override and resolve
-`node_modules/npm/node_modules/tar` to 6.2.1; `development` resolves it to
-7.5.22. Removing the override reintroduces the critical without changing a
-single line outside `package.json`.
-
-A caret range is the wrong shape here because npm's own bundled dependency
-tree is not monotonic across releases: a newer npm version can ship an older,
-vulnerable copy of a bundled package. The pin has to be revisited by hand
-against each candidate npm release rather than left to float.
-
 ### `libsodium-sumo`
 
 `libsodium-sumo: 0.7.15` has no advisory behind it; it is a functional pin.
@@ -132,12 +101,23 @@ any future `3.x` patch release.
 
 ### Nested `js-yaml`, `ip-address`, `undici`
 
-`@changesets/parse` pins `js-yaml` to `^4.3.1` and `read-yaml-file` pins it
-to `^3.15.1`, fixing GHSA-5p4m-2wfm-xmqj (quadratic CPU consumption on
-crafted input) in both of the two `js-yaml` major lines this tree resolves.
-`ip-address` is pinned to `^10.3.1`, fixing GHSA-mwp4-54f8-5fhr (an
-octal/decimal parsing mismatch that lets a malformed address slip past
-validation). `undici` is pinned to `^6.27.0`, fixing a set of WebSocket
-denial-of-service issues (GHSA-vxpw-j846-p89q, GHSA-vrm6-8vpv-qv8q,
-GHSA-v9p9-hfj2-hcw8). All three were already caret ranges and needed no
-change; each still resolves clear of every advisory against it.
+`@changesets/parse` pins `js-yaml` to `^4.3.2` and `read-yaml-file` pins it
+to `^3.15.2`, fixing GHSA-2883-xcg3-v3hh (the `maxTotalMergeKeys` limit
+does not bound CPU use for empty merge sources) in both of the two
+`js-yaml` major lines this tree resolves; the earlier floors came from
+GHSA-5p4m-2wfm-xmqj (quadratic CPU consumption on crafted input).
+`ip-address` is pinned to `^10.7.4`, the patched release for
+GHSA-rxp7-6hxx-x8q5 (`Address6` matches a zone identifier in quadratic time
+before its length limit applies, so one long string can stall the process);
+the earlier floors came from GHSA-j6r3-76f7-8jcv (`isInSubnet()` and
+`isHostInSubnet()` compare IPv4 and IPv6 addresses as one address space, so an
+allowlist check can admit an address outside its range), GHSA-h3mg-xc3c-68pw
+(`Address6` builds a parse diagnostic with no length bound, so one long string
+can stall or crash the process), GHSA-2vr4-cq9g-pvrc (an unclassified NAT64
+local-use range that lets a crafted address slip past validation) and
+GHSA-mwp4-54f8-5fhr (an octal/decimal parsing mismatch).
+`undici` is pinned to `^6.28.1`, the patched release for
+GHSA-3wwx-pv8p-q78v (a WebSocket permessage-deflate denial of service); the
+earlier floor came from a set of WebSocket denial-of-service issues
+(GHSA-vxpw-j846-p89q, GHSA-vrm6-8vpv-qv8q, GHSA-v9p9-hfj2-hcw8). All three
+are caret ranges; each still resolves clear of every advisory against it.
