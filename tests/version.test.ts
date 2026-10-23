@@ -175,7 +175,7 @@ describe('build resolution', () => {
 
     it('reads a build-info.json that starts with a byte order mark', async () => {
         const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-        await writeFile(file, '﻿' + JSON.stringify({ gitSha: 'abc1234' }));
+        await writeFile(file, '\uFEFF' + JSON.stringify({ gitSha: 'abc1234' }));
         expect(resolveBuildInfo(file, {}).gitSha).toBe('abc1234');
         expect(warn).not.toHaveBeenCalled();
     });
@@ -390,7 +390,7 @@ describe('build resolution in the bundled service', () => {
 });
 
 // Runs last: it exhausts this server's public limiter.
-describe('publicProbeLimiter', () => {
+describe('createPublicProbeLimiter', () => {
     it('limits GET /version on its own bucket, leaving GET /audit/full untouched', async () => {
         let last: RawResponse | undefined;
         for (let i = 0; i < 121; i++) last = await send('/version');
