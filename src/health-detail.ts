@@ -7,6 +7,7 @@
  * list of reasons.
  */
 
+import { IPFS_API_URL } from './helpers.js';
 import { BALLOT_DEFINITION_PREFIX, BALLOT_INSTANCE_PREFIX } from './types.js';
 
 export const PROBE_TIMEOUT_MS = 3_000;
@@ -72,6 +73,7 @@ export function __resetHealthDetailForTests(): void {
         memo.inflight = null;
     }
     blockfrostBaseOverride = null;
+    registeredHeadId = null;
 }
 
 // ---------------------------------------------------------------------------
@@ -107,7 +109,7 @@ async function request(url: string, init: RequestInit): Promise<{ status: number
 }
 
 async function probeIpfs(): Promise<ProbeResult> {
-    const base = (process.env.IPFS_API_URL || 'http://localhost:5001').replace(/\/+$/, '');
+    const base = IPFS_API_URL.replace(/\/+$/, '');
     const res = await request(`${base}/api/v0/id`, { method: 'POST' });
     if ('reason' in res) return down(res.reason);
     return res.status >= 200 && res.status < 300 ? ok() : down(statusReason(res.status));
@@ -132,11 +134,14 @@ export function __setBlockfrostBaseForTests(base: string): void {
 async function probeBlockfrost(): Promise<ProbeResult> {
     const key = process.env.BLOCKFROST_API_KEY;
     if (!key) return { state: 'not_configured', reason: 'not_configured', checkedAt: new Date().toISOString() };
-    const prefix = key.startsWith('mainnet')
-        ? 'cardano-mainnet'
-        : key.startsWith('preprod') ? 'cardano-preprod' : 'cardano-preview';
-    const base = blockfrostBaseOverride ?? `https://${prefix}.blockfrost.io/api/v0`;
-    const res = await request(`${base}/blocks/latest`, { method: 'GET', headers: { project_id: key } });
+    // Resolved as Mesh's BlockfrostProvider does: a value starting with http or /
+    // is the base URL itself (no project_id header); anything else is a project
+    // id whose first seven characters name the network.
+    const isBase = key.startsWith('http') || key.startsWith('/');
+    const base = isBase
+        ? key.replace(/\/+$/, '')
+        : blockfrostBaseOverride ?? `https://cardano-${key.slice(0, 7)}.blockfrost.io/api/v0`;
+    const res = await request(`${base}/blocks/latest`, { method: 'GET', headers: isBase ? {} : { project_id: key } });
     if ('reason' in res) return down(res.reason);
     return res.status >= 200 && res.status < 300 ? ok() : down(statusReason(res.status));
 }
@@ -164,29 +169,38 @@ export async function getHealthProbes(): Promise<HealthProbes> {
 
 /**
  * Count voter tokens in a head snapshot: assets under the voter policy,
- * excluding the ballot definition and instance tokens that share it.
+ * excluding the ballot definition and instance tokens that share it. Distinct asset
+ * names are counted, so a voter holding two tokens of one name counts once.
  */
 export function countVoterTokens(snapshot: Record<string, any>, voterPolicy: string): number {
-    let count = 0;
+    const names = new Set<string>();
     for (const utxo of Object.values(snapshot)) {
         const assets = utxo?.value?.[voterPolicy];
         if (!assets || typeof assets !== 'object') continue;
         for (const name of Object.keys(assets)) {
             if (name.startsWith(BALLOT_INSTANCE_PREFIX) || name.startsWith(BALLOT_DEFINITION_PREFIX)) continue;
-            count++;
+            names.add(name);
         }
     }
-    return count;
+    return names.size;
 }
 
 const registeredMemo = createMemo<number | null>();
+let registeredHeadId: string | null = null;
 
 /**
  * Registered-voter count from `read`, cached for 30 seconds with a single
  * snapshot read shared by concurrent callers. A failed or slow read yields
  * null (and is cached like any other result).
  */
-export function getRegisteredVoters(read: () => Promise<number | null>): Promise<number | null> {
+export function getRegisteredVoters(headId: string | null, read: () => Promise<number | null>): Promise<number | null> {
+    // A count belongs to the head it was read from; a different head starts afresh.
+    if (headId !== registeredHeadId) {
+        registeredHeadId = headId;
+        registeredMemo.value = undefined;
+        registeredMemo.at = 0;
+        registeredMemo.inflight = null;
+    }
     return memoized(registeredMemo, REGISTERED_CACHE_MS, async () => {
         let timer: ReturnType<typeof setTimeout> | undefined;
         try {

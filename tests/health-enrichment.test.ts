@@ -40,13 +40,21 @@ interface Fake {
     server: Server;
     hits: number;
     handler: Handler;
+    /** A request that fails the guard is refused with `refusal` before the handler runs. */
+    guard?: (req: IncomingMessage) => boolean;
+    refusal: number;
     url: string;
 }
 
-async function fake(initial: Handler): Promise<Fake> {
-    const f = { hits: 0, handler: initial } as Fake;
+async function fake(initial: Handler, guard?: Fake['guard'], refusal = 405): Promise<Fake> {
+    const f = { hits: 0, handler: initial, guard, refusal } as Fake;
     f.server = createServer((req, res) => {
         f.hits++;
+        if (f.guard && !f.guard(req)) {
+            res.statusCode = f.refusal;
+            res.end();
+            return;
+        }
         f.handler(req, res);
     });
     await new Promise<void>((r) => f.server.listen(0, '127.0.0.1', () => r()));
@@ -68,7 +76,18 @@ const savedEnv: Record<string, string | undefined> = {};
 let helpers: typeof import('../src/helpers.js');
 let lifecycle: typeof import('../src/routes/lifecycle.js');
 let detail: typeof import('../src/health-detail.js');
-let monitorStatus: string;
+let monitorStatus: 'OPEN' | 'CLOSED';
+let monitorHeadId: string;
+const MIXED_CASE = { OPEN: 'Open', CLOSED: 'Closed' } as const;
+
+/** A SnapshotConfirmed message in the shape of the hydra-node 2.2.0 API. */
+const snapshotConfirmed = (number: number) => ({
+    tag: 'SnapshotConfirmed',
+    headId: 'head1',
+    snapshot: { headId: 'head1', version: 0, number, confirmed: [], utxo: {}, utxoToCommit: null, utxoToDecommit: null },
+    seq: number,
+    timestamp: '2026-01-01T00:00:00Z',
+});
 
 function get(path: string, headers: Record<string, string> = { 'x-api-key': API_KEY }): Promise<{ status: number; body: any; text: string }> {
     return new Promise((resolve, reject) => {
@@ -87,9 +106,13 @@ const ENV = ['X_API_KEY', 'IPFS_STAGING_DIR', 'IPFS_API_URL', 'TRP_URL', 'BLOCKF
 
 beforeAll(async () => {
     for (const name of ENV) savedEnv[name] = process.env[name];
-    ipfsFake = await fake(answer(200));
+    ipfsFake = await fake(answer(200), (req) => req.method === 'POST' && req.url === '/api/v0/id');
     trpFake = await fake(answer(404));
-    bfFake = await fake(answer(200));
+    bfFake = await fake(
+        answer(200),
+        (req) => req.method === 'GET' && req.url === '/blocks/latest' && req.headers.project_id === BLOCKFROST_KEY,
+        401,
+    );
 
     scratch = await mkdtemp(join(tmpdir(), 'hydra-health-'));
     process.env.X_API_KEY = API_KEY;
@@ -105,8 +128,11 @@ beforeAll(async () => {
     const { createApp } = await import('../src/app.js');
 
     vi.spyOn(helpers.hydraMonitor, 'connected', 'get').mockReturnValue(true);
+    // What hydra-sdk returns: `headStatus` is the uppercase HydraStatus, and
+    // `headInfo.headStatus` is the same state mapped to mixed case.
+    vi.spyOn(helpers.hydraMonitor, 'headStatus', 'get').mockImplementation(() => monitorStatus);
     vi.spyOn(helpers.hydraMonitor, 'headInfo', 'get').mockImplementation(
-        () => ({ headStatus: monitorStatus, headId: 'head1', nodeVersion: '2.0.0' }) as any,
+        () => ({ headStatus: MIXED_CASE[monitorStatus], headId: monitorHeadId, nodeVersion: '2.0.0' }) as any,
     );
 
     const expressApp: Express = createApp();
@@ -134,10 +160,13 @@ beforeEach(async () => {
     detail.__setBlockfrostBaseForTests(bfFake.url);
     lifecycle.__resetBallotSessionForTests();
     monitorStatus = 'OPEN';
+    monitorHeadId = 'head1';
+    (helpers.queueWorker as any).onMessage({ tag: 'HeadIsOpen', headId: 'head1', utxo: {} });
     for (const f of [ipfsFake, trpFake, bfFake]) f.hits = 0;
     ipfsFake.handler = answer(200);
     trpFake.handler = answer(404);
     bfFake.handler = answer(200);
+    bfFake.guard = (req) => req.method === 'GET' && req.url === '/blocks/latest' && req.headers.project_id === BLOCKFROST_KEY;
     process.env.BLOCKFROST_API_KEY = BLOCKFROST_KEY;
     SNAPSHOT_GET.mockReset();
     SNAPSHOT_GET.mockResolvedValue({});
@@ -154,7 +183,7 @@ describe('GET /health detail', () => {
         expect(res.status).toBe(200);
         expect(res.body.status).toBe('SUCCESS');
         expect(res.body.data).toMatchObject({
-            headStatus: 'OPEN',
+            headStatus: 'Open',
             headId: 'head1',
             nodeVersion: '2.0.0',
             connected: true,
@@ -221,11 +250,51 @@ describe('GET /health detail', () => {
     });
 
     it('follows SnapshotConfirmed messages for snapshotNumber', async () => {
-        (helpers.queueWorker as any).onMessage({ tag: 'SnapshotConfirmed', snapshot: { snapshotNumber: 41, confirmed: [] } });
+        (helpers.queueWorker as any).onMessage(snapshotConfirmed(41));
         expect((await get('/health')).body.data.snapshotNumber).toBe(41);
-        (helpers.queueWorker as any).onMessage({ tag: 'SnapshotConfirmed', snapshot: { snapshotNumber: 42, confirmed: [] } });
+        (helpers.queueWorker as any).onMessage(snapshotConfirmed(42));
         expect((await get('/health')).body.data.snapshotNumber).toBe(42);
     });
+
+    it('does not read the number from a snapshotNumber field', async () => {
+        (helpers.queueWorker as any).onMessage({ tag: 'SnapshotConfirmed', snapshot: { snapshotNumber: 7, confirmed: [] } });
+        expect((await get('/health')).body.data.snapshotNumber).toBeNull();
+    });
+
+    it('drops the old head\'s snapshot number and voter count when a new head opens', async () => {
+        SNAPSHOT_GET.mockResolvedValue({ 'tx1#0': { value: { [VOTER_POLICY]: { '01aa': 1 } } } });
+        (helpers.queueWorker as any).onMessage(snapshotConfirmed(12));
+        let { data } = (await get('/health')).body;
+        expect(data.voters.registered).toBe(1);
+        expect(data.snapshotNumber).toBe(12);
+
+        monitorStatus = 'CLOSED';
+        (helpers.queueWorker as any).onMessage({ tag: 'HeadIsClosed', headId: 'head1', snapshotNumber: 12 });
+        monitorStatus = 'OPEN';
+        monitorHeadId = 'head2';
+        (helpers.queueWorker as any).onMessage({ tag: 'HeadIsOpen', headId: 'head2', utxo: {} });
+        SNAPSHOT_GET.mockResolvedValue({});
+        ({ data } = (await get('/health')).body);
+        expect(data.snapshotNumber).toBeNull();
+        expect(data.voters.registered).toBe(0);
+    });
+
+    it('counts a voter token name once even when two outputs hold it', async () => {
+        SNAPSHOT_GET.mockResolvedValue({
+            'tx1#0': { value: { [VOTER_POLICY]: { '01aa': 1 } } },
+            'tx2#0': { value: { [VOTER_POLICY]: { '01aa': 1 } } },
+        });
+        expect((await get('/health')).body.data.voters.registered).toBe(1);
+    });
+
+    it('reports voters.registered null, within about 3 seconds, when the snapshot read hangs', async () => {
+        SNAPSHOT_GET.mockReturnValue(new Promise(() => {}));
+        const started = Date.now();
+        const res = await get('/health');
+        expect(res.status).toBe(200);
+        expect(res.body.data.voters.registered).toBeNull();
+        expect(Date.now() - started).toBeLessThan(4_500);
+    }, 10_000);
 });
 
 describe('GET /health probes', () => {
@@ -254,15 +323,74 @@ describe('GET /health probes', () => {
         expect((await get('/health')).body.data.probes.trp).toMatchObject({ state: 'down', reason: 'provider_error' });
     });
 
+    it('maps TRP 403 to provider_auth_failed and treats a TRP 429 as reachable', async () => {
+        trpFake.handler = answer(403);
+        expect((await get('/health')).body.data.probes.trp).toMatchObject({ state: 'down', reason: 'provider_auth_failed' });
+        detail.__resetHealthDetailForTests();
+        detail.__setBlockfrostBaseForTests(bfFake.url);
+        trpFake.handler = answer(429);
+        expect((await get('/health')).body.data.probes.trp).toMatchObject({ state: 'ok' });
+    });
+
+    it('maps 429 to provider_rate_limited for IPFS and Blockfrost', async () => {
+        ipfsFake.handler = answer(429);
+        bfFake.handler = answer(429);
+        const { probes } = (await get('/health')).body.data;
+        expect(probes.ipfs).toMatchObject({ state: 'down', reason: 'provider_rate_limited' });
+        expect(probes.blockfrost).toMatchObject({ state: 'down', reason: 'provider_rate_limited' });
+    });
+
+    it('probes IPFS with POST /api/v0/id and Blockfrost with GET /blocks/latest and its project_id', async () => {
+        // The fakes refuse any other method, path or key, so an ok result proves the request shape.
+        const { probes } = (await get('/health')).body.data;
+        expect(probes.ipfs).toMatchObject({ state: 'ok' });
+        expect(probes.blockfrost).toMatchObject({ state: 'ok' });
+    });
+
+    it('uses a BLOCKFROST_API_KEY that starts with http as the base URL, sends no project_id, and never returns the token', async () => {
+        const token = 'tokeninpath123';
+        process.env.BLOCKFROST_API_KEY = `${bfFake.url}/${token}`;
+        bfFake.guard = (req) => req.method === 'GET' && req.url === `/${token}/blocks/latest` && req.headers.project_id === undefined;
+        const res = await get('/health');
+        expect(res.body.data.probes.blockfrost).toMatchObject({ state: 'ok' });
+        expect(res.text).not.toContain(token);
+
+        detail.__resetHealthDetailForTests();
+        bfFake.handler = answer(500);
+        const failed = await get('/health');
+        expect(failed.body.data.probes.blockfrost).toMatchObject({ state: 'down', reason: 'provider_error' });
+        expect(failed.text).not.toContain(token);
+    });
+
+    it('derives the Blockfrost host from the first seven characters of a project key', async () => {
+        const seen: string[] = [];
+        const realFetch = globalThis.fetch;
+        vi.stubGlobal('fetch', (url: any, init: any) => {
+            seen.push(String(url));
+            return realFetch(url, init);
+        });
+        try {
+            for (const [key, host] of [['preprodABC', 'cardano-preprod'], ['mainnetXYZ', 'cardano-mainnet'], ['previewQRS', 'cardano-preview']]) {
+                detail.__resetHealthDetailForTests();
+                process.env.BLOCKFROST_API_KEY = key;
+                await get('/health');
+                expect(seen.some((u) => u === `https://${host}.blockfrost.io/api/v0/blocks/latest`)).toBe(true);
+            }
+        } finally {
+            vi.unstubAllGlobals();
+        }
+    });
+
     it('reports provider_unreachable when nothing answers', async () => {
         const dead = await fake(answer(200));
         const url = dead.url;
         dead.server.close();
-        process.env.IPFS_API_URL = url;
+        const saved = process.env.TRP_URL;
+        process.env.TRP_URL = url;
         try {
-            expect((await get('/health')).body.data.probes.ipfs).toMatchObject({ state: 'down', reason: 'provider_unreachable' });
+            expect((await get('/health')).body.data.probes.trp).toMatchObject({ state: 'down', reason: 'provider_unreachable' });
         } finally {
-            process.env.IPFS_API_URL = ipfsFake.url;
+            process.env.TRP_URL = saved;
         }
     });
 

@@ -4,6 +4,7 @@ import type { MeshWallet } from '@meshsdk/core';
 import { CLOSE_TOKEN, ipfs, voteCache, IPFS_STAGING_DIR, success, error, hydraMonitor, txQueue, queueWorker, enqueueAndWait, driveHeadToFinal, initialize, HEAD_OPEN_TIMEOUT_MS, DEPOSIT_FINALIZE_TIMEOUT_MS, DEPOSIT_FINALIZE_TIMEOUT_OVERRIDE_MS, DEPOSIT_FINALIZE_BUFFER_MS, DEPOSIT_CONFIRM_TIMEOUT_MS, DEPOSIT_CONFIRM_POLL_INTERVAL_MS, DEPOSIT_SUBMIT_RETRIES, DEPOSIT_SUBMIT_RETRY_DELAY_MS } from '../helpers.js';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import type { HydraStatus } from '@lerna-labs/hydra-sdk';
 import type { BallotDefinition } from '../types.js';
 import { validateBallotDefinition } from '../ballot-validation.js';
 import { buildPrimeSnapshotTx, hydraValueToAmounts, type Amount } from '../tx-builder.js';
@@ -309,11 +310,11 @@ async function readRegisteredVoters(): Promise<number | null> {
     return countVoterTokens(await wrangler.http.getSnapshotUtxo(), scriptHash as string);
 }
 
-/** Additive /health detail. Never throws: a failing part is reported as null, not as an error. */
-async function healthDetail(headStatus: string | undefined) {
+/** Additive /health detail. Probe failures are reported in the probe, and an unreadable count as null; neither throws. */
+async function healthDetail(headStatus: HydraStatus, headId: string | null) {
     const [probes, registered] = await Promise.all([
         getHealthProbes(),
-        headStatus === 'OPEN' ? getRegisteredVoters(readRegisteredVoters) : Promise.resolve(null),
+        headStatus === 'OPEN' ? getRegisteredVoters(headId, readRegisteredVoters) : Promise.resolve(null),
     ]);
     const q = txQueue.status();
     return {
@@ -344,7 +345,7 @@ router.get('/health', async (_, res) => {
         }
         const info = hydraMonitor.headInfo;
         const deposit = getDepositInfo();
-        const detail = await healthDetail(info?.headStatus);
+        const detail = await healthDetail(hydraMonitor.headStatus, info?.headId ?? null);
         return success(res, {
             headStatus: info?.headStatus ?? 'Unknown',
             headId: info?.headId ?? null,

@@ -81,8 +81,11 @@ export class QueueWorker {
             const txId = msg.transaction?.txId ?? msg.txId ?? '';
             const reason = msg.validationError?.reason ?? 'unknown';
             this.handleTxInvalid(txId, reason);
+        } else if (msg.tag === 'HeadIsOpen') {
+            // A new head numbers its snapshots from the start.
+            this.lastSnapshotNumber = null;
         } else if (msg.tag === 'SnapshotConfirmed') {
-            const snapshotNumber = msg.snapshot?.snapshotNumber;
+            const snapshotNumber = msg.snapshot?.number;
             if (typeof snapshotNumber === 'number') this.lastSnapshotNumber = snapshotNumber;
             const confirmed: any[] = msg.snapshot?.confirmed ?? msg.confirmed ?? [];
             this.handleSnapshotConfirmed(confirmed);
