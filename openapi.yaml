@@ -12,8 +12,8 @@ info:
       - Success: `{ "status": "SUCCESS", "data": { ... } }`
       - Error:   `{ "status": "ERROR", "code": "...", "message": "..." }`
 
-    All endpoints require the `x-api-key` header except where otherwise noted
-    (the middleware applies globally).
+    All endpoints require the `x-api-key` header except those tagged
+    Public, which are served ahead of the key check.
 
     ## Head close-out order (canonical)
 
@@ -59,6 +59,8 @@ security:
   - ApiKeyAuth: []
 
 tags:
+  - name: Public
+    description: Served without the `x-api-key` header.
   - name: Ballot Setup (L1)
     description: L1 ballot token minting and admin wallet consolidation.
   - name: Head Lifecycle
@@ -78,6 +80,31 @@ tags:
     description: Verification bundles (live and post-settlement).
 
 paths:
+  # ---------- Public ----------
+  /version:
+    get:
+      tags: [Public]
+      summary: Service name, version and build
+      description: |
+        Bare document, not wrapped in the response envelope. `gitSha` and
+        `buildTime` come from the `build-info.json` beside the running
+        bundle, or from the `GIT_SHA` and `BUILD_TIME` environment variables
+        when no such file exists, and are null when neither is set. A
+        `version` from the same source (`APP_VERSION` in the environment)
+        replaces the `package.json` version. Rate limited to 120 requests
+        per minute per client, separately from the keyed routes. Sent with
+        `Cache-Control: public, max-age=60`.
+      security: []
+      responses:
+        '200':
+          description: Version document
+          headers:
+            Cache-Control:
+              schema: { type: string, example: 'public, max-age=60' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VersionDocument' }
+
   # ---------- Ballot Setup (L1) ----------
   /prepare:
     post:
@@ -1193,6 +1220,23 @@ components:
             - HYDRA_UNREACHABLE
             - INTERNAL_ERROR
         message: { type: string }
+
+    # ---------- Public ----------
+    VersionDocument:
+      type: object
+      required: [name, version, gitSha, buildTime]
+      additionalProperties: false
+      properties:
+        name: { type: string, enum: [ekklesia-hydra] }
+        version: { type: string, example: '1.1.2' }
+        gitSha:
+          type: [string, 'null']
+          pattern: '^[0-9a-f]{7}$'
+          description: First seven characters of the commit, or null when unknown.
+        buildTime:
+          type: [string, 'null']
+          format: date-time
+          description: ISO 8601 UTC build time, or null when unknown.
 
     # ---------- Ballot Definition ----------
     BallotOption:

@@ -1,0 +1,18 @@
+{
+  "$comment": "Copy for tests. The canonical schema is docs/schemas/version.schema.json in lerna-labs/ekklesia-backend.",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "VersionDocument",
+  "description": "Public GET /version response of an Ekklesia service.",
+  "type": "object",
+  "required": ["name", "version", "gitSha", "buildTime"],
+  "additionalProperties": false,
+  "properties": {
+    "name": { "type": "string", "minLength": 1 },
+    "version": { "type": "string", "minLength": 1 },
+    "gitSha": { "type": ["string", "null"], "pattern": "^[0-9a-f]{7}$" },
+    "buildTime": {
+      "type": ["string", "null"],
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?Z$"
+    }
+  }
+}
