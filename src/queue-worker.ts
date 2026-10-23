@@ -31,6 +31,7 @@ function isRetryable(reason: string): boolean {
 export class QueueWorker {
     private running = false;
     private dispatchTimer: ReturnType<typeof setTimeout> | null = null;
+    private lastSnapshotNumber: number | null = null;
 
     constructor(
         private readonly queue: TxQueue,
@@ -52,6 +53,11 @@ export class QueueWorker {
         this.scheduleDispatch();
 
         debug('[queue-worker] Started');
+    }
+
+    /** Number of the last snapshot confirmed by the head, or null before the first one. */
+    getLastSnapshotNumber(): number | null {
+        return this.lastSnapshotNumber;
     }
 
     /** Stop the worker. */
@@ -76,6 +82,8 @@ export class QueueWorker {
             const reason = msg.validationError?.reason ?? 'unknown';
             this.handleTxInvalid(txId, reason);
         } else if (msg.tag === 'SnapshotConfirmed') {
+            const snapshotNumber = msg.snapshot?.snapshotNumber;
+            if (typeof snapshotNumber === 'number') this.lastSnapshotNumber = snapshotNumber;
             const confirmed: any[] = msg.snapshot?.confirmed ?? msg.confirmed ?? [];
             this.handleSnapshotConfirmed(confirmed);
         }
