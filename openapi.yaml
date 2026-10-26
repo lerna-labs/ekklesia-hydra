@@ -390,6 +390,33 @@ paths:
                           headId: { type: string, nullable: true }
                           nodeVersion: { type: string, nullable: true }
                           connected: { type: boolean }
+                          ballot:
+                            type: object
+                            properties:
+                              ballotId: { type: string, nullable: true, description: "Cached ballot identifier; null until a ballot is started." }
+                              policyId: { type: string, nullable: true, description: "Cached ballot policy id; null until a ballot is started." }
+                          voters:
+                            type: object
+                            properties:
+                              registered: { type: integer, nullable: true, description: "Voter tokens in the head snapshot, cached for 30 seconds; null when the head is not Open or the snapshot cannot be read." }
+                              voted: { type: integer, description: "Distinct voters with a cached vote." }
+                          queue:
+                            type: object
+                            properties:
+                              depth: { type: integer, description: "In-flight entries (built, submitted, accepted and confirmed)." }
+                              built: { type: integer }
+                              submitted: { type: integer }
+                              accepted: { type: integer }
+                              confirmed: { type: integer }
+                              failed: { type: integer }
+                          snapshotNumber: { type: integer, nullable: true, description: "Number of the last confirmed head snapshot seen by the queue worker; null before the first." }
+                          probes:
+                            type: object
+                            description: "Dependency reachability, cached for 15 seconds. Each probe has a 3 second timeout and never changes the status code."
+                            properties:
+                              ipfs: { $ref: '#/components/schemas/HealthProbe' }
+                              trp: { $ref: '#/components/schemas/HealthProbe' }
+                              blockfrost: { $ref: '#/components/schemas/HealthProbe' }
         '503': { $ref: '#/components/responses/Unavailable' }
 
   /head-info:
@@ -1193,6 +1220,14 @@ components:
           schema: { $ref: '#/components/schemas/ErrorEnvelope' }
 
   schemas:
+    HealthProbe:
+      type: object
+      required: [state, checkedAt]
+      properties:
+        state: { type: string, enum: [ok, down, not_configured] }
+        reason: { type: string, enum: [provider_unreachable, provider_auth_failed, provider_rate_limited, provider_error, timeout, not_configured] }
+        checkedAt: { type: string, format: date-time }
+
     # ---------- Envelopes ----------
     SuccessEnvelope:
       type: object

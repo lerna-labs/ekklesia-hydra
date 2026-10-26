@@ -1,13 +1,15 @@
 import { Router } from 'express';
-import { Wrangler } from '@lerna-labs/hydra-sdk';
+import { createNativeScript, Wrangler } from '@lerna-labs/hydra-sdk';
 import type { MeshWallet } from '@meshsdk/core';
-import { CLOSE_TOKEN, ipfs, voteCache, IPFS_STAGING_DIR, success, error, hydraMonitor, txQueue, enqueueAndWait, driveHeadToFinal, initialize, HEAD_OPEN_TIMEOUT_MS, DEPOSIT_FINALIZE_TIMEOUT_MS, DEPOSIT_FINALIZE_TIMEOUT_OVERRIDE_MS, DEPOSIT_FINALIZE_BUFFER_MS, DEPOSIT_CONFIRM_TIMEOUT_MS, DEPOSIT_CONFIRM_POLL_INTERVAL_MS, DEPOSIT_SUBMIT_RETRIES, DEPOSIT_SUBMIT_RETRY_DELAY_MS } from '../helpers.js';
+import { CLOSE_TOKEN, ipfs, voteCache, IPFS_STAGING_DIR, success, error, hydraMonitor, txQueue, queueWorker, enqueueAndWait, driveHeadToFinal, initialize, HEAD_OPEN_TIMEOUT_MS, DEPOSIT_FINALIZE_TIMEOUT_MS, DEPOSIT_FINALIZE_TIMEOUT_OVERRIDE_MS, DEPOSIT_FINALIZE_BUFFER_MS, DEPOSIT_CONFIRM_TIMEOUT_MS, DEPOSIT_CONFIRM_POLL_INTERVAL_MS, DEPOSIT_SUBMIT_RETRIES, DEPOSIT_SUBMIT_RETRY_DELAY_MS } from '../helpers.js';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import type { HydraStatus } from '@lerna-labs/hydra-sdk';
 import type { BallotDefinition } from '../types.js';
 import { validateBallotDefinition } from '../ballot-validation.js';
 import { buildPrimeSnapshotTx, hydraValueToAmounts, type Amount } from '../tx-builder.js';
 import { adminActionLimiter } from '../rate-limit.js';
+import { countVoterTokens, getHealthProbes, getRegisteredVoters } from '../health-detail.js';
 
 const router = Router();
 
@@ -299,6 +301,38 @@ export function __resetBallotSessionForTests(): void {
 /** Test-only: path of the ballot session file. */
 export const __BALLOT_SESSION_PATH_FOR_TESTS = BALLOT_SESSION_PATH;
 
+/** Voter tokens in the head snapshot, or null when it cannot be read. */
+async function readRegisteredVoters(): Promise<number | null> {
+    const { admin_wallet } = await initialize();
+    if (!admin_wallet) return null;
+    const { scriptHash } = createNativeScript(admin_wallet.addresses.enterpriseAddressBech32 as string);
+    const wrangler = new Wrangler(process.env.HYDRA_API_URL, undefined, hydraMonitor);
+    return countVoterTokens(await wrangler.http.getSnapshotUtxo(), scriptHash as string);
+}
+
+/** Additive /health detail. Probe failures are reported in the probe, and an unreadable count as null; neither throws. */
+async function healthDetail(headStatus: HydraStatus, headId: string | null) {
+    const [probes, registered] = await Promise.all([
+        getHealthProbes(),
+        headStatus === 'OPEN' ? getRegisteredVoters(headId, readRegisteredVoters) : Promise.resolve(null),
+    ]);
+    const q = txQueue.status();
+    return {
+        ballot: { ballotId: cachedBallotId, policyId: cachedBallotPolicy },
+        voters: { registered, voted: voteCache.getAll().length },
+        queue: {
+            depth: q.built + q.submitted + q.accepted + q.confirmed,
+            built: q.built,
+            submitted: q.submitted,
+            accepted: q.accepted,
+            confirmed: q.confirmed,
+            failed: q.failed,
+        },
+        snapshotNumber: queueWorker.getLastSnapshotNumber(),
+        probes,
+    };
+}
+
 router.get('/health', async (_, res) => {
     try {
         // If monitor isn't connected, try to connect with a short timeout
@@ -311,6 +345,7 @@ router.get('/health', async (_, res) => {
         }
         const info = hydraMonitor.headInfo;
         const deposit = getDepositInfo();
+        const detail = await healthDetail(hydraMonitor.headStatus, info?.headId ?? null);
         return success(res, {
             headStatus: info?.headStatus ?? 'Unknown',
             headId: info?.headId ?? null,
@@ -336,6 +371,7 @@ router.get('/health', async (_, res) => {
                 txIds: deposit.txIds,
                 error: deposit.error,
             },
+            ...detail,
         });
     } catch (e: any) {
         console.error('Health check failed:', e);

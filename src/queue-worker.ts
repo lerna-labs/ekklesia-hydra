@@ -31,6 +31,8 @@ function isRetryable(reason: string): boolean {
 export class QueueWorker {
     private running = false;
     private dispatchTimer: ReturnType<typeof setTimeout> | null = null;
+    private lastSnapshotNumber: number | null = null;
+    private lastSnapshotHeadId: string | null = null;
 
     constructor(
         private readonly queue: TxQueue,
@@ -54,6 +56,17 @@ export class QueueWorker {
         debug('[queue-worker] Started');
     }
 
+    /**
+     * Number of the last snapshot confirmed by the current head, or null before
+     * the first one. A number stored under another head id is not reported, so a
+     * head change seen only through Greetings (no HeadIsOpen) cannot leak the old one.
+     */
+    getLastSnapshotNumber(): number | null {
+        const current = this.monitor.headInfo?.headId ?? null;
+        if (current && this.lastSnapshotHeadId && current !== this.lastSnapshotHeadId) return null;
+        return this.lastSnapshotNumber;
+    }
+
     /** Stop the worker. */
     stop(): void {
         this.running = false;
@@ -75,7 +88,16 @@ export class QueueWorker {
             const txId = msg.transaction?.txId ?? msg.txId ?? '';
             const reason = msg.validationError?.reason ?? 'unknown';
             this.handleTxInvalid(txId, reason);
+        } else if (msg.tag === 'HeadIsOpen') {
+            // A new head numbers its snapshots from the start.
+            this.lastSnapshotNumber = null;
+            this.lastSnapshotHeadId = null;
         } else if (msg.tag === 'SnapshotConfirmed') {
+            const snapshotNumber = msg.snapshot?.number;
+            if (typeof snapshotNumber === 'number') {
+                this.lastSnapshotNumber = snapshotNumber;
+                this.lastSnapshotHeadId = msg.snapshot?.headId ?? msg.headId ?? null;
+            }
             const confirmed: any[] = msg.snapshot?.confirmed ?? msg.confirmed ?? [];
             this.handleSnapshotConfirmed(confirmed);
         }
