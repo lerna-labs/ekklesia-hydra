@@ -83,10 +83,11 @@ caret range.
 
 ### `body-parser`
 
-`^1.20.6`. Fixes GHSA-v422-hmwv-36x6, a silently skipped size limit when an
-invalid `limit` value is supplied, ceiling `< 1.20.6`, pulled in via
-`express`. Exact pin converted to a caret range for the same reason as the
-others above.
+`^1.20.9`. Fixes GHSA-27r3-jxmh-p828, a denial of service from trailing
+bytes after a compressed request body, ceiling `< 1.20.9`, pulled in via
+`express`. The previous floor of `^1.20.6` came from GHSA-v422-hmwv-36x6, a
+silently skipped size limit when an invalid `limit` value is supplied,
+ceiling `< 1.20.6`; `1.20.9` is clear of both.
 
 ### `nanoid`
 
@@ -116,8 +117,10 @@ allowlist check can admit an address outside its range), GHSA-h3mg-xc3c-68pw
 can stall or crash the process), GHSA-2vr4-cq9g-pvrc (an unclassified NAT64
 local-use range that lets a crafted address slip past validation) and
 GHSA-mwp4-54f8-5fhr (an octal/decimal parsing mismatch).
-`undici` is pinned to `^6.28.1`, the patched release for
-GHSA-3wwx-pv8p-q78v (a WebSocket permessage-deflate denial of service); the
-earlier floor came from a set of WebSocket denial-of-service issues
-(GHSA-vxpw-j846-p89q, GHSA-vrm6-8vpv-qv8q, GHSA-v9p9-hfj2-hcw8). All three
+`undici` is pinned to `^6.29.1`, the patched release for
+GHSA-xjj6-f33q-929c (a denial of service from an unhandled error) and
+GHSA-4qv8-2p9j-2685 (unbounded memory use); the earlier floors came from
+GHSA-3wwx-pv8p-q78v (a WebSocket permessage-deflate denial of service) and a
+set of WebSocket denial-of-service issues (GHSA-vxpw-j846-p89q,
+GHSA-vrm6-8vpv-qv8q, GHSA-v9p9-hfj2-hcw8). All three
 are caret ranges; each still resolves clear of every advisory against it.
