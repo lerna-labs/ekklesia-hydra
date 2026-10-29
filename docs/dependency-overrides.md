@@ -69,17 +69,15 @@ own if one is ever published, which the exact pin would not.
 
 ### `qs`
 
-`^6.16.0`. Fixes GHSA-x5fp-wj9c-mxmx, an array-limit bypass via bracket-key
-comma parsing, ceiling `>= 6.14.2, <= 6.15.3`. The override previously sat
-exactly on that ceiling at `6.15.3`, which read as coverage while actually
-sitting on the last vulnerable version; it was bumped to the exact version
-`6.16.0` to clear it. That same `6.16.0` is also the fixed version for an
-older, separate denial-of-service advisory, GHSA-4mjr-xmp4-gh2g (`>= 2.2.5,
-< 6.16.0`), which this override cleared as a side effect of qs's own
-upstream release moving past it, not because of anything done in this
-project. The lesson from the first exact pin applies again: an exact pin one
-version above a ceiling is the same failure shape twice, so this is now a
-caret range.
+`^6.16.1`. Fixes GHSA-6pq8-jhm2-2vcw, a denial of service in `qs.stringify`
+with `arrayFormat: 'comma'`, ceiling `>= 6.7.0, <= 6.16.0`. The earlier
+floor of `^6.16.0` came from GHSA-x5fp-wj9c-mxmx, an array-limit bypass via
+bracket-key comma parsing, ceiling `>= 6.14.2, <= 6.15.3`. The override
+before that sat exactly on that ceiling at `6.15.3`, the last vulnerable
+version, and was bumped to the exact version `6.16.0`. That `6.16.0` is also
+the fixed version for an older, separate denial-of-service advisory,
+GHSA-4mjr-xmp4-gh2g (`>= 2.2.5, < 6.16.0`). The override has been a caret
+range since it was converted from the exact pin on 2026-09-21.
 
 ### `body-parser`
 
