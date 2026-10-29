@@ -45,7 +45,7 @@
   "overrides": {
     "libsodium-sumo": "0.7.15",
     "path-to-regexp": "^0.1.13",
-    "qs": "^6.16.0",
+    "qs": "^6.16.1",
     "@changesets/parse": {
       "js-yaml": "^4.3.2"
     },
