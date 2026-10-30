@@ -16,7 +16,21 @@ env:
   IMAGE_NAME: lerna-labs/ekklesia-hydra
 
 jobs:
+  verify-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify signed release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/scripts/verify-release-tag.sh "${GITHUB_REF_NAME}"
+
   build-and-push:
+    needs: verify-tag
     runs-on: ubuntu-latest
 
     steps:
@@ -75,8 +89,13 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "Release ${GITHUB_REF_NAME} already exists; skipping."
+            exit 0
+          fi
           version="${GITHUB_REF_NAME#v}"
           notes=$(awk -v v="## ${version}" '$0==v{f=1;next} /^## /{if(f)exit} f' CHANGELOG.md)
           gh release create "${GITHUB_REF_NAME}" \
+            --verify-tag \
             --title "${GITHUB_REF_NAME}" \
             --notes "${notes:-Release ${GITHUB_REF_NAME}}"

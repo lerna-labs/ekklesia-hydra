@@ -12,8 +12,8 @@ info:
       - Success: `{ "status": "SUCCESS", "data": { ... } }`
       - Error:   `{ "status": "ERROR", "code": "...", "message": "..." }`
 
-    All endpoints require the `x-api-key` header except where otherwise noted
-    (the middleware applies globally).
+    All endpoints require the `x-api-key` header except those tagged
+    Public, which are served ahead of the key check.
 
     ## Head close-out order (canonical)
 
@@ -59,6 +59,8 @@ security:
   - ApiKeyAuth: []
 
 tags:
+  - name: Public
+    description: Served without the `x-api-key` header.
   - name: Ballot Setup (L1)
     description: L1 ballot token minting and admin wallet consolidation.
   - name: Head Lifecycle
@@ -78,6 +80,33 @@ tags:
     description: Verification bundles (live and post-settlement).
 
 paths:
+  # ---------- Public ----------
+  /version:
+    get:
+      tags: [Public]
+      summary: Service name, version and build
+      description: |
+        Bare document, not wrapped in the response envelope. `gitSha` and
+        `buildTime` come from the `build-info.json` beside the running
+        bundle, or from the `GIT_SHA` and `BUILD_TIME` environment variables
+        when no such file exists. They are null when neither source sets
+        them, and when the file exists but cannot be read. A `version` from
+        the same source (`APP_VERSION` in the environment) replaces the
+        `package.json` version. Rate limited to 120 requests per minute per
+        client, separately from the keyed routes. Sent with
+        `Cache-Control: public, max-age=60`.
+      security: []
+      responses:
+        '200':
+          description: Version document
+          headers:
+            Cache-Control:
+              schema: { type: string, example: 'public, max-age=60' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VersionDocument' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
   # ---------- Ballot Setup (L1) ----------
   /prepare:
     post:
@@ -361,6 +390,33 @@ paths:
                           headId: { type: string, nullable: true }
                           nodeVersion: { type: string, nullable: true }
                           connected: { type: boolean }
+                          ballot:
+                            type: object
+                            properties:
+                              ballotId: { type: string, nullable: true, description: "Cached ballot identifier; null until a ballot is started." }
+                              policyId: { type: string, nullable: true, description: "Cached ballot policy id; null until a ballot is started." }
+                          voters:
+                            type: object
+                            properties:
+                              registered: { type: integer, nullable: true, description: "Voter tokens in the head snapshot, cached for 30 seconds; null when the head is not Open or the snapshot cannot be read." }
+                              voted: { type: integer, description: "Distinct voters with a cached vote." }
+                          queue:
+                            type: object
+                            properties:
+                              depth: { type: integer, description: "In-flight entries (built, submitted, accepted and confirmed)." }
+                              built: { type: integer }
+                              submitted: { type: integer }
+                              accepted: { type: integer }
+                              confirmed: { type: integer }
+                              failed: { type: integer }
+                          snapshotNumber: { type: integer, nullable: true, description: "Number of the last confirmed head snapshot seen by the queue worker; null before the first." }
+                          probes:
+                            type: object
+                            description: "Dependency reachability, cached for 15 seconds. Each probe has a 3 second timeout and never changes the status code."
+                            properties:
+                              ipfs: { $ref: '#/components/schemas/HealthProbe' }
+                              trp: { $ref: '#/components/schemas/HealthProbe' }
+                              blockfrost: { $ref: '#/components/schemas/HealthProbe' }
         '503': { $ref: '#/components/responses/Unavailable' }
 
   /head-info:
@@ -1157,8 +1213,21 @@ components:
       content:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    RateLimited:
+      description: Rate limit exceeded (`RATE_LIMITED`)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
 
   schemas:
+    HealthProbe:
+      type: object
+      required: [state, checkedAt]
+      properties:
+        state: { type: string, enum: [ok, down, not_configured] }
+        reason: { type: string, enum: [provider_unreachable, provider_auth_failed, provider_rate_limited, provider_error, timeout, not_configured] }
+        checkedAt: { type: string, format: date-time }
+
     # ---------- Envelopes ----------
     SuccessEnvelope:
       type: object
@@ -1192,7 +1261,25 @@ components:
             - IPFS_UNAVAILABLE
             - HYDRA_UNREACHABLE
             - INTERNAL_ERROR
+            - RATE_LIMITED
         message: { type: string }
+
+    # ---------- Public ----------
+    VersionDocument:
+      type: object
+      required: [name, version, gitSha, buildTime]
+      additionalProperties: false
+      properties:
+        name: { type: string, enum: [ekklesia-hydra] }
+        version: { type: string, example: '1.1.2' }
+        gitSha:
+          type: [string, 'null']
+          pattern: '^[0-9a-f]{7}$'
+          description: First seven characters of the commit, or null when unknown.
+        buildTime:
+          type: [string, 'null']
+          format: date-time
+          description: ISO 8601 UTC build time, or null when unknown.
 
     # ---------- Ballot Definition ----------
     BallotOption:
