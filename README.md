@@ -20,6 +20,8 @@ token back to L1 at an operator-chosen custody address.
   voting methods (binary, ranked, weighted, etc.) and validation rules.
 - **[`docs/AUDITOR_GUIDE.md`](docs/AUDITOR_GUIDE.md)** — step-by-step
   third-party verification of a finalized ballot.
+- **[`docs/RELEASING.md`](docs/RELEASING.md)** — how a release is cut:
+  the signed tag the maintainer pushes and what publishing verifies.
 - **[`docs/dependency-overrides.md`](docs/dependency-overrides.md)** — why
   each entry in `package.json`'s `overrides` block exists, and what it
   takes to remove one safely.
