@@ -2,7 +2,7 @@ name: Release
 
 # Runs on every push to main. changesets/action checks for pending changeset
 # files: if there are any (a staging -> main promotion just landed), it
-# opens/updates a "Version Packages" PR that bumps package.json and rolls the
+# opens/updates a "chore: release" PR that bumps package.json and rolls the
 # changesets into CHANGELOG.md. Merging that PR tags and publishes nothing:
 # the maintainer pushes a signed annotated v<version> tag at the version
 # commit, and publish.yml verifies the tag before building the image from it.
