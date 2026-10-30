@@ -1,6 +1,6 @@
 # Releasing
 
-Releases are cut from `main`. Automation never creates a version tag: the maintainer pushes a signed annotated tag, and publishing starts only from that tag.
+Releases are cut from `main`. Automation never creates a git tag: the maintainer pushes a signed annotated tag, and publishing starts only from that tag.
 
 1. Changesets on `main` opens and updates the "chore: release" pull request (branch `changeset-release/main`). Merging it bumps `package.json` and `CHANGELOG.md` and tags and publishes nothing.
 2. The maintainer creates a signed annotated tag at the version commit on `main` and pushes it, where `X.Y.Z` is the version in `package.json` and `<version-commit-sha>` is the merge commit of the "chore: release" pull request:
@@ -24,4 +24,4 @@ The verification script can be run locally against an existing tag:
 GITHUB_REPOSITORY=lerna-labs/ekklesia-hydra GH_TOKEN=$(gh auth token) .github/scripts/verify-release-tag.sh vX.Y.Z
 ```
 
-Release candidates are built from `staging` by `staging-rc.yml` and carry no version tag.
+Release candidates are built from `staging` by `staging-rc.yml` and carry no git tag.
