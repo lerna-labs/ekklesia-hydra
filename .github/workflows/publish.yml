@@ -96,5 +96,6 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           notes=$(awk -v v="## ${version}" '$0==v{f=1;next} /^## /{if(f)exit} f' CHANGELOG.md)
           gh release create "${GITHUB_REF_NAME}" \
+            --verify-tag \
             --title "${GITHUB_REF_NAME}" \
             --notes "${notes:-Release ${GITHUB_REF_NAME}}"

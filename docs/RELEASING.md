@@ -13,9 +13,10 @@ Releases are cut from `main`. Automation never creates a git tag: the maintainer
 
 3. The tag push triggers `publish.yml`. Its first job runs `.github/scripts/verify-release-tag.sh`, and the image build only starts if every check passes:
    - the ref is an annotated tag object, not a lightweight tag;
-   - GitHub reports the tag's signature as verified;
-   - the tagged commit is an ancestor of `main`;
-   - the tag equals `v` plus the version in `package.json` at the tagged commit.
+   - GitHub reports the tag's signature as verified, and the tag points directly at a commit (not at another tag);
+   - the signed tag's commit is the commit that was pushed, so the checkout being built is the one that was signed;
+   - that commit is an ancestor of `main`;
+   - the tag equals `v` plus the version in `package.json` at that commit.
 4. The workflow then builds and pushes the image to GHCR and creates the GitHub Release with the `CHANGELOG.md` section as notes, unless the release already exists.
 
 The verification script can be run locally against an existing tag:

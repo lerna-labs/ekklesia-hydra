@@ -18,13 +18,25 @@ ref_type=$(gh api "repos/$REPO/git/ref/tags/$TAG" --jq .object.type 2>/dev/null)
   fail "Tag $TAG is a lightweight tag. Release tags must be signed annotated tags (git tag -s)."
 
 object_sha=$(gh api "repos/$REPO/git/ref/tags/$TAG" --jq .object.sha)
-verified=$(gh api "repos/$REPO/git/tags/$object_sha" --jq .verification.verified)
+tag_json=$(gh api "repos/$REPO/git/tags/$object_sha")
+verified=$(jq -r .verification.verified <<<"$tag_json")
 if [ "$verified" != "true" ]; then
-  reason=$(gh api "repos/$REPO/git/tags/$object_sha" --jq .verification.reason)
+  reason=$(jq -r .verification.reason <<<"$tag_json")
   fail "GitHub does not report the signature on tag $TAG as verified (reason: $reason)."
 fi
 
-commit=$(git rev-parse "refs/tags/$TAG^{commit}")
+target_type=$(jq -r .object.type <<<"$tag_json")
+[ "$target_type" = "commit" ] ||
+  fail "Tag $TAG points at a $target_type, not a commit."
+
+commit=$(jq -r .object.sha <<<"$tag_json")
+expected="${GITHUB_SHA:-$commit}"
+[ "$commit" = "$expected" ] ||
+  fail "Signed tag $TAG points at $commit, but the pushed commit is $expected."
+
+git cat-file -e "$commit^{commit}" 2>/dev/null ||
+  fail "Commit $commit of tag $TAG is not present in the local clone."
+
 git fetch --quiet origin main
 git merge-base --is-ancestor "$commit" origin/main ||
   fail "Tag $TAG points at $commit, which is not an ancestor of origin/main."
