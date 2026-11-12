@@ -49,13 +49,16 @@ to notice and re-pin by hand before it is covered. The caret range picks up
 
 ### `mongoose`
 
-`^9.10.1`. Originally pinned exactly at `9.7.2` to fix GHSA-664h-wqgq-64gw
-(prototype pollution in update casting), a ceiling of `< 9.7.2`, pulled in
-transitively through `@lerna-labs/ekklesia-helpers`. A Dependabot pull
-request bumping this override to `9.8.1` was opened and then auto-closed
-unmerged under this project's policy against automatic dependency pull
-requests, and the override was left unchanged through three more minor
-releases. The caret range now resolves to `9.10.1`, the current release.
+`^9.11.4`. Fixes GHSA-gg4r-jv3p-qx3c, GHSA-8332-j7wj-wjw4, GHSA-6972-9mcm-vhwj
+and GHSA-wr5m-5jph-8m96, all with ceiling `>= 9.0.0, < 9.11.4`, pulled in
+transitively through `@lerna-labs/ekklesia-helpers`. The lockfile resolves
+`9.12.1`, the current release. The earlier floor of `^9.10.1` came from
+GHSA-664h-wqgq-64gw (prototype pollution in update casting), ceiling
+`< 9.7.2`; the override before that was pinned exactly at `9.7.2` and was
+converted to a caret range. A Dependabot pull request bumping the exact pin to
+`9.8.1` was opened and then auto-closed unmerged under this project's policy
+against automatic dependency pull requests, and the override was left
+unchanged through three more minor releases.
 
 ### `path-to-regexp`
 
