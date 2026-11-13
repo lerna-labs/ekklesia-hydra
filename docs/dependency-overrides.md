@@ -20,37 +20,6 @@ installed tree, not what a consumer of a published package resolves.
 
 ## Functional pins
 
-### `npm`
-
-This is the one entry that looks like dead weight and isn't. Three copies of
-`@cardano-sdk/crypto` in this tree (pulled in through `@meshsdk/provider` and
-its own nested `@cardano-sdk/input-selection` and `@cardano-sdk/key-management`)
-declare `npm: ^9.3.0` as a plain runtime dependency. Left unconstrained, that
-resolves to npm 9.9.4, which bundles `tar` 6.2.1. That `tar` version falls
-inside GHSA-23hp-3jrh-7fpw / CVE-2026-59873, a critical decompression denial
-of service (an attacker-supplied archive with a small compressed size and an
-oversized claimed content length exhausts disk space during extraction),
-fixed in `tar` 7.5.19. The vulnerable range is `<= 7.5.18`.
-
-No override on `tar` itself can reach this. npm ships its own dependencies
-bundled inside its package tarball: every package under
-`node_modules/npm/node_modules/` is recorded in the lockfile with
-`"inBundle": true` and no `resolved` field, and `overrides` cannot rewrite a
-bundled dependency. The only available fix is bumping the package that does
-the bundling, which is why the override targets `npm` and not `tar`.
-
-`npm: 11.19.1` resolves the bundled copy to `tar` 7.5.22, outside the
-vulnerable range. This is verifiable directly: the `staging` and `main`
-branches carry no `npm` override and resolve
-`node_modules/npm/node_modules/tar` to 6.2.1; `development` resolves it to
-7.5.22. Removing the override reintroduces the critical without changing a
-single line outside `package.json`.
-
-A caret range is the wrong shape here because npm's own bundled dependency
-tree is not monotonic across releases: a newer npm version can ship an older,
-vulnerable copy of a bundled package. The pin has to be revisited by hand
-against each candidate npm release rather than left to float.
-
 ### `libsodium-sumo`
 
 `libsodium-sumo: 0.7.15` has no advisory behind it; it is a functional pin.
@@ -100,24 +69,23 @@ own if one is ever published, which the exact pin would not.
 
 ### `qs`
 
-`^6.16.0`. Fixes GHSA-x5fp-wj9c-mxmx, an array-limit bypass via bracket-key
-comma parsing, ceiling `>= 6.14.2, <= 6.15.3`. The override previously sat
-exactly on that ceiling at `6.15.3`, which read as coverage while actually
-sitting on the last vulnerable version; it was bumped to the exact version
-`6.16.0` to clear it. That same `6.16.0` is also the fixed version for an
-older, separate denial-of-service advisory, GHSA-4mjr-xmp4-gh2g (`>= 2.2.5,
-< 6.16.0`), which this override cleared as a side effect of qs's own
-upstream release moving past it, not because of anything done in this
-project. The lesson from the first exact pin applies again: an exact pin one
-version above a ceiling is the same failure shape twice, so this is now a
-caret range.
+`^6.16.1`. Fixes GHSA-6pq8-jhm2-2vcw, a denial of service in `qs.stringify`
+with `arrayFormat: 'comma'`, ceiling `>= 6.7.0, <= 6.16.0`. The earlier
+floor of `^6.16.0` came from GHSA-x5fp-wj9c-mxmx, an array-limit bypass via
+bracket-key comma parsing, ceiling `>= 6.14.2, <= 6.15.3`. The override
+before that sat exactly on that ceiling at `6.15.3`, the last vulnerable
+version, and was bumped to the exact version `6.16.0`. That `6.16.0` is also
+the fixed version for an older, separate denial-of-service advisory,
+GHSA-4mjr-xmp4-gh2g (`>= 2.2.5, < 6.16.0`). The override has been a caret
+range since it was converted from the exact pin on 2026-09-21.
 
 ### `body-parser`
 
-`^1.20.6`. Fixes GHSA-v422-hmwv-36x6, a silently skipped size limit when an
-invalid `limit` value is supplied, ceiling `< 1.20.6`, pulled in via
-`express`. Exact pin converted to a caret range for the same reason as the
-others above.
+`^1.20.9`. Fixes GHSA-27r3-jxmh-p828, a denial of service from trailing
+bytes after a compressed request body, ceiling `< 1.20.9`, pulled in via
+`express`. The previous floor of `^1.20.6` came from GHSA-v422-hmwv-36x6, a
+silently skipped size limit when an invalid `limit` value is supplied,
+ceiling `< 1.20.6`; `1.20.9` is clear of both.
 
 ### `nanoid`
 
@@ -132,12 +100,25 @@ any future `3.x` patch release.
 
 ### Nested `js-yaml`, `ip-address`, `undici`
 
-`@changesets/parse` pins `js-yaml` to `^4.3.1` and `read-yaml-file` pins it
-to `^3.15.1`, fixing GHSA-5p4m-2wfm-xmqj (quadratic CPU consumption on
-crafted input) in both of the two `js-yaml` major lines this tree resolves.
-`ip-address` is pinned to `^10.3.1`, fixing GHSA-mwp4-54f8-5fhr (an
-octal/decimal parsing mismatch that lets a malformed address slip past
-validation). `undici` is pinned to `^6.27.0`, fixing a set of WebSocket
-denial-of-service issues (GHSA-vxpw-j846-p89q, GHSA-vrm6-8vpv-qv8q,
-GHSA-v9p9-hfj2-hcw8). All three were already caret ranges and needed no
-change; each still resolves clear of every advisory against it.
+`@changesets/parse` pins `js-yaml` to `^4.3.2` and `read-yaml-file` pins it
+to `^3.15.2`, fixing GHSA-2883-xcg3-v3hh (the `maxTotalMergeKeys` limit
+does not bound CPU use for empty merge sources) in both of the two
+`js-yaml` major lines this tree resolves; the earlier floors came from
+GHSA-5p4m-2wfm-xmqj (quadratic CPU consumption on crafted input).
+`ip-address` is pinned to `^10.7.4`, the patched release for
+GHSA-rxp7-6hxx-x8q5 (`Address6` matches a zone identifier in quadratic time
+before its length limit applies, so one long string can stall the process);
+the earlier floors came from GHSA-j6r3-76f7-8jcv (`isInSubnet()` and
+`isHostInSubnet()` compare IPv4 and IPv6 addresses as one address space, so an
+allowlist check can admit an address outside its range), GHSA-h3mg-xc3c-68pw
+(`Address6` builds a parse diagnostic with no length bound, so one long string
+can stall or crash the process), GHSA-2vr4-cq9g-pvrc (an unclassified NAT64
+local-use range that lets a crafted address slip past validation) and
+GHSA-mwp4-54f8-5fhr (an octal/decimal parsing mismatch).
+`undici` is pinned to `^6.29.1`, the patched release for
+GHSA-xjj6-f33q-929c (a denial of service from an unhandled error) and
+GHSA-4qv8-2p9j-2685 (unbounded memory use); the earlier floors came from
+GHSA-3wwx-pv8p-q78v (a WebSocket permessage-deflate denial of service) and a
+set of WebSocket denial-of-service issues (GHSA-vxpw-j846-p89q,
+GHSA-vrm6-8vpv-qv8q, GHSA-v9p9-hfj2-hcw8). All three
+are caret ranges; each still resolves clear of every advisory against it.
