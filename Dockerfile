@@ -23,7 +23,7 @@ RUN npm run build  # -> dist/
 FROM node:22-slim
 WORKDIR /app
 ENV NODE_ENV=production
-COPY package.json ./
+COPY package.json LICENSE ./
 COPY --from=deps  /app/node_modules ./node_modules
 COPY --from=build /app/dist        ./dist
 EXPOSE 3000
