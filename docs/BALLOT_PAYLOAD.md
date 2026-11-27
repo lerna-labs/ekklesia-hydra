@@ -63,7 +63,10 @@ provide the fields listed under **Ekklesia extension** below.
 | `votingWindow.open`   | ISO-8601 UTC    | **The timelock anchor.** Must be in the future when `/prepare` is called — the minting policy is locked at this slot.    |
 | `votingWindow.close`  | ISO-8601 UTC    | Informational; enforced by the middleware, not the script.                                                               |
 
-`calidus` and `addr` / `addr_test` are not voter identities. The pool ID (`pool1...`) is always the SPO identity: an SPO voting with a calidus key submits `voterId` as the pool and supplies the calidus key only as a signing witness (`calidusDeclaration`).
+`calidus` and `addr` / `addr_test` are not voter identities. The pool ID
+(`pool1...`) is always the SPO identity: an SPO voting with a calidus key
+submits `voterId` as the pool and supplies the calidus key only as a signing
+witness (`calidusDeclaration`).
 
 Fields the middleware will overwrite:
 
@@ -102,7 +105,9 @@ Pick exactly one option.
 }
 ```
 
-Voter submits `selection: [<one value>]`. To skip a question, the voter submits `abstain: true` instead of `selection` (allowed unless the question sets `requireAnswer: true`).
+Voter submits `selection: [<one value>]`. To skip a question, the voter submits
+`abstain: true` instead of `selection` (allowed unless the question sets
+`requireAnswer: true`).
 
 ### `multi-choice`
 
@@ -137,11 +142,15 @@ Pick N of M.
 ```
 
 Voter submits `selection: [1, 3]`. Duplicates are rejected. Defaults:
-`minSelections = 1`, `maxSelections = options.length`. `minSelections` must be at least 1, and `maxSelections` must be at least `minSelections` and no more than `options.length`.
+`minSelections = 1`, `maxSelections = options.length`. `minSelections` must be
+at least 1, and `maxSelections` must be at least `minSelections` and no more
+than `options.length`.
 
 ### `range`
 
-Submit a single integer on the `valueRange` grid. `min`, `max` and the optional `step` (default 1) must be integers, `step` must be positive, and `max - min` must be divisible by `step`.
+Submit a single integer on the `valueRange` grid. `min`, `max` and the optional
+`step` (default 1) must be integers, `step` must be positive, and `max - min`
+must be divisible by `step`.
 
 ```json
 {
@@ -159,7 +168,9 @@ Voter submits `selection: [3]`. `options` is not required.
 
 ### `ranked`
 
-Order options by preference. `rankCount` is required (a positive integer no greater than `options.length`), and the voter submits exactly that many entries. Position 0 = first preference. No duplicates.
+Order options by preference. `rankCount` is required (a positive integer no
+greater than `options.length`), and the voter submits exactly that many entries.
+Position 0 = first preference. No duplicates.
 
 ```json
 {
@@ -188,8 +199,9 @@ Voter submits `selection: [2, 1, 3]` (Bob > Alice > Carol).
 
 ### `weighted`
 
-Distribute a fixed budget across options. `budget` must be a positive integer and `options` must be present. Weights must be non-negative integers
-that sum **exactly** to `budget`.
+Distribute a fixed budget across options. `budget` must be a positive integer
+and `options` must be present. Weights must be non-negative integers that sum
+**exactly** to `budget`.
 
 ```json
 {
@@ -215,7 +227,8 @@ that sum **exactly** to `budget`.
 ```
 
 Voter submits
-`selection: [{"option":1,"value":40},{"option":2,"value":35},{"option":3,"value":25}]`, where `option` is an option value and `value` is the points allocated to it.
+`selection: [{"option":1,"value":40},{"option":2,"value":35},{"option":3,"value":25}]`,
+where `option` is an option value and `value` is the points allocated to it.
 
 ---
 
@@ -229,7 +242,8 @@ Maps each role to how its votes are aggregated during tally:
 }
 ```
 
-Role keys are lowercase and only `drep`, `pool` and `stake` are accepted. The earlier `DRep`, `SPO`, `Stakeholder` and `CC` keys are rejected at `/prepare`.
+Role keys are lowercase and only `drep`, `pool` and `stake` are accepted. The
+earlier `DRep`, `SPO`, `Stakeholder` and `CC` keys are rejected at `/prepare`.
 
 Allowed values per role:
 
@@ -330,7 +344,7 @@ The middleware runs `validateSelections()` against the cached ballot:
   abstaining is refused on a question with `requireAnswer: true`.
 
 Selections that fail any of these return HTTP 400 with
-`code: INVALID_INPUT`.
+`code: INVALID_VOTE`.
 
 ---
 
