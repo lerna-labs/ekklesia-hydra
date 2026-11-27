@@ -59,9 +59,14 @@ provide the fields listed under **Ekklesia extension** below.
 |-----------------------|-----------------|--------------------------------------------------------------------------------------------------------------------------|
 | `votingAuthority`     | string (bech32) | Admin address that mints ballot tokens. Should match the middleware's admin wallet.                                      |
 | `context`             | `"hydra-head"`  | Fixed value — voting happens inside a Hydra head.                                                                        |
-| `acceptedCredentials` | string[]        | Bech32 HRPs that may register as voters. Allowed: `drep`, `pool`, `calidus`, `stake`, `stake_test`, `addr`, `addr_test`. |
+| `acceptedCredentials` | string[]        | Bech32 HRPs that may register as voters. Allowed: `drep`, `pool`, `stake`, `stake_test`. Any other value is rejected at `/prepare`. |
 | `votingWindow.open`   | ISO-8601 UTC    | **The timelock anchor.** Must be in the future when `/prepare` is called — the minting policy is locked at this slot.    |
 | `votingWindow.close`  | ISO-8601 UTC    | Informational; enforced by the middleware, not the script.                                                               |
+
+`calidus` and `addr` / `addr_test` are not voter identities. The pool ID
+(`pool1...`) is always the SPO identity: an SPO voting with a calidus key
+submits `voterId` as the pool and supplies the calidus key only as a signing
+witness (`calidusDeclaration`).
 
 Fields the middleware will overwrite:
 
@@ -95,16 +100,14 @@ Pick exactly one option.
     {
       "label": "No",
       "value": 0
-    },
-    {
-      "label": "Abstain",
-      "value": -1
     }
   ]
 }
 ```
 
-Voter submits `selection: [<one value>]`.
+Voter submits `selection: [<one value>]`. To skip a question, the voter submits
+`abstain: true` instead of `selection` (allowed unless the question sets
+`requireAnswer: true`).
 
 ### `multi-choice`
 
@@ -139,11 +142,15 @@ Pick N of M.
 ```
 
 Voter submits `selection: [1, 3]`. Duplicates are rejected. Defaults:
-`minSelections = 0`, `maxSelections = options.length`.
+`minSelections = 1`, `maxSelections = options.length`. `minSelections` must be
+at least 1, and `maxSelections` must be at least `minSelections` and no more
+than `options.length`.
 
 ### `range`
 
-Submit a single integer within `valueRange`.
+Submit a single integer on the `valueRange` grid. `min`, `max` and the optional
+`step` (default 1) must be integers, `step` must be positive, and `max - min`
+must be divisible by `step`.
 
 ```json
 {
@@ -161,8 +168,9 @@ Voter submits `selection: [3]`. `options` is not required.
 
 ### `ranked`
 
-Order options by preference. `rankCount` entries required (defaults to all
-options). Position 0 = first preference. No duplicates.
+Order options by preference. `rankCount` is required (a positive integer no
+greater than `options.length`), and the voter submits exactly that many entries.
+Position 0 = first preference. No duplicates.
 
 ```json
 {
@@ -187,12 +195,13 @@ options). Position 0 = first preference. No duplicates.
 }
 ```
 
-Voter submits `ranking: [2, 1, 3]` (Bob > Alice > Carol).
+Voter submits `selection: [2, 1, 3]` (Bob > Alice > Carol).
 
 ### `weighted`
 
-Distribute a fixed budget across options. Weights must be non-negative integers
-that sum **exactly** to `budget`.
+Distribute a fixed budget across options. `budget` must be a positive integer
+and `options` must be present. Weights must be non-negative integers that sum
+**exactly** to `budget`.
 
 ```json
 {
@@ -218,7 +227,8 @@ that sum **exactly** to `budget`.
 ```
 
 Voter submits
-`weights: [{"option":1,"weight":40},{"option":2,"weight":35},{"option":3,"weight":25}]`.
+`selection: [{"option":1,"value":40},{"option":2,"value":35},{"option":3,"value":25}]`,
+where `option` is an option value and `value` is the points allocated to it.
 
 ---
 
@@ -228,18 +238,20 @@ Maps each role to how its votes are aggregated during tally:
 
 ```json
 "roleWeighting": {
-"DRep": "CredentialBased", "SPO": "StakeBased", "Stakeholder": "StakeBased"
+"drep": "CredentialBased", "pool": "StakeBased", "stake": "StakeBased"
 }
 ```
 
+Role keys are lowercase and only `drep`, `pool` and `stake` are accepted. The
+earlier `DRep`, `SPO`, `Stakeholder` and `CC` keys are rejected at `/prepare`.
+
 Allowed values per role:
 
-| Role          | Allowed modes                                  |
-|---------------|------------------------------------------------|
-| `DRep`        | `CredentialBased`, `StakeBased`                |
-| `SPO`         | `CredentialBased`, `StakeBased`, `PledgeBased` |
-| `CC`          | `CredentialBased`                              |
-| `Stakeholder` | `StakeBased`                                   |
+| Role    | Allowed modes                                  |
+|---------|------------------------------------------------|
+| `drep`  | `CredentialBased`, `StakeBased`                |
+| `pool`  | `CredentialBased`, `StakeBased`, `PledgeBased` |
+| `stake` | `CredentialBased`, `StakeBased`                |
 
 Only roles you intend to count need to be listed. Results are raw unweighted
 counts — stake weighting is applied externally (intentional).
@@ -248,7 +260,7 @@ counts — stake weighting is applied externally (intentional).
 
 ## Option values
 
-- `value` is always an **integer**. Human labels live in `label`.
+- `value` is always a **non-negative integer**. Human labels live in `label`.
 - Values must be unique within a question.
 - Keep them stable — they end up in signed vote payloads and evidence files on
   IPFS. Changing a value after minting breaks verification.
@@ -281,8 +293,8 @@ counts — stake weighting is applied externally (intentional).
     }
   ],
   "roleWeighting": {
-    "DRep": "CredentialBased",
-    "SPO": "CredentialBased"
+    "drep": "CredentialBased",
+    "pool": "CredentialBased"
   },
   "ekklesia": {
     "votingAuthority": "addr_test1qzadmin...",
@@ -321,16 +333,18 @@ The middleware runs `validateSelections()` against the cached ballot:
 - `questionId` must exist.
 - `binary` / `single-choice`: exactly one `selection`; must be a known option
   value.
-- `multi-choice`: respects `minSelections` / `maxSelections`; no duplicates; all
-  values valid.
-- `range`: exactly one value; within `valueRange`.
-- `ranked`: `ranking.length === rankCount`; all values valid options; no
+- `multi-choice`: respects `minSelections` (at least 1) / `maxSelections`; no
+  duplicates; all values valid.
+- `range`: exactly one value; on the `valueRange` grid.
+- `ranked`: `selection.length === rankCount`; all values valid options; no
   duplicates.
-- `weighted`: all options valid; no duplicate option entries; weights are
-  non-negative integers; weights sum to `budget`.
+- `weighted`: all options valid; no duplicate option entries; each `value` is a
+  non-negative integer; the values sum to `budget`.
+- Each entry in `votes[]` carries either `selection` or `abstain: true`, never both;
+  abstaining is refused on a question with `requireAnswer: true`.
 
 Selections that fail any of these return HTTP 400 with
-`code: INVALID_INPUT`.
+`code: INVALID_VOTE`.
 
 ---
 
@@ -349,4 +363,4 @@ Selections that fail any of these return HTTP 400 with
   top-level request field on `/prepare`; the middleware writes it into
   `ekklesia.namespace` for you.
 - **`options` with `range`**: omit `options` — `valueRange` defines the domain.
-  Including both is not a validation error but is ignored.
+  If present, `options` must still have unique non-negative integer values.
